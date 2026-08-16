@@ -962,7 +962,10 @@ def nginx_cdn_origin_config(port, path, style="prefix",
     """Generate nginx CDN origin config.
 
     style:
-      "prefix"  — path это каталог (/content/media/), обычный prefix-location.
+      "prefix"  — path это каталог. Голый путь отдаёт 404, проксируется только
+                  то, что под ним: активная проба ровно по <path> неотличима от
+                  обращения к несуществующей странице, а xhttp всегда ходит на
+                  <path>/<сессия>. (Снято с рабочей ноды на Yandex CDN.)
       "rewrite" — path это файл (/static/getFile/video/segment.ts): нужен ^~ и
                   rewrite, добавляющий слеш, иначе xhttp не матчится.
                   (Проверено автором на Beeline 28.07.2026.)
@@ -1002,7 +1005,8 @@ def nginx_cdn_origin_config(port, path, style="prefix",
                "    location = %s {\n        return 404;\n    }\n"
                % (path, path, proxy_block, path))
     else:
-        loc = "    location %s {\n%s    }\n" % (path, proxy_block)
+        loc = ("    location = %s {\n        return 404;\n    }\n\n"
+               "    location %s/ {\n%s    }\n" % (path, path, proxy_block))
 
     v6_80  = "\n    listen [::]:80 default_server;" if ipv6 else ""
     v6_443 = "\n    listen [::]:443 ssl http2 default_server;" if ipv6 else ""
