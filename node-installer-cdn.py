@@ -40,6 +40,7 @@ import uuid as _uuid
 import base64
 import random
 import string
+import shlex
 import argparse
 import subprocess
 
@@ -55,6 +56,10 @@ REMNANODE_IMAGE  = "ghcr.io/remnawave/node:latest"
 XUI_VERSION      = "v3.6.0"
 POSTGRES_IMAGE   = "postgres:18.4"             # как в офиц. compose Remnawave 3.x
 VALKEY_IMAGE     = "valkey/valkey:9-alpine"    # 3.x: redis через unix-сокет
+
+# Валидация пользовательского ввода: значения попадают в шелл-строки и конфиги
+RE_DOMAIN = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$")
+RE_XPATH  = re.compile(r"^/[A-Za-z0-9._~/-]{1,120}$")
 
 CDN_CRT = "/etc/nginx/ssl/cdn.crt"
 CDN_KEY = "/etc/nginx/ssl/cdn.key"
@@ -395,13 +400,22 @@ def _oneline(cmd):
     return s if len(s) <= 300 else s[:297] + "..."
 
 
-def run(cmd, timeout=600):
+def shq(value):
+    """Экранировать значение для вставки в шелл-строку."""
+    return shlex.quote(str(value))
+
+
+def run(cmd, timeout=600, env_extra=None):
     """Run a shell command with clean env (no bundled LD_LIBRARY_PATH).
 
+    env_extra — переменные окружения для дочернего процесса (пароль для
+    sshpass передаётся так, чтобы не светиться в ps).
     Возвращает (stdout, rc). stderr сливается в stdout.
     """
     env = dict(os.environ)
     env.pop("LD_LIBRARY_PATH", None)
+    if env_extra:
+        env.update(env_extra)
     try:
         p = subprocess.run(cmd, shell=True, env=env, timeout=timeout,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -412,34 +426,65 @@ def run(cmd, timeout=600):
         return str(e), 1
 
 
+SSH_KNOWN_HOSTS = "/root/.ssh/known_hosts_installer"
+_ssh_dir_ready = False
+
+def _ensure_ssh_dir():
+    """~/.ssh с правами 700 под known_hosts установщика (создаётся один раз)."""
+    global _ssh_dir_ready
+    if _ssh_dir_ready:
+        return
+    d = os.path.dirname(SSH_KNOWN_HOSTS)
+    try:
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    _ssh_dir_ready = True
+
+
 def _ssh_prefix(cred):
-    """sshpass/ssh префикс по учётке {ip,user,pass|key,port}."""
+    """sshpass/ssh префикс по учётке {ip,user,pass|key,port}.
+
+    Отпечаток хоста запоминается в known_hosts при первом подключении
+    (accept-new): подмена сервера на последующих шагах даст отказ, а не
+    молчаливую отправку пароля чужому хосту.
+    """
+    _ensure_ssh_dir()
     user = cred.get("user") or "root"
     port = cred.get("port") or 22
-    opts = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            "-o ConnectTimeout=15 -p %d" % port)
+    opts = ("-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s "
+            "-o ConnectTimeout=15 -p %d" % (SSH_KNOWN_HOSTS, port))
     if cred.get("key"):
-        return "ssh -i '%s' %s %s@%s " % (cred["key"], opts, user, cred["ip"])
-    pw = cred.get("pass", "").replace("'", "'\\''")
-    return "sshpass -p '%s' ssh %s %s@%s " % (pw, opts, user, cred["ip"])
+        return "ssh -i %s %s %s@%s " % (shq(cred["key"]), opts, shq(user), cred["ip"])
+    # пароль уходит в окружение (SSHPASS), а не в argv — ps его не покажет
+    return "sshpass -e ssh %s %s@%s " % (opts, shq(user), cred["ip"])
 
 
 def run_remote(cred, cmd, timeout=600):
     """Run command on remote server via SSH (password or key)."""
     safe = cmd.replace("'", "'\\''")
-    return run(_ssh_prefix(cred) + "'" + safe + "'", timeout=timeout)
+    env_extra = None if cred.get("key") else {"SSHPASS": cred.get("pass", "") or ""}
+    return run(_ssh_prefix(cred) + "'" + safe + "'", timeout=timeout,
+               env_extra=env_extra)
 
 
-def write_remote(cred, path, content):
+def write_remote(cred, path, content, mode=None):
     """Write file to remote server via base64 over SSH."""
     b = base64.b64encode(content.encode()).decode()
-    return run_remote(cred, "echo '%s' | base64 -d > '%s'" % (b, path))
+    cmd = "echo '%s' | base64 -d > %s" % (b, shq(path))
+    if mode is not None:
+        cmd += " && chmod %o %s" % (mode, shq(path))
+    return run_remote(cred, cmd)
 
 
-def write_file(path, content):
+def write_file(path, content, mode=None):
+    """Записать файл; mode=0o600 для всего, что содержит секреты."""
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
     with open(path, "w") as f:
         f.write(content)
+    if mode is not None:
+        os.chmod(path, mode)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,11 +768,11 @@ def ensure_nginx_base(cred=None):
 
 
 def self_signed_cert(cn="cdn-origin", cred=None):
-    """Создать self-signed cdn.crt/cdn.key если их нет."""
-    cmd = ("mkdir -p /etc/nginx/ssl && test -f %s || "
+    """Создать self-signed cdn.crt/cdn.key если их нет (ключ — только root)."""
+    cmd = ("mkdir -p /etc/nginx/ssl && chmod 700 /etc/nginx/ssl && test -f %s || "
            "openssl req -x509 -nodes -days 3650 -newkey rsa:2048 "
-           "-keyout %s -out %s -subj '/CN=%s' 2>/dev/null"
-           % (CDN_CRT, CDN_KEY, CDN_CRT, cn))
+           "-keyout %s -out %s -subj '/CN=%s' 2>/dev/null; chmod 600 %s 2>/dev/null"
+           % (CDN_CRT, CDN_KEY, CDN_CRT, cn, CDN_KEY))
     run_remote(cred, cmd) if cred else run(cmd)
 
 
@@ -1128,7 +1173,7 @@ def remnawave_bringup(cfg):
         % (rand(64), rand(16), rand(64), pg_pass, pg_pass,
            domain, domain, domain)
     )
-    write_file("/opt/remnawave/.env", env)
+    write_file("/opt/remnawave/.env", env, mode=0o600)          # пароль БД, JWT
 
     say("  Запуск контейнеров Remnawave...")
     run("cd /opt/remnawave && docker compose down 2>/dev/null")
@@ -1158,7 +1203,7 @@ def remnawave_bringup(cfg):
     say("  Регистрация админа...")
     login_jwt = remnawave_register("admin", admin_pw)
     token = remnawave_api_token(login_jwt)
-    write_file("/opt/remnawave/.panel_token", token)
+    write_file("/opt/remnawave/.panel_token", token, mode=0o600)
     return token
 
 
@@ -1226,17 +1271,20 @@ def install_remnawave(cfg):
     os.makedirs("/opt/remnanode", exist_ok=True)
     download_xray_binary("/opt/remnanode/xray-custom")
     write_file("/opt/remnanode/docker-compose.yml", REMNANODE_COMPOSE)
-    write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""))
+    write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""),
+               mode=0o600)
     setup_xray_ru_geo()
     say("  Запуск контейнера remnanode...")
     run("cd /opt/remnanode && docker compose pull", timeout=600)
     run("cd /opt/remnanode && docker compose up -d")
+    # Файрвол ставим до ограничения 2222: тогда правило ноды уходит в ufw и
+    # переживает перезагрузку. Порты запасных каналов открываем явно, иначе
+    # политика deny incoming их закроет.
+    extra_tcp = ([8888] if cfg.get("cascade") else []) \
+        + ([] if cfg.get("no_grpc") else [2053])
+    extra_udp = [] if cfg.get("no_hy2") else [8443]
+    firewall_setup(extra_tcp=extra_tcp, extra_udp=extra_udp)
     restrict_node_port_2222(gw)
-    if cfg.get("cascade"):
-        # BRIDGE_IN :8888 нужен только в каскаде. Открываем через ufw, только
-        # если ufw активен (без дублирующего сырого iptables-правила).
-        if "active" in run("ufw status 2>/dev/null")[0]:
-            run("ufw allow 8888/tcp >/dev/null 2>&1")
     node_wait_ready()
 
     # ── хост CDN + опц. hy2/grpc, юзер, сквад ──
@@ -1271,8 +1319,76 @@ def download_xray_binary(dest):
         warn("Не удалось скачать xray: %s" % out[:120])
 
 
+def detect_ssh_port(runner):
+    """Порт sshd из sshd_config (иначе 22) — чтобы не отрезать себе доступ."""
+    out, _ = runner("awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' "
+                    "/etc/ssh/sshd_config 2>/dev/null")
+    p = out.strip()
+    return p if p.isdigit() and 0 < int(p) < 65536 else "22"
+
+
+def ufw_active(runner):
+    out, _ = runner("ufw status 2>/dev/null")
+    return "Status: active" in out or "активен" in out
+
+
+def persist_iptables(runner):
+    """Сохранить правила iptables, иначе они исчезнут после перезагрузки."""
+    runner("echo 'iptables-persistent iptables-persistent/autosave_v4 boolean true' "
+           "| debconf-set-selections; "
+           "echo 'iptables-persistent iptables-persistent/autosave_v6 boolean true' "
+           "| debconf-set-selections; "
+           "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent "
+           ">/dev/null 2>&1")
+    out, rc = runner("netfilter-persistent save >/dev/null 2>&1")
+    if rc != 0:
+        # без пакета — сохраняем дамп руками, восстановление на старте сети
+        out, rc = runner("mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4")
+    if rc == 0:
+        ok("Правила iptables сохранены (переживут перезагрузку)")
+    else:
+        warn("Не удалось сохранить правила iptables — после ребута их не будет.\n"
+             "     Проверь вручную: netfilter-persistent save")
+    return rc == 0
+
+
+def firewall_setup(cred=None, extra_tcp=(), extra_udp=()):
+    """ufw с политикой deny incoming: SSH, 80/443 и явно перечисленные порты.
+
+    Порт sshd открывается ПЕРВЫМ и только потом включается политика, иначе
+    установка обрывает сама себя вместе с SSH-сессией.
+    """
+    runner = (lambda c: run_remote(cred, c)) if cred else run
+    if runner("which ufw")[1] != 0:
+        pkg_install("ufw", cred)
+    if runner("which ufw")[1] != 0:
+        warn("ufw не установился — базовый файрвол не настроен")
+        return False
+    sshp = detect_ssh_port(runner)
+    runner("ufw allow %s/tcp >/dev/null 2>&1" % sshp)
+    for p in (80, 443) + tuple(extra_tcp):
+        runner("ufw allow %s/tcp >/dev/null 2>&1" % p)
+    for p in tuple(extra_udp):
+        runner("ufw allow %s/udp >/dev/null 2>&1" % p)
+    runner("ufw default deny incoming >/dev/null 2>&1")
+    runner("ufw default allow outgoing >/dev/null 2>&1")
+    runner("ufw --force enable >/dev/null 2>&1")
+    if ufw_active(runner):
+        ok("Файрвол: deny incoming, открыты SSH %s, 80, 443%s"
+           % (sshp, (", " + ", ".join(str(p) for p in
+                                      tuple(extra_tcp) + tuple(extra_udp)))
+              if (extra_tcp or extra_udp) else ""))
+        return True
+    warn("ufw не включился — правила не применены")
+    return False
+
+
 def restrict_node_port_2222(panel_ip, cred=None):
-    """ACCEPT для панели + DROP остального на 2222 (DROP только если ACCEPT добавлен)."""
+    """Порт ноды 2222 доступен только панели.
+
+    При активном ufw правила уходят в него (переживают перезагрузку сами),
+    иначе — сырой iptables с последующим сохранением.
+    """
     runner = (lambda c: run_remote(cred, c)) if cred else run
     ip = panel_ip
     if not re.match(r"^\d+\.\d+\.\d+\.\d+", ip or ""):
@@ -1280,6 +1396,12 @@ def restrict_node_port_2222(panel_ip, cred=None):
         ip = out.strip()
     if not re.match(r"^\d+\.\d+\.\d+\.\d+", ip or ""):
         warn("Не удалось определить IP панели из '%s' — порт 2222 оставлен открытым" % panel_ip)
+        return
+    if ufw_active(runner):
+        runner("ufw allow from %s to any port 2222 proto tcp >/dev/null 2>&1" % ip)
+        runner("ufw allow from 172.16.0.0/12 to any port 2222 proto tcp >/dev/null 2>&1")
+        runner("ufw deny 2222/tcp >/dev/null 2>&1")
+        ok("Порт 2222 ограничен через ufw: панель %s" % ip)
         return
     # Идемпотентно: -C проверяет наличие правила, добавляем только если нет,
     # иначе повторные запуски скрипта плодят дубликаты в INPUT.
@@ -1291,6 +1413,7 @@ def restrict_node_port_2222(panel_ip, cred=None):
     _rule("-p tcp --dport 2222 -s 172.16.0.0/12 -j ACCEPT")
     _rule("-p tcp --dport 2222 -j DROP", where="-A")
     ok("Порт 2222 ограничен: панель %s" % ip)
+    persist_iptables(runner)
 
 
 def node_wait_ready(cred=None):
@@ -1429,6 +1552,27 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY, cred=None):
     return False
 
 
+def upgrade_origin_cert(origin_domain, cred=None, skip=False):
+    """Заменить self-signed на Let's Encrypt для origin, если получится.
+
+    Self-signed CDN не может проверить — у провайдера приходится включать
+    «игнорировать сертификат origin», то есть канал шифруется, но origin не
+    аутентифицируется. С настоящим LE этого костыля не нужно. Вызывать ПОСЛЕ
+    старта nginx: certbot ходит через /.well-known/acme-challenge/.
+    При неудаче остаётся self-signed — установка не прерывается.
+    """
+    if skip:
+        return False
+    runner = (lambda c: run_remote(cred, c)) if cred else run
+    say("  Пробую выпустить Let's Encrypt для origin %s..." % origin_domain)
+    if issue_le_cert(origin_domain, cred=cred):
+        runner("chmod 600 %s" % shq(CDN_KEY))
+        return True
+    say("  Остаётся self-signed — у CDN-провайдера включи "
+        "«игнорировать сертификат origin»")
+    return False
+
+
 def nginx_panel_proxy(domain, upstream_port, crt=CDN_CRT, key=CDN_KEY,
                       extra_locations=""):
     """nginx-конфиг для проксирования панели (80->443 redirect + proxy)."""
@@ -1497,7 +1641,7 @@ def install_3xui_panel(admin_pw, port, base_path):
 def xui_sql(sql):
     """Выполнить SQL в /etc/x-ui/x-ui.db через sqlite3."""
     pkg_install("sqlite3") if run("which sqlite3")[1] != 0 else None
-    write_file("/tmp/_xui.sql", sql)
+    write_file("/tmp/_xui.sql", sql, mode=0o600)   # в SQL едут uuid и пароли
     out, rc = run("sqlite3 /etc/x-ui/x-ui.db < /tmp/_xui.sql 2>&1")
     run("rm -f /tmp/_xui.sql")
     if rc != 0:
@@ -1566,6 +1710,9 @@ def install_3xui(cfg):
     reality = None
     if not cfg.get("no_grpc"):
         reality = xui_grpc_inbound(uuid)
+
+    firewall_setup(extra_tcp=([] if cfg.get("no_grpc") else [2053]),
+                   extra_udp=([] if cfg.get("no_hy2") else [8443]))
 
     return {"user_uuid": uuid, "sub_id": sub_id, "xport": xport,
             "panel_port": panel_port, "panel_path": panel_path,
@@ -1678,7 +1825,8 @@ def dns_wait(lines, skip=False):
 #  Режим 2: панель здесь + нода на удалённом сервере (по SSH)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport):
+def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport,
+                      no_origin_le=False):
     """Install Docker + nginx CDN origin + remnanode на удалённом сервере via SSH."""
     say("  [удалённая] Подключение к %s..." % cred["ip"])
     out, rc = run_remote(cred, "echo OK")
@@ -1687,10 +1835,7 @@ def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport):
         return False
     say("  [удалённая] SSH OK, установка пакетов...")
     pkg_install("nginx openssl curl ca-certificates gnupg", cred)
-    out, _ = run_remote(cred, "ufw status 2>/dev/null")
-    if "active" in out:
-        run_remote(cred, "ufw allow 80/tcp >/dev/null 2>&1 && "
-                   "ufw allow 443/tcp >/dev/null 2>&1 && ufw reload >/dev/null 2>&1")
+    firewall_setup(cred, extra_tcp=[2053], extra_udp=[8443])
     say("  [удалённая] Установка Docker...")
     if not install_docker(cred) or not ensure_compose(cred):
         err("[удалённая] Docker не установился на %s" % cred["ip"]); return False
@@ -1704,11 +1849,13 @@ def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport):
     run_remote(cred, "rm -f /etc/nginx/sites-enabled/default && "
                "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
                "nginx -t && systemctl restart nginx")
+    upgrade_origin_cert(origin, cred, skip=no_origin_le)
     # remnanode
     say("  [удалённая] Настройка remnanode...")
     run_remote(cred, "mkdir -p /opt/remnanode")
     write_remote(cred, "/opt/remnanode/docker-compose.yml", REMNANODE_COMPOSE)
-    write_remote(cred, "/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""))
+    write_remote(cred, "/opt/remnanode/.env",
+                 "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""), mode=0o600)
     setup_xray_ru_geo(cred=cred)
     run_remote(cred, "cd /opt/remnanode && docker compose pull", timeout=600)
     run_remote(cred, "cd /opt/remnanode && docker compose up -d")
@@ -1764,7 +1911,8 @@ def install_node_only(cfg):
     os.makedirs("/opt/remnanode", exist_ok=True)
     download_xray_binary("/opt/remnanode/xray-custom")
     write_file("/opt/remnanode/docker-compose.yml", REMNANODE_COMPOSE)
-    write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""))
+    write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""),
+               mode=0o600)
     setup_xray_ru_geo()
     if cfg.get("skip_cdn"):
         say("  Пропуск nginx CDN-origin (режим «только нода»)")
@@ -1774,6 +1922,8 @@ def install_node_only(cfg):
         run("rm -f /etc/nginx/sites-enabled/default && "
             "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
             "nginx -t && systemctl restart nginx")
+        upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
+    firewall_setup(extra_tcp=[2053], extra_udp=[8443])
     run("cd /opt/remnanode && docker compose pull", timeout=600)
     run("cd /opt/remnanode && docker compose up -d")
     node_wait_ready()
@@ -1825,11 +1975,13 @@ def install_panel_only(cfg):
         if not issue_le_cert(domain):
             self_signed_cert(domain)
         nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
+        firewall_setup()
         ok("Панель 3x-ui готова — подключай ноды в веб-интерфейсе")
         return {"panel_only": True, "panel_port": panel_port,
                 "panel_path": panel_path}
     # Remnawave
     token = remnawave_bringup(cfg)
+    firewall_setup()
     ok("Панель Remnawave готова — подключай ноды (режим «только нода»)")
     return {"panel_only": True, "token": token}
 
@@ -1854,6 +2006,8 @@ def install_cdn_only(cfg):
     run("rm -f /etc/nginx/sites-enabled/default && "
         "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
         "nginx -t && systemctl restart nginx")
+    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
+    firewall_setup()
     ok("nginx CDN-origin поднят на :443 -> 127.0.0.1:%d" % xport)
     return {"cdn_only": True, "my_ip": my_ip}
 
@@ -1884,6 +2038,8 @@ def parse_args():
     p.add_argument("--panel-ssh-pass", help="Panel SSH password (mode 3)")
     p.add_argument("--no-hy2", action="store_true", help="Skip Hysteria2")
     p.add_argument("--no-grpc", action="store_true", help="Skip gRPC")
+    p.add_argument("--no-origin-le", action="store_true",
+                   help="Do not try Let's Encrypt for the CDN origin (keep self-signed)")
     p.add_argument("--squad", help="Squad number or name (mode 3 Remnawave)")
     p.add_argument("--skip-dns-wait", action="store_true")
     p.add_argument("--skip-cdn-wait", action="store_true")
@@ -1964,19 +2120,28 @@ def main():
     else:
         cdn_name = ""
 
-    domain = args.domain or ask("Домен без http:// (Domain)")
+    domain = (args.domain or ask("Домен без http:// (Domain)") or "").strip()
     if not domain:
         err("Домен обязателен"); sys.exit(1)
+    if not RE_DOMAIN.match(domain):
+        err("Домен '%s' не похож на домен (ожидается вид example.com)" % domain)
+        sys.exit(1)
     origin = "origin." + domain
 
     # путь/upstream-порт: режим 6 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
     if mode == "6":
-        path = args.path or ask("Существующий xhttp путь (например /abc123)")
+        path = (args.path or ask("Существующий xhttp путь (например /abc123)") or "").strip()
+        if not RE_XPATH.match(path):
+            err("Путь '%s' невалиден: ожидается вид /abc123 "
+                "(латиница, цифры, - _ . ~ /)" % path)
+            sys.exit(1)
         if args.xport:
             xport = args.xport
         else:
             xp = ask("Локальный upstream-порт xray на 127.0.0.1", default="8080")
             xport = int(xp) if str(xp).isdigit() else random.randint(10000, 20000)
+        if not 0 < xport < 65536:
+            err("Порт %s вне диапазона 1..65535" % xport); sys.exit(1)
     else:
         path = rand_path()
         xport = random.randint(10000, 20000)
@@ -1985,7 +2150,8 @@ def main():
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
            "no_hy2": args.no_hy2, "no_grpc": args.no_grpc,
-           "cascade": args.cascade, "xport": xport}
+           "cascade": args.cascade, "xport": xport,
+           "no_origin_le": args.no_origin_le}
 
     # ── DNS ──
     if mode == "4":
@@ -2010,7 +2176,8 @@ def main():
         if args.node_ip:
             cred = {"ip": args.node_ip, "user": args.node_user,
                     "pass": args.node_pass, "key": args.node_key}
-            setup_remote_node(cred, None, my_ip, origin, cdn_name, path, cfg["xport"])
+            setup_remote_node(cred, None, my_ip, origin, cdn_name, path, cfg["xport"],
+                              no_origin_le=cfg.get("no_origin_le"))
     elif mode in ("3", "5"):
         cfg["panel_url"] = args.panel_url or ask("IP/URL панели Remnawave")
         cfg["panel_ssh_user"] = args.panel_ssh_user
