@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-node-installer-cdn.py — установщик прокси-инфраструктуры за российским CDN (v2.0)
+node-installer-cdn.py — установщик прокси-инфраструктуры за российским CDN (v1.0)
 
 ЧТО ЭТО
 -------
@@ -46,6 +46,8 @@ import subprocess
 # ─────────────────────────────────────────────────────────────────────────────
 #  Константы
 # ─────────────────────────────────────────────────────────────────────────────
+
+INSTALLER_VERSION = "1.0"             # версия установщика, печатается в баннере
 
 XRAY_MIN_VERSION = "26.3.27"          # xray-core, тянется на ноду (актуальный релиз)
 REMNAWAVE_IMAGE  = "remnawave/backend:3"       # мажорный тег 3.x (офиц. compose)
@@ -362,7 +364,7 @@ def banner():
     inner = UI_W - 2
     lines = [("VPN · CDN · INSTALLER", "1;" + C_TITLE),
              ("XHTTP packet-up через российский CDN", C_DIM),
-             ("v2.0 · reconstructed", C_ACC)]
+             ("v" + INSTALLER_VERSION, C_ACC)]
     print("", flush=True)
     print(_c(C_TITLE, "╭" + "─" * inner + "╮"), flush=True)
     for text, col in lines:
@@ -1862,7 +1864,7 @@ def install_cdn_only(cfg):
 
 def parse_args():
     """Parse CLI args for non-interactive mode."""
-    p = argparse.ArgumentParser(description="VPN CDN Installer (reconstructed v2.0)")
+    p = argparse.ArgumentParser(description="VPN CDN Installer v%s" % INSTALLER_VERSION)
     p.add_argument("--mode", help="1=Panel+node here, 2=Panel here+node remote, "
                    "3=Node+CDN to existing panel, 4=Panel only, 5=Node only, 6=CDN only")
     p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (modes 1,2,4)")
