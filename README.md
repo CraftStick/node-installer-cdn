@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🌐 node-installer-cdn
+# node-installer-cdn
 
 **Прокси, спрятанный за витриной рунета — панель, нода и обвязка в один запуск.**
 
