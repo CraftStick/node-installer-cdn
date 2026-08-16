@@ -1149,8 +1149,9 @@ def remnawave_bringup(cfg):
 
     os.makedirs("/opt/remnawave", exist_ok=True)
     pg_pass = rand(24)
+    # POSTGRES_PASSWORD подставляется прямо в compose — файл только для root
     write_file("/opt/remnawave/docker-compose.yml",
-               REMNAWAVE_COMPOSE.replace("{pg_pass}", pg_pass))
+               REMNAWAVE_COMPOSE.replace("{pg_pass}", pg_pass), mode=0o600)
     # .env по схеме Remnawave 3.x: APP_SECRET вместо JWT_*, redis через unix-сокет,
     # WEBHOOK_SECRET_HEADER ровно 64 символа [a-zA-Z0-9], отдельный порт метрик.
     env = (
