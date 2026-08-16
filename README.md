@@ -4,8 +4,6 @@
 
 **Прокси, спрятанный за витриной рунета — панель, нода и обвязка в один запуск.**
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
 </div>
 
 ---
