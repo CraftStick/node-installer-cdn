@@ -50,7 +50,7 @@ import subprocess
 
 INSTALLER_VERSION = "1.0"             # версия установщика, печатается в баннере
 
-XRAY_MIN_VERSION = "26.3.27"          # xray-core, тянется на ноду (актуальный релиз)
+XRAY_MIN_VERSION = "26.7.28"          # xray-core, тянется на ноду (актуальный релиз)
 REMNAWAVE_IMAGE  = "remnawave/backend:3"       # мажорный тег 3.x (офиц. compose)
 REMNANODE_IMAGE  = "ghcr.io/remnawave/node:latest"
 XUI_VERSION      = "v3.6.0"

@@ -200,7 +200,7 @@ CDN · файрвол · BBR, TCP Fast Open и сетевые буферы ·
 | Компонент | Версия |
 |---|---|
 | Remnawave (backend) | `remnawave/backend:3` |
-| Xray-core | `26.3.27` |
+| Xray-core | `26.7.28` |
 | 3x-ui | `v3.6.0` |
 | PostgreSQL | `18.4` |
 | Valkey (Redis) | `9-alpine` (unix-сокет) |
