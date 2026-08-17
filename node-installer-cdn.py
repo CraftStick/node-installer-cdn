@@ -1211,22 +1211,29 @@ def remnawave_register(username, password):
 
 
 def remnawave_api_token(login_jwt):
-    """Создать API-токен (uuid+jwt) прямо в БД через docker exec psql."""
-    # чистим прежний токен установщика и создаём новый
-    run('docker exec remnawave-db psql -U postgres -c '
-        '"DELETE FROM api_tokens WHERE name = \'installer\';"')
-    # реальный JWT подписывается APP секретом внутри бэкенда; проще — взять
-    # существующий рабочий токен из БД, иначе использовать login JWT
-    out, _ = run('docker exec remnawave-db psql -U postgres -t -A -c '
-                 '"SELECT token FROM api_tokens WHERE token LIKE \'eyJ%\' LIMIT 1;" 2>/dev/null')
-    if out.strip().startswith("eyJ"):
-        ok("API-токен: OK (из БД)")
-        return out.strip()
+    """Создать API-токен штатным эндпоинтом POST /api/tokens.
+
+    JWT логина годится только для дашборда: на прочих маршрутах панель отвечает
+    403 «For API requests you must create own API-token in the admin dashboard».
+    Сам /api/tokens, наоборот, принимает только admin JWT и запрещён для
+    API-ключа — поэтому порядок именно такой: логин, затем выпуск токена.
+    """
     if not login_jwt:
-        err("API-токена нет — любой вызов API вернёт 401")
+        err("Нет JWT админа — API-токен выпустить нечем")
         return ""
-    ok("API-токен: OK (login JWT)")
-    return login_jwt
+    # одноимённый токен от прошлого запуска мешает создать новый
+    run('docker exec remnawave-db psql -U postgres -c '
+        '"DELETE FROM api_tokens WHERE name = \'installer\';" 2>/dev/null')
+    resp, code = rw_api_local(login_jwt, "POST", "tokens",
+                              {"name": "installer",
+                               "description": "node-installer-cdn"})
+    tok = (((resp.get("response") or {}).get("token") or {}).get("token") or "").strip()
+    if tok:
+        ok("API-токен выпущен через /api/tokens")
+        return tok
+    err("Панель не выдала API-токен (%s): %s"
+        % (code, str(resp.get("message") or resp)[:160]))
+    return ""
 
 
 def _slug(prefix):
@@ -2308,14 +2315,35 @@ def parse_args():
     return p.parse_args()
 
 
+def flush_stdin():
+    """Выбросить всё, что настучалось в терминал, пока шёл долгий шаг.
+
+    Иначе нажатия во время docker pull попадают в следующий вопрос: домен
+    приезжает с мусором в начале, а битый байт роняет input() с
+    UnicodeDecodeError.
+    """
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
 def ask(prompt, default=None):
     tail = _c(C_DIM, " [%s]" % default) if default else ""
     line = "  " + _c(C_ACC, "❯") + " " + prompt + tail + _c(C_DIM, "  ")
-    try:
-        v = input(line).strip()
-    except (EOFError, KeyboardInterrupt):
-        v = ""
-    return v or (default or "")
+    while True:
+        flush_stdin()
+        try:
+            v = input(line).strip()
+        except (EOFError, KeyboardInterrupt):
+            v = ""
+        except UnicodeDecodeError:
+            warn("Ввод не похож на UTF-8 (обрывок прошлого нажатия) — повтори")
+            continue
+        return v or (default or "")
 
 
 def ask_required(prompt, why):
