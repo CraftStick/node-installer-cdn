@@ -44,6 +44,7 @@ import shlex
 import getpass
 import argparse
 import subprocess
+import urllib.parse
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Константы
@@ -75,12 +76,6 @@ REALITY_DEST = "www.microsoft.com:443"
 REALITY_SNI  = "www.microsoft.com"
 REALITY_DEST_ALT = "www.google.com:443"
 
-# packet-up / padding параметры xhttp
-PU_PADDING       = "100-1000"
-PU_SC_MAXBYTES   = "500000-1000000"
-PU_SC_MININT     = "50-150"
-PU_XMUX_CONC     = "60-180"          # xmux maxConcurrency
-PU_XMUX_REUSE    = "600-900"
 
 # Русские geo-правила роутинга (для standalone xray на exit/ноде)
 RU_GEOIP   = "ext:geoip_RU.dat:ru"
@@ -308,10 +303,19 @@ def rand_password(n=28):
     return "".join(chars)
 
 
+# Каталоги, за которые путь сойдёт при взгляде в логи CDN: /uploadfiles/... —
+# то, что использовал оригинальный установщик.
+PATH_PREFIXES = ["uploadfiles", "content/media", "static/files", "upload/data",
+                 "assets/video", "files/storage"]
+
 def rand_path():
-    """Random path for panel/CDN access."""
-    return "/" + rand(random.randint(8, 14),
-                      "abcdefghijklmnopqrstuvwxyz0123456789-_")
+    """Путь xhttp: правдоподобный каталог + случайный хвост.
+
+    Одного каталога мало — их всего несколько, и путь стал бы угадываемым;
+    случайный хвост оставляет endpoint скрытым, а вид пути — обычным.
+    """
+    return "/%s/%s" % (random.choice(PATH_PREFIXES),
+                       rand(random.randint(6, 10), "abcdefghijklmnopqrstuvwxyz0123456789"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  UI / тема оформления
@@ -891,13 +895,6 @@ def nginx_write_conf(name, content):
 #  Xray: бинарник на ноду, x25519, RU-гео, инбаунды
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _rng(spec):
-    """'100-1000' -> случайное int в диапазоне; одиночное число -> оно же."""
-    if "-" in spec:
-        a, b = spec.split("-"); return random.randint(int(a), int(b))
-    return int(spec)
-
-
 def gen_x25519(cred=None):
     """Generate x25519 keypair for Reality. Returns (private, public) or (None,None)."""
     runner = (lambda c, **k: run_remote(cred, c, **k)) if cred else run
@@ -950,11 +947,18 @@ def setup_xray_ru_geo(asset_dir="/usr/local/share/xray", cred=None):
     return True
 
 
-def build_xhttp_inbound(port, path, tag, uuid, host):
-    """XHTTP packet-up inbound для xray-core (слушает 127.0.0.1:port, TLS снимает nginx).
+def build_xhttp_inbound(port, path, tag, uuid=None, host=None):
+    """XHTTP packet-up inbound: слушает 127.0.0.1:port, TLS снимает nginx.
 
-    Ключи: mode=packet-up, xPaddingBytes, scMaxEachPostBytes,
-    scMinPostsIntervalMs, noSSEHeader, xmux.
+    Набор ключей xhttpSettings взят с работающей ноды — это семейство
+    xPaddingObfs: паддинг уезжает в query и в заголовок X-Cache, аплинк идёт
+    методом GET. Реконструкция раньше писала другой набор
+    (scMaxEachPostBytes/xmux/noSSEHeader) — он валиден для xray, но маскировкой
+    под кэш-трафик CDN не занимается.
+
+    path у xray со слешем на конце: nginx проксирует всё, что под путём, а сам
+    путь без слеша отдаёт 404. clients пустой — пользователей в конфиг ноды
+    подставляет панель; для 3x-ui клиент прописывается отдельно в xui_cdn_inbound.
     """
     return {
         "tag": tag,
@@ -962,27 +966,25 @@ def build_xhttp_inbound(port, path, tag, uuid, host):
         "port": port,
         "protocol": "vless",
         "settings": {
-            "clients": [{"id": uuid, "email": "user1"}],
+            "clients": [{"id": uuid, "email": "user1"}] if uuid else [],
             "decryption": "none",
         },
+        "sniffing": {"enabled": True, "routeOnly": False,
+                     "destOverride": ["http", "tls", "quic"]},
         "streamSettings": {
             "network": "xhttp",
             "security": "none",
             "xhttpSettings": {
-                "host": host,
-                "path": path,
                 "mode": "packet-up",
-                "noSSEHeader": True,
-                "scMaxEachPostBytes": _rng(PU_SC_MAXBYTES),
-                "scMinPostsIntervalMs": _rng(PU_SC_MININT),
-                "xPaddingBytes": PU_PADDING,
-                "xmux": {
-                    "maxConcurrency": _rng(PU_XMUX_CONC),
-                    "maxReuseTimes": _rng(PU_XMUX_REUSE),
-                },
+                "path": "/" + path.strip("/") + "/",
+                "xPaddingKey": "_dc",
+                "xPaddingHeader": "X-Cache",
+                "xPaddingMethod": "tokenish",
+                "uplinkHTTPMethod": "get",
+                "xPaddingObfsMode": True,
+                "xPaddingPlacement": "queryInHeader",
             },
         },
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
     }
 
 
@@ -1576,8 +1578,7 @@ def install_remnawave(cfg):
     # ── профиль + инбаунды (CDN xhttp + опц. gRPC + опц. BRIDGE_IN) ──
     step("Создание профиля, ноды, хоста и юзера через API")
     user_uuid = str(_uuid.uuid4())
-    inbounds = [build_xhttp_inbound(xport, path, "%s-CDN" % (cfg["cdn"]),
-                                    user_uuid, origin)]
+    inbounds = [build_xhttp_inbound(xport, path, "%s_CDN" % cfg["cdn"].upper())]
     ok("Основной вход: VLESS XHTTP packet-up, 127.0.0.1:%d, путь %s" % (xport, path))
     reality = None
     if not cfg.get("no_grpc"):
@@ -1589,7 +1590,7 @@ def install_remnawave(cfg):
             reality = {"pbk": pub, "sid": sid}
             ok("Добавлен gRPC Reality inbound (TCP 2053)")
     if cfg.get("cascade"):
-        inbounds.append(build_xhttp_inbound(8888, path, "BRIDGE_IN", user_uuid, origin))
+        inbounds.append(build_xhttp_inbound(8888, path, "BRIDGE_IN"))
         ok("Добавлен BRIDGE_IN inbound (TCP 8888) для каскада")
 
     prof_tag = _slug("cdn")
@@ -1785,10 +1786,18 @@ def build_xray_profile(name, inbounds):
     """
     return {"name": name, "config": {
         "log": {"loglevel": "warning"},
+        # DNS через 8.8.8.8 и только IPv4: без этого xray на серверах с
+        # кривым IPv6 упирается в таймауты резолва
+        "dns": {"servers": [{"address": "8.8.8.8", "skipFallback": False}],
+                "queryStrategy": "UseIPv4"},
         "inbounds": inbounds,
-        "outbounds": [{"tag": "DIRECT", "protocol": "freedom"},
-                      {"tag": "BLOCK", "protocol": "blackhole"}],
-        "routing": {"rules": []}}}
+        "outbounds": [{"tag": "direct", "protocol": "freedom"},
+                      {"tag": "block", "protocol": "blackhole"}],
+        # Локальные сети — напрямую, торренты — в блок: жалобы abuse на exit-IP
+        # это главное, из-за чего теряют и сервер, и CDN-аккаунт
+        "routing": {"rules": [
+            {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+            {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}]}}}
 
 
 def create_config_profile(api, name, inbounds, tries=3):
@@ -1851,9 +1860,14 @@ def create_remnawave_host(token, prof_uuid, inbound_tag, cdn_domain, origin,
         "remark": "CDN %s" % cdn_domain,
         "address": cdn_domain,
         "port": 443,
-        "sni": origin,
-        "host": origin,
-        "path": path,
+        # SNI и Host — домен CDN, а не origin: клиент открывает TLS именно к
+        # CDN, и его сертификат выписан на этот домен. С origin в SNI
+        # соединение отвалится по имени.
+        "sni": cdn_domain,
+        "host": cdn_domain,
+        "path": "/" + path.strip("/") + "/",
+        "alpn": "h3,h2,http/1.1",
+        "fingerprint": "random",
         "xhttpExtraParams": {"mode": "packet-up"},
         "xHttpExtraParams": {"mode": "packet-up"},
         "securityLayer": "TLS",
@@ -2361,7 +2375,7 @@ def install_node_only(cfg):
     user_uuid = str(_uuid.uuid4())
     origin = cfg.get("origin_domain", cfg["domain"]); path = cfg["path"]
     xport = XHTTP_PORT
-    inbounds = [build_xhttp_inbound(xport, path, "%s-CDN" % cfg["cdn"], user_uuid, origin)]
+    inbounds = [build_xhttp_inbound(xport, path, "%s_CDN" % cfg["cdn"].upper())]
     prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
     inbound_uuids = [u for u in (tag2uuid.get(i["tag"]) for i in inbounds) if u]
 
@@ -2688,7 +2702,7 @@ def main():
         "Панель + нода (всё на этом сервере)",
         "Панель здесь + нода на другом сервере",
         "Нода + CDN к существующей панели",
-        "Только CDN-origin (перед уже работающей нодой)"]))
+        "Только CDN (перед уже работающей нодой)"]))
 
     # какие шаги нужны этому режиму
     need_panel = mode in ("1", "2")   # тип панели спрашиваем, только если её ставим
@@ -2822,7 +2836,7 @@ def main():
     # ── финальный отчёт ──
     cdn_val = cdn_domain or "— укажи после настройки провайдера"
     if mode == "4":
-        rows = [("Режим", "только CDN-origin"),
+        rows = [("Режим", "только CDN"),
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
                 ("nginx", ":443 → 127.0.0.1:%d  путь %s" % (xport, path)),
                 ("CDN", cdn_val)]
@@ -2838,9 +2852,12 @@ def main():
     state_clear()      # дошли до конца — продолжать нечего
 
     if cdn_domain and result.get("user_uuid"):
+        xpath = urllib.parse.quote("/" + path.strip("/") + "/", safe="")
         link = ("vless://%s@%s:443?type=xhttp&security=tls&sni=%s&fp=random"
-                "&path=%s&host=%s&mode=packet-up&encryption=none#user1-%s"
-                % (result["user_uuid"], cdn_domain, origin, path, origin, cdn_name))
+                "&alpn=%s&path=%s&host=%s&mode=packet-up&encryption=none#user1-%s"
+                % (result["user_uuid"], cdn_domain, cdn_domain,
+                   urllib.parse.quote("h3,h2,http/1.1", safe=""),
+                   xpath, cdn_domain, cdn_name))
         callout("VLESS CDN ссылка", [link], color=C_TITLE)
     if result.get("reality"):
         r = result["reality"]
