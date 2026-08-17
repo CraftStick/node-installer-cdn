@@ -1100,6 +1100,10 @@ def rw_api_local(token, method, path, data=None):
         "X-Forwarded-Proto": "https",
         "X-Forwarded-For": "127.0.0.1",
         "X-Real-IP": "127.0.0.1",
+        # JwtDefaultGuard пускает админский JWT только с этим заголовком, иначе
+        # 403 «For API requests you must create own API-token». Для роли API
+        # (постоянный токен) заголовок не проверяется, так что шлём всегда.
+        "X-Remnawave-Client-Type": "browser",
         "Host": rdom,
     }
     if token:
@@ -1126,7 +1130,8 @@ def rw_api_ssh(cred, token, method, path, data=None):
     base = ('RDOM=$(grep -oP "PANEL_DOMAIN=\\K.*" /opt/remnawave/.env 2>/dev/null); '
             'curl -s -X %s -H "Content-Type: application/json" '
             '-H "X-Forwarded-Proto: https" -H "X-Forwarded-For: 127.0.0.1" '
-            '-H "X-Real-IP: 127.0.0.1" -H "Host: ${RDOM:-localhost}" ' % method)
+            '-H "X-Real-IP: 127.0.0.1" -H "X-Remnawave-Client-Type: browser" '
+            '-H "Host: ${RDOM:-localhost}" ' % method)
     tok, _ = run_remote(cred, "cat /opt/remnawave/.panel_token 2>/dev/null")
     tok = (token or tok).strip()
     if tok:
