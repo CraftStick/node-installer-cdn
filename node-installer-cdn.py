@@ -1206,6 +1206,44 @@ def _slug(prefix):
     return "%s-%s" % (prefix, rand(6, "abcdefghijklmnopqrstuvwxyz0123456789"))
 
 
+def resolve_pg_pass():
+    """Пароль postgres, совместимый с уже существующим томом базы.
+
+    POSTGRES_PASSWORD применяется только при ПЕРВОЙ инициализации кластера.
+    Том remnawave-db-data переживает docker compose down, поэтому свежий
+    случайный пароль в старую базу не попадёт, и панель ляжет в крэш-луте с
+    Prisma P1000 (authentication failed). Если том остался — берём пароль из
+    прежнего .env, а если его не восстановить, предлагаем снести базу.
+    """
+    out, _ = run("docker volume ls -q --filter name=remnawave-db-data")
+    if not out.strip():
+        return rand(24)
+    old = ""
+    try:
+        with open("/opt/remnawave/.env") as f:
+            for line in f:
+                if line.startswith("POSTGRES_PASSWORD="):
+                    old = line.split("=", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    if old:
+        say("  Найден том базы от прошлой установки — использую её пароль")
+        return old
+    warn("Том базы remnawave-db-data остался от прошлой установки, "
+         "а пароль от него утерян")
+    say("  С новым паролем панель не войдёт в базу (Prisma P1000)")
+    if sys.stdin.isatty() and ask("Удалить старую базу и поставить начисто? (y/N)",
+                                  "n").lower() in ("y", "yes", "д", "да"):
+        run("cd /opt/remnawave && docker compose down -v 2>/dev/null")
+        run("docker volume rm -f remnawave-db-data "
+            "remnawave_remnawave-db-data 2>/dev/null")
+        return rand(24)
+    err("Без совпадающего пароля установка не поднимется")
+    say("  Удали том вручную: cd /opt/remnawave && docker compose down -v")
+    sys.exit(1)
+
+
 def remnawave_bringup(cfg):
     """Docker + compose + .env + запуск контейнеров + регистрация админа + API-токен.
 
@@ -1221,7 +1259,7 @@ def remnawave_bringup(cfg):
         sys.exit(1)
 
     os.makedirs("/opt/remnawave", exist_ok=True)
-    pg_pass = rand(24)
+    pg_pass = resolve_pg_pass()
     # POSTGRES_PASSWORD подставляется прямо в compose — файл только для root
     write_file("/opt/remnawave/docker-compose.yml",
                REMNAWAVE_COMPOSE.replace("{pg_pass}", pg_pass), mode=0o600)
@@ -1305,8 +1343,12 @@ def remnawave_bringup(cfg):
         nap(5)
     if not up:
         err("Панель Remnawave не поднялась — логи контейнеров:")
-        say(run("docker compose -f /opt/remnawave/docker-compose.yml logs --tail=50 2>&1")[0])
-        say(run("df -h /")[0])
+        logs = run("docker compose -f /opt/remnawave/docker-compose.yml "
+                   "logs --tail=50 2>&1")[0]
+        say(logs)
+        if "P1000" in logs:
+            say("  Пароль не подошёл к существующей базе. Снести её и начать "
+                "начисто: cd /opt/remnawave && docker compose down -v")
         sys.exit(1)
     ok("Панель Remnawave запущена")
 
