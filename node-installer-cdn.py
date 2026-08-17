@@ -2340,6 +2340,10 @@ def install_node_only(cfg):
             "nginx -t && systemctl restart nginx")
         upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup(extra_tcp=[2053])
+    # Панель здесь удалённая и стучится к ноде на 2222 снаружи: без этого
+    # правила политика deny incoming закрывает порт вообще для всех, и нода
+    # появляется в панели, но остаётся неуправляемой.
+    restrict_node_port_2222(panel["ip"])
     run("cd /opt/remnanode && docker compose pull", timeout=600)
     run("cd /opt/remnanode && docker compose up -d")
     node_wait_ready()
