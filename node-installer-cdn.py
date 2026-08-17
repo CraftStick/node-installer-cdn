@@ -422,6 +422,44 @@ def shq(value):
     return shlex.quote(str(value))
 
 
+# Кириллические буквы, неотличимые от латинских в терминале. Один такой символ
+# в домене — и вместо внятного отказа получаешь непонятную ошибку сертификата.
+HOMOGLYPHS = {
+    "а": "a", "в": "b", "е": "e", "к": "k", "м": "m", "н": "h", "о": "o",
+    "р": "p", "с": "c", "т": "t", "у": "y", "х": "x", "ѕ": "s", "і": "i",
+    "ј": "j", "ԁ": "d", "ԛ": "q", "ԝ": "w",
+    "А": "A", "В": "B", "Е": "E", "З": "3", "К": "K", "М": "M", "Н": "H",
+    "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X", "Ѕ": "S",
+    "І": "I", "Ј": "J",
+}
+
+def homoglyph_hint(value):
+    """Объяснить, что во вводе кириллица вместо латиницы. '' — если не она."""
+    letters = [ch for ch in value if ch.isalpha()]
+    cyr = [ch for ch in letters if "Ѐ" <= ch <= "ӿ"]
+    # Домен целиком кириллицей — это не опечатка, а IDN: подсказываем punycode,
+    # потому что nginx и certbot работают только с ним.
+    if letters and len(cyr) == len(letters):
+        try:
+            puny = value.encode("idna").decode()
+        except Exception:
+            puny = ""
+        return ("это кириллический домен. Панель, nginx и certbot понимают "
+                "только punycode" + (" — введи '%s'" % puny if puny else ""))
+    twins = [(i, ch) for i, ch in enumerate(value, 1) if ch in HOMOGLYPHS]
+    if twins:
+        where = ", ".join("'%s' в позиции %d" % (ch, i) for i, ch in twins[:4])
+        fixed = "".join(HOMOGLYPHS.get(ch, ch) for ch in value)
+        return ("похоже, кириллица вместо латиницы: %s. Скорее всего нужно '%s' "
+                "— перенабери в английской раскладке" % (where, fixed))
+    other = [(i, ch) for i, ch in enumerate(value, 1) if ord(ch) > 127]
+    if other:
+        return ("не-латинские символы: "
+                + ", ".join("'%s' (U+%04X) в позиции %d" % (ch, ord(ch), i)
+                            for i, ch in other[:4]))
+    return ""
+
+
 def run(cmd, timeout=600, env_extra=None):
     """Run a shell command with clean env (no bundled LD_LIBRARY_PATH).
 
@@ -1201,6 +1239,15 @@ def remnawave_register(username, password):
     """Регистрация первого админа. Возвращает JWT-токен логина или ''."""
     resp, code = rw_api_local(None, "POST", "auth/register",
                               {"username": username, "password": password})
+    # code=0 — до HTTP не дошло: REST-инстанс панели ещё не слушает 3000 и
+    # docker-proxy рвёт соединение. Ждать тут дешевле, чем падать.
+    for attempt in range(6):
+        if code != 0:
+            break
+        say("  Панель оборвала соединение, повтор через 5 с (%d/6)..." % (attempt + 1))
+        nap(5)
+        resp, code = rw_api_local(None, "POST", "auth/register",
+                                  {"username": username, "password": password})
     if code in (200, 201):
         ok("Админ зарегистрирован")
     elif code in (400, 409):
@@ -1462,10 +1509,16 @@ def remnawave_bringup(cfg):
         # /health на порту метрик — тот же эндпоинт, что в healthcheck контейнера.
         # По auth/register проверять нельзя: маршрут только POST, и GET на нём
         # всегда отдаёт 404, сколько бы панель ни работала.
-        code, _ = run("curl -s -o /dev/null -w '%{http_code}' "
-                      "http://127.0.0.1:3001/health")
-        if code.strip() == "200":
-            up = True; break
+        # Готовность — это ответ САМОГО API на 3000, а не /health на 3001.
+        # Метрики поднимаются раньше REST-инстанса (в логах панели cron-0
+        # стартует на секунду-полторы раньше rest-0), а порт 3000 к тому
+        # моменту уже опубликован docker-proxy: он принимает соединение и рвёт
+        # его, раз внутри контейнера ещё никто не слушает. Регистрация в эту
+        # щель ловила ECONNRESET сразу после бодрого «панель запущена».
+        #
+        # Заголовки обязательны: proxyCheckMiddleware рвёт сокет, если нет
+        # x-forwarded-proto: https И непустого x-forwarded-for. Без них ответа
+        # не будет никогда и проба ничего не измеряет.
         code, _ = run("RDOM=$(grep PANEL_DOMAIN /opt/remnawave/.env | head -1 | cut -d= -f2); "
                       "curl -s -X POST -H \"Host: ${RDOM:-localhost}\" "
                       "-H 'Content-Type: application/json' -d '{}' "
@@ -2505,6 +2558,9 @@ def main():
         err("Домен обязателен"); sys.exit(1)
     if not RE_DOMAIN.match(domain):
         err("Домен '%s' не похож на домен (ожидается вид example.com)" % domain)
+        hint = homoglyph_hint(domain)
+        if hint:
+            say("  " + hint)
         sys.exit(1)
     origin = "origin." + domain
 
@@ -2514,6 +2570,9 @@ def main():
         if not RE_XPATH.match(path):
             err("Путь '%s' невалиден: ожидается вид /abc123 "
                 "(латиница, цифры, - _ . ~ /)" % path)
+            hint = homoglyph_hint(path)
+            if hint:
+                say("  " + hint)
             sys.exit(1)
         if args.xport:
             xport = args.xport
