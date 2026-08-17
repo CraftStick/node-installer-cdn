@@ -2377,15 +2377,12 @@ def install_node_only(cfg):
     write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""),
                mode=0o600)
     setup_xray_ru_geo()
-    if cfg.get("skip_cdn"):
-        say("  Пропуск nginx CDN-origin (режим «только нода»)")
-    else:
-        conf = nginx_cdn_origin_config(xport, path, "prefix")
-        write_file("/etc/nginx/sites-available/default", conf)
-        run("rm -f /etc/nginx/sites-enabled/default && "
-            "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
-            "nginx -t && systemctl restart nginx")
-        upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
+    conf = nginx_cdn_origin_config(xport, path, "prefix")
+    write_file("/etc/nginx/sites-available/default", conf)
+    run("rm -f /etc/nginx/sites-enabled/default && "
+        "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
+        "nginx -t && systemctl restart nginx")
+    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup(extra_tcp=[2053])
     # Панель здесь удалённая и стучится к ноде на 2222 снаружи: без этого
     # правила политика deny incoming закрывает порт вообще для всех, и нода
@@ -2423,35 +2420,6 @@ def cascade_direction_ok(exit_ip):
 #  Отдельные компоненты: только панель / только нода / только CDN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def install_panel_only(cfg):
-    """Режим 4: только панель — без локальной ноды и без CDN-origin.
-
-    Remnawave: docker-панель + регистрация админа + API-токен.
-    3x-ui:     панель + nginx-прокси + LE/self-signed.
-    Ноды подключаются потом отдельным запуском (режим «только нода»)."""
-    domain = cfg["domain"]
-    admin_pw = cfg["admin_pass"]
-    if cfg.get("panel") == "2":
-        step("Установка панели 3x-ui (без CDN inbound)")
-        panel_port = random.randint(20000, 40000)
-        panel_path = rand(10, "abcdefghijklmnopqrstuvwxyz0123456789")
-        ensure_nginx_base()
-        install_3xui_panel(admin_pw, panel_port, panel_path)
-        setup_xray_ru_geo()
-        nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
-        if not issue_le_cert(domain):
-            self_signed_cert(domain)
-        nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
-        firewall_setup()
-        ok("Панель 3x-ui готова — подключай ноды в веб-интерфейсе")
-        return {"panel_only": True, "panel_port": panel_port,
-                "panel_path": panel_path}
-    # Remnawave
-    token = remnawave_bringup(cfg)
-    firewall_setup()
-    ok("Панель Remnawave готова — подключай ноды (режим «только нода»)")
-    return {"panel_only": True, "token": token}
-
 
 def install_cdn_only(cfg):
     """Режим 6: только nginx CDN-origin перед уже работающей нодой на ЭТОМ сервере.
@@ -2487,7 +2455,7 @@ def parse_args():
     """Parse CLI args for non-interactive mode."""
     p = argparse.ArgumentParser(description="VPN CDN Installer v%s" % INSTALLER_VERSION)
     p.add_argument("--mode", help="1=Panel+node here, 2=Panel here+node remote, "
-                   "3=Node+CDN to existing panel, 4=Panel only, 5=Node only, 6=CDN only")
+                   "3=Node+CDN to existing panel, 4=CDN origin only")
     p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (modes 1,2,4)")
     p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb")
     p.add_argument("--domain", help="Domain name")
@@ -2720,14 +2688,11 @@ def main():
         "Панель + нода (всё на этом сервере)",
         "Панель здесь + нода на другом сервере",
         "Нода + CDN к существующей панели",
-        "Только панель (ноды подключишь потом)",
-        "Только нода (к существующей панели, без CDN)",
         "Только CDN-origin (перед уже работающей нодой)"]))
 
     # какие шаги нужны этому режиму
-    need_panel = mode in ("1", "2", "4")           # спросить тип панели
-    need_cdn   = mode in ("1", "2", "3", "5", "6") # нужен CDN-провайдер (тег/инструкция)
-    cdn_origin = mode in ("1", "2", "3", "6")      # ставит nginx CDN-origin + инструкция
+    need_panel = mode in ("1", "2")   # тип панели спрашиваем, только если её ставим
+    # CDN-провайдер и nginx-origin нужны во всех оставшихся режимах
 
     # ── панель ──
     if need_panel:
@@ -2736,13 +2701,10 @@ def main():
     else:
         panel = "1"
 
-    # ── CDN ──
-    if need_cdn:
-        cdn_n = int(args.cdn) if args.cdn else choose("CDN провайдер?", [
-            "VK Cloud", "Yandex Cloud", "Beeline (CDNvideo)", "Timeweb"])
-        cdn_name = CDN_NAMES[cdn_n]
-    else:
-        cdn_name = ""
+    # ── CDN: нужен во всех режимах ──
+    cdn_n = int(args.cdn) if args.cdn else choose("CDN провайдер?", [
+        "VK Cloud", "Yandex Cloud", "Beeline (CDNvideo)", "Timeweb"])
+    cdn_name = CDN_NAMES[cdn_n]
 
     domain = (args.domain or ask("Домен без http:// (Domain)") or "").strip()
     if not domain:
@@ -2756,7 +2718,7 @@ def main():
     origin = "origin." + domain
 
     # путь/upstream-порт: режим 6 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
-    if mode == "6":
+    if mode == "4":
         path = (args.path or ask("Существующий xhttp путь (например /abc123)") or "").strip()
         if not RE_XPATH.match(path):
             err("Путь '%s' невалиден: ожидается вид /abc123 "
@@ -2784,7 +2746,7 @@ def main():
     # Раньше запасной вход добавлялся молча. Теперь спрашиваем — но только
     # там, где инбаунды вообще создаются, и только если не задано флагом.
     want_grpc = not args.no_grpc
-    if mode in ("1", "2", "3", "5") and not args.no_grpc:
+    if mode in ("1", "2", "3") and not args.no_grpc:
         say("")
         say("  Основной вход — VLESS XHTTP packet-up через CDN, он ставится всегда.")
         want_grpc = choose("Добавить к нему запасной вход?", [
@@ -2798,21 +2760,16 @@ def main():
            "no_origin_le": args.no_origin_le}
 
     # ── DNS ──
-    if mode == "4":
-        dns_wait(["A %s -> %s   (панель, DNS only)" % (domain, my_ip)],
-                 skip=args.skip_dns_wait)
-    elif cdn_origin:
-        dns_wait(["A     %s        ->  %s   (DNS only)" % (origin, my_ip),
-                  "CNAME %s -> [CDN CNAME после создания] (DNS only)" % domain],
-                 skip=args.skip_dns_wait)
-    # mode 5 (только нода) — DNS не требуется
+    dns_wait(["A     %s        ->  %s   (DNS only)" % (origin, my_ip),
+              "CNAME %s -> [CDN CNAME после создания] (DNS only)" % domain],
+             skip=args.skip_dns_wait)
 
     # ── снести прошлую установку тех компонентов, которые ставим сейчас ──
     if state_is_done("wipe"):
         say("  Прошлая установка уже снесена на прошлом запуске — пропускаю")
     elif not args.no_wipe:
-        wipe_previous(panel=(mode in ("1", "2", "4")),
-                      node=(mode in ("1", "2", "3", "5")),
+        wipe_previous(panel=(mode in ("1", "2")),
+                      node=(mode in ("1", "2", "3")),
                       assume_yes=args.wipe)
         state_done("wipe")
 
@@ -2831,7 +2788,7 @@ def main():
                     "pass": args.node_pass, "key": args.node_key}
             setup_remote_node(cred, None, my_ip, origin, cdn_name, path, cfg["xport"],
                               no_origin_le=cfg.get("no_origin_le"))
-    elif mode in ("3", "5"):
+    elif mode == "3":
         cfg["panel_url"] = ssh_host(args.panel_url or ask_required(
             "IP/URL панели Remnawave", "без адреса панели подключиться некуда"))
         cfg["panel_ssh_user"] = args.panel_ssh_user
@@ -2848,49 +2805,33 @@ def main():
                 if not cfg["panel_ssh_pass"]:
                     warn("Пустой пароль — SSH к панели не пройдёт "
                          "(или запусти с --node-key /путь/к/ключу)")
-        cfg["skip_cdn"] = (mode == "5")   # «только нода» — без nginx CDN-origin
         result = install_node_only(cfg)
     elif mode == "4":
-        result = install_panel_only(cfg)
-    elif mode == "6":
         result = install_cdn_only(cfg)
 
     # ── CDN-инструкция + ожидание ──
-    cdn_domain = ""
-    if cdn_origin:
-        print_cdn_instructions(cdn_name, origin, my_ip)
-        if not args.skip_cdn_wait:
-            try:
-                input("\n  " + _c(C_ACC, "❯") + " Enter когда CDN настроен и серт"
-                      " выпущен" + _c(C_DIM, "  "))
-            except (EOFError, KeyboardInterrupt):
-                pass
-        cdn_domain = ask("CDN домен (например xxx.cdn.twcstorage.ru)")
+    print_cdn_instructions(cdn_name, origin, my_ip)
+    if not args.skip_cdn_wait:
+        try:
+            input("\n  " + _c(C_ACC, "❯") + " Enter когда CDN настроен и серт"
+                  " выпущен" + _c(C_DIM, "  "))
+        except (EOFError, KeyboardInterrupt):
+            pass
+    cdn_domain = ask("CDN домен (например xxx.cdn.twcstorage.ru)")
 
     # ── финальный отчёт ──
     cdn_val = cdn_domain or "— укажи после настройки провайдера"
-    if mode == "5":
-        rows = [("Режим", "только нода → панель %s" % cfg.get("panel_url", "")),
-                ("Origin", "%s  (A → %s)" % (origin, my_ip)),
-                ("Нода", "xhttp 127.0.0.1:%d  путь %s" % (xport, path)),
-                "",
-                ("Дальше", "режим 6 (только CDN) перед этой нодой:"),
-                ("", "--xport %d --path %s" % (xport, path))]
-    elif mode == "6":
+    if mode == "4":
         rows = [("Режим", "только CDN-origin"),
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
                 ("nginx", ":443 → 127.0.0.1:%d  путь %s" % (xport, path)),
                 ("CDN", cdn_val)]
     else:
-        rows = []
-        if mode == "4":
-            rows.append(("Режим", "только панель — ноды подключишь позже"))
-        rows += [("Панель", "https://%s/" % domain),
+        rows = [("Панель", "https://%s/" % domain),
                  ("Логин", "admin"),
                  ("Пароль", admin_pw),
-                 ("Origin", "%s  (A → %s)" % (origin, my_ip))]
-        if cdn_origin:
-            rows.append(("CDN", cdn_val))
+                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
+                 ("CDN", cdn_val)]
     if result.get("sub_url"):
         rows.append(("Подписка", result["sub_url"]))
     card("ГОТОВО · УСТАНОВКА ЗАВЕРШЕНА", rows, color=C_OK)
