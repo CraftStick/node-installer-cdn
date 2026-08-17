@@ -287,6 +287,22 @@ REMNANODE_COMPOSE = """services:
 def rand(n=16, alphabet=string.ascii_letters + string.digits):
     return "".join(random.choice(alphabet) for _ in range(n))
 
+def rand_password(n=28):
+    """Пароль под требования Remnawave: >=24 символов, есть A-Z, a-z и 0-9.
+
+    Панель проверяет ^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9]).{24,}$ — случайной
+    строки мало, нужно гарантировать каждый класс символов.
+    """
+    n = max(n, 24)
+    chars = [random.choice(string.ascii_uppercase),
+             random.choice(string.ascii_lowercase),
+             random.choice(string.digits)]
+    pool = string.ascii_letters + string.digits
+    chars += [random.choice(pool) for _ in range(n - 3)]
+    random.shuffle(chars)
+    return "".join(chars)
+
+
 def rand_path():
     """Random path for panel/CDN access."""
     return "/" + rand(random.randint(8, 14),
@@ -1177,12 +1193,20 @@ def remnawave_register(username, password):
     if code in (200, 201):
         ok("Админ зарегистрирован")
     elif code in (400, 409):
-        say("  Админ уже зарегистрирован")
+        # 400 — это не только «уже зарегистрирован», но и отказ валидации
+        # (пароль короче 24 символов либо без цифры/заглавной). Считать его
+        # успехом нельзя: раньше установка доезжала до конца с пустым токеном
+        # и 401 на каждом вызове API.
+        say("  Регистрация вернула %s: %s"
+            % (code, str(resp.get("message") or resp)[:160]))
     tok = (resp.get("response", {}) or {}).get("accessToken") or resp.get("accessToken")
     if not tok:
         resp, code = rw_api_local(None, "POST", "auth/login",
                                   {"username": username, "password": password})
         tok = (resp.get("response", {}) or {}).get("accessToken") or resp.get("accessToken")
+        if not tok:
+            err("Ни регистрация, ни вход не дали токен: %s"
+                % str(resp.get("message") or resp)[:160])
     return tok or ""
 
 
@@ -1198,6 +1222,9 @@ def remnawave_api_token(login_jwt):
     if out.strip().startswith("eyJ"):
         ok("API-токен: OK (из БД)")
         return out.strip()
+    if not login_jwt:
+        err("API-токена нет — любой вызов API вернёт 401")
+        return ""
     ok("API-токен: OK (login JWT)")
     return login_jwt
 
@@ -1408,6 +1435,11 @@ def remnawave_bringup(cfg):
     say("  Регистрация админа...")
     login_jwt = remnawave_register("admin", admin_pw)
     token = remnawave_api_token(login_jwt)
+    if not token:
+        err("Без токена панели профиль, ноду и юзера создать нельзя")
+        say("  Сама панель работает: https://%s/ — но настроить её через API "
+            "не выйдет, продолжать бессмысленно" % domain)
+        sys.exit(1)
     write_file("/opt/remnawave/.panel_token", token, mode=0o600)
     return token
 
@@ -2398,7 +2430,7 @@ def main():
     else:
         path = rand_path()
         xport = random.randint(10000, 20000)
-    admin_pw = rand(16)
+    admin_pw = rand_password()
 
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
