@@ -62,6 +62,11 @@ VALKEY_IMAGE     = "valkey/valkey:9-alpine"    # 3.x: redis через unix-со
 RE_DOMAIN = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$")
 RE_XPATH  = re.compile(r"^/[A-Za-z0-9._~/-]{1,120}$")
 
+# Локальный порт xhttp-инбаунда. Фиксированный, как в оригинальном
+# установщике: наружу он не смотрит (TLS снимает nginx), поэтому случайность
+# ничего не даёт, а предсказуемый порт нужен режиму 6 и ручной диагностике.
+XHTTP_PORT = 4443
+
 CDN_CRT = "/etc/nginx/ssl/cdn.crt"
 CDN_KEY = "/etc/nginx/ssl/cdn.key"
 
@@ -2151,7 +2156,7 @@ def install_3xui(cfg):
     # CDN xhttp inbound
     step("Создание %s CDN inbound" % cfg["cdn"])
     uuid = str(_uuid.uuid4()); sub_id = rand(16)
-    xport = random.randint(10000, 20000)
+    xport = XHTTP_PORT
     xui_cdn_inbound(cfg["cdn"], xport, path, origin, uuid, sub_id)
 
     reality = None
@@ -2355,7 +2360,7 @@ def install_node_only(cfg):
     step("Создание профиля через API панели")
     user_uuid = str(_uuid.uuid4())
     origin = cfg.get("origin_domain", cfg["domain"]); path = cfg["path"]
-    xport = random.randint(10000, 20000)
+    xport = XHTTP_PORT
     inbounds = [build_xhttp_inbound(xport, path, "%s-CDN" % cfg["cdn"], user_uuid, origin)]
     prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
     inbound_uuids = [u for u in (tag2uuid.get(i["tag"]) for i in inbounds) if u]
@@ -2665,13 +2670,14 @@ def main():
         if args.xport:
             xport = args.xport
         else:
-            xp = ask("Локальный upstream-порт xray на 127.0.0.1", default="8080")
-            xport = int(xp) if str(xp).isdigit() else random.randint(10000, 20000)
+            xp = ask("Локальный upstream-порт xray на 127.0.0.1",
+                     default=str(XHTTP_PORT))
+            xport = int(xp) if str(xp).isdigit() else XHTTP_PORT
         if not 0 < xport < 65536:
             err("Порт %s вне диапазона 1..65535" % xport); sys.exit(1)
     else:
         path = rand_path()
-        xport = random.randint(10000, 20000)
+        xport = XHTTP_PORT
     admin_pw = rand_password()
 
     # ── запасные каналы ──
