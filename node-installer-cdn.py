@@ -1267,12 +1267,20 @@ def remnawave_bringup(cfg):
     say("  Ожидание запуска контейнеров (до 5 минут)...")
     up = False
     for i in range(60):
+        # /health на порту метрик — тот же эндпоинт, что в healthcheck контейнера.
+        # По auth/register проверять нельзя: маршрут только POST, и GET на нём
+        # всегда отдаёт 404, сколько бы панель ни работала.
+        code, _ = run("curl -s -o /dev/null -w '%{http_code}' "
+                      "http://127.0.0.1:3001/health")
+        if code.strip() == "200":
+            up = True; break
         code, _ = run("RDOM=$(grep PANEL_DOMAIN /opt/remnawave/.env | head -1 | cut -d= -f2); "
-                      "curl -s -H \"Host: ${RDOM:-localhost}\" "
+                      "curl -s -X POST -H \"Host: ${RDOM:-localhost}\" "
+                      "-H 'Content-Type: application/json' -d '{}' "
                       "http://127.0.0.1:3000/api/auth/register "
                       "-H 'X-Forwarded-Proto: https' -H 'X-Forwarded-For: 127.0.0.1' "
                       "-o /dev/null -w '%{http_code}'")
-        if code.strip() in ("200", "201", "400", "409"):
+        if code.strip() in ("200", "201", "400", "409", "422"):
             up = True; break
         if i and i % 6 == 0:      # каждые 30 с — признак жизни, а не молчание на 5 минут
             ps, _ = run("cd /opt/remnawave && docker compose ps -a "
