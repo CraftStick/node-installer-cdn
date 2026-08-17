@@ -1266,6 +1266,7 @@ def remnawave_bringup(cfg):
 
     say("  Ожидание запуска контейнеров (до 5 минут)...")
     up = False
+    dying = 0
     for i in range(60):
         # /health на порту метрик — тот же эндпоинт, что в healthcheck контейнера.
         # По auth/register проверять нельзя: маршрут только POST, и GET на нём
@@ -1290,6 +1291,17 @@ def remnawave_bringup(cfg):
             if states and not any("running" in s.lower() for s in states):
                 err("Ни один контейнер не поднялся — ждать дальше бессмысленно")
                 break
+            # remnawave=restarting значит, что панель уже упала и её поднял
+            # restart:always. Второй такой замер подряд — это не «долгий старт»,
+            # а цикл падений: ждать оставшиеся минуты незачем.
+            panel_state = next((s for s in states if s.startswith("remnawave=")), "")
+            if any(w in panel_state for w in ("restarting", "exited", "dead")):
+                dying += 1
+                if dying >= 2:
+                    err("Контейнер remnawave падает и перезапускается по кругу")
+                    break
+            else:
+                dying = 0
         nap(5)
     if not up:
         err("Панель Remnawave не поднялась — логи контейнеров:")
