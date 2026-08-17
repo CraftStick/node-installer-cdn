@@ -2405,6 +2405,18 @@ def install_node_only(cfg):
     user_uuid = str(_uuid.uuid4())
     xport = XHTTP_PORT
     inbounds = [build_xhttp_inbound(xport, path, "%s_CDN" % cfg["cdn"].upper())]
+    # Запасной вход — как в режиме 1: раньше про него здесь спрашивали, а
+    # инбаунд всё равно создавался только один, и ответ уходил в никуда.
+    reality = None
+    if not cfg.get("no_grpc"):
+        priv, pub = gen_x25519()
+        if priv:
+            sid = rand(8, "0123456789abcdef")
+            service = _slug("grpc")
+            inbounds.append(build_grpc_inbound(2053, user_uuid, priv, pub, sid,
+                                               service))
+            reality = {"pbk": pub, "sid": sid, "service": service, "port": 2053}
+            ok("Добавлен gRPC Reality inbound (TCP 2053)")
     prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
     inbound_uuids = [u for u in (tag2uuid.get(i["tag"]) for i in inbounds) if u]
 
@@ -2426,8 +2438,7 @@ def install_node_only(cfg):
         "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
         "nginx -t && systemctl restart nginx")
     upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
-    # В профиле только CDN-вход: наружу открывать нечего, кроме 80/443.
-    firewall_setup()
+    firewall_setup(extra_tcp=([2053] if reality else []))
     # Панель здесь удалённая и стучится к ноде на 2222 снаружи: без этого
     # правила политика deny incoming закрывает порт вообще для всех, и нода
     # появляется в панели, но остаётся неуправляемой.
@@ -2450,7 +2461,8 @@ def install_node_only(cfg):
     sub_url = create_remnawave_user(api, "user1", user_uuid,
                                     pdom.strip() or panel["ip"])
     return {"user_uuid": user_uuid, "prof_uuid": prof_uuid, "my_ip": my_ip,
-            "sub_url": sub_url, "host_uuid": host_uuid, "api": api}
+            "sub_url": sub_url, "host_uuid": host_uuid, "api": api,
+            "reality": reality}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2810,8 +2822,8 @@ def main():
         say("")
         say("  Основной вход — VLESS XHTTP packet-up через CDN, он ставится всегда.")
         want_grpc = choose("Добавить к нему запасной вход?", [
-            "Да, gRPC Reality (TCP 2053) — прямой вход, работает при отказе CDN",
-            "Нет, только CDN — минимум открытых портов наружу"]) == 1
+            "Да, gRPC Reality — прямой вход, работает при отказе CDN",
+            "Нет, только XHTTP через CDN — минимум открытых портов наружу"]) == 1
 
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
