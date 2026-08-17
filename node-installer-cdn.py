@@ -16,7 +16,7 @@ node-installer-cdn.py — установщик прокси-инфраструк
   1  Панель + нода на этом сервере
   2  Панель здесь + нода на другом сервере (по SSH)
   3  Нода + CDN к уже существующей панели
-  4  Только панель      5  Только нода      6  Только CDN-origin
+  4  Только CDN перед уже работающей нодой
 Панель: Remnawave 3.x или 3x-ui. CDN: VK Cloud / Yandex Cloud / Beeline(CDNvideo)
 / Timeweb. Опционально — каскад (relay в РФ -> exit за рубежом).
 
@@ -1998,14 +1998,14 @@ def setup_remnawave_web(cfg, xport, path):
     """
     domain = cfg["domain"]
     origin = cfg.get("origin_domain", domain)
-    step("nginx: панель и CDN-origin")
+    step("nginx: панель и CDN")
     pkg_install("nginx openssl curl ca-certificates certbot")
     ensure_nginx_base()
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
     write_decoy(origin)
     nginx_write_conf("default", nginx_cdn_origin_config(xport, path, "prefix"))
     nginx_write_conf("panel.conf", nginx_panel_proxy(domain, 3000))
-    ok("nginx: origin :443 -> 127.0.0.1:%d, панель %s -> 127.0.0.1:3000"
+    ok("nginx: CDN :443 -> 127.0.0.1:%d, панель %s -> 127.0.0.1:3000"
        % (xport, domain))
     # LE для домена панели: без копирования, vhost переписываем на live-пути
     if issue_le_cert(domain, crt=None, key=None):
@@ -2436,7 +2436,7 @@ def cascade_direction_ok(exit_ip):
 
 
 def install_cdn_only(cfg):
-    """Режим 6: только nginx CDN-origin перед уже работающей нодой на ЭТОМ сервере.
+    """Режим 4: только nginx-фронт CDN перед уже работающей нодой на ЭТОМ сервере.
 
     Не трогает панель и docker-ноду — ставит только nginx-фронт (self-signed серт
     + decoy) на upstream 127.0.0.1:<xport> с путём <path> и печатает инструкцию
@@ -2445,7 +2445,7 @@ def install_cdn_only(cfg):
     xport = cfg["xport"]
     path = cfg["path"]
     my_ip = get_ip() or "<SERVER_IP>"
-    step("Установка nginx CDN-origin (только CDN)")
+    step("Установка CDN-фронта")
     say("  Upstream: 127.0.0.1:%d   path: %s" % (xport, path))
     ensure_nginx_base()
     self_signed_cert(origin)
@@ -2457,7 +2457,7 @@ def install_cdn_only(cfg):
         "nginx -t && systemctl restart nginx")
     upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup()
-    ok("nginx CDN-origin поднят на :443 -> 127.0.0.1:%d" % xport)
+    ok("CDN-фронт поднят на :443 -> 127.0.0.1:%d" % xport)
     return {"cdn_only": True, "my_ip": my_ip}
 
 
