@@ -2,6 +2,8 @@
 
 # node-installer-cdn
 
+</div>
+
 ---
 
 ## ⚡ Установка
