@@ -2518,6 +2518,8 @@ def parse_args():
                    help="Снести прошлую установку без вопросов (для автозапуска)")
     p.add_argument("--no-wipe", action="store_true",
                    help="Не трогать прошлую установку (ставить поверх)")
+    p.add_argument("--fresh", action="store_true",
+                   help="Забыть сохранённый прогресс и начать с нуля")
     p.add_argument("--skip-dns-wait", action="store_true")
     p.add_argument("--skip-cdn-wait", action="store_true")
     p.add_argument("--cascade", action="store_true", help="Enable cascade relay")
@@ -2544,7 +2546,77 @@ def flush_stdin():
         pass
 
 
-def ask(prompt, default=None):
+STATE_PATH = "/var/lib/node-installer-cdn/state.json"
+_STATE = {"answers": {}, "done": [], "values": {}}
+_RESUME = False          # True, когда продолжаем прошлый запуск
+
+
+def state_load():
+    """Прочитать состояние прошлого запуска. Возвращает True, если оно есть."""
+    global _STATE
+    try:
+        with open(STATE_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("answers") is not None:
+            _STATE = {"answers": data.get("answers") or {},
+                      "done": data.get("done") or [],
+                      "values": data.get("values") or {}}
+            return bool(_STATE["answers"] or _STATE["done"])
+    except Exception:
+        pass
+    return False
+
+
+def state_save():
+    """Сохранить состояние. Внутри пароль админа, поэтому файл только для root."""
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            json.dump(_STATE, f, ensure_ascii=False, indent=1)
+        os.chmod(STATE_PATH, 0o600)
+    except OSError:
+        pass          # не смогли сохранить — установка всё равно должна ехать
+
+
+def state_clear():
+    _STATE["answers"].clear(); _STATE["done"][:] = []; _STATE["values"].clear()
+    try:
+        os.remove(STATE_PATH)
+    except OSError:
+        pass
+
+
+def state_done(step):
+    """Отметить фазу пройденной, чтобы не повторять её при продолжении."""
+    if step not in _STATE["done"]:
+        _STATE["done"].append(step)
+        state_save()
+
+
+def state_is_done(step):
+    return _RESUME and step in _STATE["done"]
+
+
+def state_value(key, produce):
+    """Значение, которое должно совпадать между запусками (путь, пароль).
+
+    При продолжении берётся прошлое: сгенерировать новое — значит разойтись
+    с тем, что уже прописано в панели, nginx и .env.
+    """
+    if _RESUME and key in _STATE["values"]:
+        return _STATE["values"][key]
+    val = produce()
+    _STATE["values"][key] = val
+    state_save()
+    return val
+
+
+def ask(prompt, default=None, remember=True):
+    # При продолжении прошлый ответ становится подсказкой по умолчанию: Enter
+    # — оставить как было, иначе набрать новое. Именно подсказкой, а не молчаливой
+    # подстановкой: перезапускают обычно из-за неверного ответа.
+    if _RESUME and default is None and remember:
+        default = _STATE["answers"].get(prompt)
     tail = _c(C_DIM, " [%s]" % default) if default else ""
     line = "  " + _c(C_ACC, "❯") + " " + prompt + tail + _c(C_DIM, "  ")
     while True:
@@ -2556,7 +2628,11 @@ def ask(prompt, default=None):
         except UnicodeDecodeError:
             warn("Ввод не похож на UTF-8 (обрывок прошлого нажатия) — повтори")
             continue
-        return v or (default or "")
+        v = v or (default or "")
+        if v and remember:
+            _STATE["answers"][prompt] = v
+            state_save()
+        return v
 
 
 def ask_required(prompt, why):
@@ -2594,9 +2670,13 @@ def choose(prompt, options):
     for i, o in enumerate(options, 1):
         print("   " + _c(C_ACC, "%2d" % i) + _c(C_DIM, " │ ") + o, flush=True)
     hr()
+    # ключ ответа — текст вопроса, иначе все «Выбор» слились бы в один
+    prev = _STATE["answers"].get(prompt) if _RESUME else None
     while True:
-        v = ask("Выбор")
+        v = ask("Выбор", default=prev, remember=False)
         if v.isdigit() and 1 <= int(v) <= len(options):
+            _STATE["answers"][prompt] = v
+            state_save()
             return int(v)
 
 
@@ -2616,6 +2696,24 @@ def main():
 
     my_ip = get_ip() or "<SERVER_IP>"
     say("   " + _c(C_DIM, "◦ Server IP: ") + _c(C_VAL, my_ip))
+
+    # ── продолжить прошлый запуск? ──
+    global _RESUME
+    if args.fresh:
+        state_clear()
+    elif state_load():
+        dom = _STATE["answers"].get("Домен без http:// (Domain)", "?")
+        steps = ", ".join(_STATE["done"]) or "ни одна"
+        callout("Найден незакончённый запуск", [
+            "домен: %s" % dom,
+            "пройдено: %s" % steps,
+            "продолжив, скрипт подставит прошлые ответы (Enter — оставить)",
+            "и не станет снова снашивать уже поднятое"])
+        _RESUME = ask("Продолжить с того места? (Y/n)", "y").lower() \
+            not in ("n", "no", "н", "нет")
+        if not _RESUME:
+            state_clear()
+            say("  Начинаем с чистого листа")
 
     # ── режим ──
     mode = args.mode or str(choose("Режим установки?", [
@@ -2676,9 +2774,11 @@ def main():
         if not 0 < xport < 65536:
             err("Порт %s вне диапазона 1..65535" % xport); sys.exit(1)
     else:
-        path = rand_path()
+        # путь и пароль обязаны совпадать между запусками: они уже прописаны
+        # в инбаунде панели, в nginx и в .env
+        path = state_value("path", rand_path)
         xport = XHTTP_PORT
-    admin_pw = rand_password()
+    admin_pw = state_value("admin_pw", rand_password)
 
     # ── запасные каналы ──
     # Раньше запасной вход добавлялся молча. Теперь спрашиваем — но только
@@ -2708,10 +2808,13 @@ def main():
     # mode 5 (только нода) — DNS не требуется
 
     # ── снести прошлую установку тех компонентов, которые ставим сейчас ──
-    if not args.no_wipe:
+    if state_is_done("wipe"):
+        say("  Прошлая установка уже снесена на прошлом запуске — пропускаю")
+    elif not args.no_wipe:
         wipe_previous(panel=(mode in ("1", "2", "4")),
                       node=(mode in ("1", "2", "3", "5")),
                       assume_yes=args.wipe)
+        state_done("wipe")
 
     # ── установка ──
     result = {}
@@ -2791,6 +2894,7 @@ def main():
     if result.get("sub_url"):
         rows.append(("Подписка", result["sub_url"]))
     card("ГОТОВО · УСТАНОВКА ЗАВЕРШЕНА", rows, color=C_OK)
+    state_clear()      # дошли до конца — продолжать нечего
 
     if cdn_domain and result.get("user_uuid"):
         link = ("vless://%s@%s:443?type=xhttp&security=tls&sni=%s&fp=random"
