@@ -1170,6 +1170,12 @@ def resolve_panel_token(cred, cfg):
         if cand and "\n" not in cand and " " not in cand:
             tok, src = cand, "/opt/remnawave/.panel_token"
     if not tok:
+        # тот же способ, что и локально: подписать API-JWT секретом панели.
+        # Работает без логина/пароля, если у нас есть SSH к панели.
+        cand = mint_api_token(lambda c, **k: run_remote(cred, c, **k))
+        if cand:
+            tok, src = cand, "APP_SECRET (self-signed)"
+    if not tok:
         user, pwd = cfg.get("panel_user"), cfg.get("panel_pass")
         if not (user and pwd) and sys.stdin.isatty():
             warn("Токен панели не найден — панель ставил не этот установщик")
@@ -1215,29 +1221,85 @@ def remnawave_register(username, password):
     return tok or ""
 
 
-def remnawave_api_token(login_jwt):
-    """Создать API-токен штатным эндпоинтом POST /api/tokens.
+def _sign_api_jwt(secret, uuid_str, days=365):
+    """Подписать JWT роли API секретом панели (HS256).
 
-    JWT логина годится только для дашборда: на прочих маршрутах панель отвечает
-    403 «For API requests you must create own API-token in the admin dashboard».
-    Сам /api/tokens, наоборот, принимает только admin JWT и запрещён для
-    API-ключа — поэтому порядок именно такой: логин, затем выпуск токена.
+    Панель проверяет ВСЕ токены секретом APP_SECRET (jwt.strategy.ts), а гвард
+    для роли API не требует заголовка X-Remnawave-Client-Type — в отличие от
+    ADMIN. Значит достаточно подписать {uuid, username, role:'API'} тем же
+    секретом; проверено против эталона jwt.io побайтово.
     """
-    if not login_jwt:
-        err("Нет JWT админа — API-токен выпустить нечем")
+    import hmac, hashlib
+    b = lambda x: base64.urlsafe_b64encode(x).rstrip(b"=")
+    now = int(time.time())
+    seg = (b(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+           + b"." + b(json.dumps({"uuid": uuid_str, "username": None, "role": "API",
+                                  "iat": now, "exp": now + days * 86400},
+                                 separators=(",", ":")).encode()))
+    sig = b(hmac.new(secret.encode(), seg, hashlib.sha256).digest())
+    return (seg + b"." + sig).decode()
+
+
+def mint_api_token(runner, db="remnawave-db"):
+    """Выпустить API-токен без обращения к /api/tokens.
+
+    /api/tokens висит на роли ADMIN и без browser-заголовка отвечает 403, а
+    login-JWT на остальных маршрутах панель тоже не принимает. Рабочий путь
+    (как в оригинальном установщике): взять секрет из .env, вписать строку в
+    api_tokens и самому подписать JWT роли API — гвард верифицирует его тем же
+    секретом и находит uuid в таблице.
+
+    runner(cmd) -> (out, rc); работает и локально, и по SSH на панели.
+    """
+    secret = ""
+    for var in ("APP_SECRET", "JWT_API_TOKENS_SECRET", "JWT_AUTH_SECRET"):
+        out, _ = runner('grep -oP "%s=\\K.*" /opt/remnawave/.env 2>/dev/null' % var)
+        secret = (out or "").strip().strip('"')
+        if secret:
+            break
+    if not secret:
+        err("APP_SECRET не найден в /opt/remnawave/.env — токен не подписать")
         return ""
-    # одноимённый токен от прошлого запуска мешает создать новый
-    run('docker exec remnawave-db psql -U postgres -c '
-        '"DELETE FROM api_tokens WHERE name = \'installer\';" 2>/dev/null')
-    resp, code = rw_api_local(login_jwt, "POST", "tokens",
-                              {"name": "installer",
-                               "description": "node-installer-cdn"})
-    tok = (((resp.get("response") or {}).get("token") or {}).get("token") or "").strip()
-    if tok:
-        ok("API-токен выпущен через /api/tokens")
-        return tok
-    err("Панель не выдала API-токен (%s): %s"
-        % (code, str(resp.get("message") or resp)[:160]))
+    tok_uuid = str(_uuid.uuid4())
+    jwt = _sign_api_jwt(secret, tok_uuid)
+    # запись токена в БД: SQL уходит через base64+stdin, чтобы кавычки и
+    # массив scopes '{"*"}' не поломались в shell
+    sql = ("DELETE FROM api_tokens WHERE name = 'installer-cdn';\n"
+           "INSERT INTO api_tokens (uuid, name, created_at, updated_at, scopes, expire_at) "
+           "VALUES ('%s', 'installer-cdn', NOW(), NOW(), '{\"*\"}', "
+           "NOW() + INTERVAL '365 days') ON CONFLICT (uuid) DO NOTHING;" % tok_uuid)
+    b64 = base64.b64encode(sql.encode()).decode()
+    out, rc = runner("echo %s | base64 -d | docker exec -i %s psql -U postgres -v ON_ERROR_STOP=1"
+                     % (b64, db))
+    if rc != 0 or "ERROR" in (out or ""):
+        err("Не удалось записать токен в БД: %s" % (out or "").strip()[:160])
+        return ""
+    return jwt
+
+
+def remnawave_api_token(login_jwt):
+    """Выпустить рабочий API-токен для локальной панели (роль API)."""
+    jwt = mint_api_token(run)
+    if jwt:
+        probe, _ = rw_api_local(jwt, "GET", "nodes")
+        if "response" in probe:
+            ok("API-токен выпущен (self-signed, роль API)")
+            return jwt
+        warn("Self-signed токен не принят: %s"
+             % str(probe.get("message") or probe)[:120])
+    # запасной путь — штатный /api/tokens (нужен admin JWT + browser-заголовок)
+    if login_jwt:
+        run('docker exec remnawave-db psql -U postgres -c '
+            '"DELETE FROM api_tokens WHERE name = \'installer\';" 2>/dev/null')
+        resp, code = rw_api_local(login_jwt, "POST", "tokens",
+                                  {"name": "installer",
+                                   "description": "node-installer-cdn"})
+        tok = (((resp.get("response") or {}).get("token") or {}).get("token") or "").strip()
+        if tok:
+            ok("API-токен выпущен через /api/tokens")
+            return tok
+        err("Панель не выдала API-токен (%s): %s"
+            % (code, str(resp.get("message") or resp)[:160]))
     return ""
 
 
