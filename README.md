@@ -2,15 +2,6 @@
 
 # node-installer-cdn
 
-**Прокси, спрятанный за витриной рунета — панель, нода и обвязка в один запуск.**
-
-<img alt="Python 3" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-<img alt="Ubuntu / Debian" src="https://img.shields.io/badge/Ubuntu%20%2F%20Debian-root-E95420?style=flat-square&logo=ubuntu&logoColor=white">
-<img alt="Xray" src="https://img.shields.io/badge/Xray--core-VLESS%20%C2%B7%20XHTTP-000000?style=flat-square">
-<img alt="Лицензия MIT" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
-
-</div>
-
 ---
 
 ## ⚡ Установка
