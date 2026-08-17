@@ -2480,8 +2480,11 @@ def parse_args():
     p.add_argument("--panel-pass", help="Panel Remnawave password (mode 3)")
     p.add_argument("--panel-ssh-user", default="root", help="Panel SSH user (mode 3)")
     p.add_argument("--panel-ssh-pass", help="Panel SSH password (mode 3)")
-    p.add_argument("--no-hy2", action="store_true", help="Skip Hysteria2")
-    p.add_argument("--no-grpc", action="store_true", help="Skip gRPC")
+    p.add_argument("--hy2", action="store_true",
+                   help="Add Hysteria2 inbound (off by default: xray-core has "
+                        "no such protocol, the panel may reject the profile)")
+    p.add_argument("--no-hy2", action="store_true", help="Skip Hysteria2 (default)")
+    p.add_argument("--no-grpc", action="store_true", help="Skip gRPC Reality")
     p.add_argument("--no-origin-le", action="store_true",
                    help="Do not try Let's Encrypt for the CDN origin (keep self-signed)")
     p.add_argument("--squad", help="Squad number or name (mode 3 Remnawave)")
@@ -2650,9 +2653,24 @@ def main():
         xport = random.randint(10000, 20000)
     admin_pw = rand_password()
 
+    # ── запасные каналы ──
+    # Раньше gRPC и Hysteria2 добавлялись молча, и невалидный для xray-core
+    # hysteria2-вход ронял весь профиль панели. Теперь спрашиваем — но только
+    # там, где инбаунды вообще создаются, и только если не задано флагами.
+    want_grpc = not args.no_grpc
+    want_hy2 = args.hy2 and not args.no_hy2
+    if mode in ("1", "2", "3", "5") and not args.no_grpc and not args.hy2:
+        pick = choose("Запасные каналы, помимо CDN?", [
+            "gRPC Reality (TCP 2053) — рекомендуется, вход на случай отказа CDN",
+            "Только CDN — минимум открытых портов наружу",
+            "gRPC Reality + Hysteria2 (UDP 8443) — xray-core hysteria2 не знает, "
+            "панель может отвергнуть профиль"])
+        want_grpc = pick in (1, 3)
+        want_hy2 = pick == 3
+
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
-           "no_hy2": args.no_hy2, "no_grpc": args.no_grpc,
+           "no_hy2": not want_hy2, "no_grpc": not want_grpc,
            "cascade": args.cascade, "xport": xport,
            "no_origin_le": args.no_origin_le}
 
