@@ -523,6 +523,30 @@ def check_ubuntu():
         sys.exit(1)
 
 
+def check_disk(need_gb, cred=None):
+    """Предупредить, если под docker-образы не хватает места на /.
+
+    Панель тянет postgres + valkey + remnawave + subscription-page: на диске
+    ~5 ГБ это упирается в «no space left on device» уже на docker compose pull,
+    поэтому лучше сказать об этом до установки, а не через 5 минут ожидания.
+    """
+    runner = (lambda c, **k: run_remote(cred, c, **k)) if cred else run
+    out, rc = runner("df -Pm / | awk 'NR==2 {print $4}'")
+    try:
+        free_gb = int(out.strip()) / 1024.0
+    except ValueError:
+        return True
+    if free_gb >= need_gb:
+        return True
+    warn("Свободно всего %.1f ГБ на / — нужно ~%d ГБ под образы Docker"
+         % (free_gb, need_gb))
+    say("  Освободи место (docker system prune -af; apt-get clean) "
+        "или возьми диск побольше")
+    if sys.stdin.isatty() and ask("Всё равно продолжить? (y/N)", "n").lower() not in ("y", "yes", "д"):
+        sys.exit(1)
+    return False
+
+
 def fix_dns(cred=None):
     """Fix broken DNS (systemd-resolved stub) by writing direct nameservers."""
     cmd = ("nslookup google.com >/dev/null 2>&1 && exit 0; "
@@ -1191,6 +1215,7 @@ def remnawave_bringup(cfg):
     admin_pw = cfg["admin_pass"]
 
     step("Установка панели Remnawave 3.x")
+    check_disk(5)
     if not install_docker() or not ensure_compose():
         err("Docker не установился! Попробуй вручную: curl -fsSL https://get.docker.com | sh")
         sys.exit(1)
@@ -1226,25 +1251,42 @@ def remnawave_bringup(cfg):
 
     say("  Запуск контейнеров Remnawave...")
     run("cd /opt/remnawave && docker compose down 2>/dev/null")
-    run("cd /opt/remnawave && docker compose pull", timeout=900)
+    out, rc = run("cd /opt/remnawave && docker compose pull 2>&1", timeout=900)
+    if rc != 0:
+        err("docker compose pull не прошёл — образы не скачались:")
+        say("  " + "\n  ".join(out.strip().splitlines()[-8:]))
+        if "no space left" in out.lower():
+            say(run("df -h /")[0])
+            say("  Освободи место (docker system prune -af) или возьми диск побольше")
+        sys.exit(1)
     out, rc = run("cd /opt/remnawave && docker compose up -d 2>&1", timeout=600)
     if rc != 0:
         err("docker compose up ошибка:\n" + out)
+        sys.exit(1)
 
-    say("  Ожидание запуска контейнеров...")
+    say("  Ожидание запуска контейнеров (до 5 минут)...")
     up = False
-    for _ in range(60):
+    for i in range(60):
         code, _ = run("RDOM=$(grep PANEL_DOMAIN /opt/remnawave/.env | head -1 | cut -d= -f2); "
                       "curl -s -H \"Host: ${RDOM:-localhost}\" "
                       "http://127.0.0.1:3000/api/auth/register "
                       "-H 'X-Forwarded-Proto: https' -H 'X-Forwarded-For: 127.0.0.1' "
                       "-o /dev/null -w '%{http_code}'")
-        if code.strip() in ("200", "201", "400", "409", "201"):
+        if code.strip() in ("200", "201", "400", "409"):
             up = True; break
+        if i and i % 6 == 0:      # каждые 30 с — признак жизни, а не молчание на 5 минут
+            ps, _ = run("cd /opt/remnawave && docker compose ps -a "
+                        "--format '{{.Service}}={{.State}}' 2>/dev/null")
+            states = ps.split()
+            say("  %3d с · %s" % (i * 5, " ".join(states) or "контейнеров нет"))
+            if states and not any("running" in s.lower() for s in states):
+                err("Ни один контейнер не поднялся — ждать дальше бессмысленно")
+                break
         nap(5)
     if not up:
-        err("Панель Remnawave не запустилась за 5 минут!")
+        err("Панель Remnawave не поднялась — логи контейнеров:")
         say(run("docker compose -f /opt/remnawave/docker-compose.yml logs --tail=50 2>&1")[0])
+        say(run("df -h /")[0])
         sys.exit(1)
     ok("Панель Remnawave запущена")
 
