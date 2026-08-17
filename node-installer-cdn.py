@@ -1882,7 +1882,7 @@ def update_host_address(api, host_uuid, cdn_domain):
         return True
     warn("Не удалось переставить хост на %s: %s"
          % (cdn_domain, json.dumps(resp)[:160]))
-    say("  Поправь адрес хоста в панели вручную — сейчас там адрес сервера")
+    say("  Поправь адрес хоста в панели вручную — сейчас там origin")
     return False
 
 
@@ -2248,7 +2248,7 @@ def print_cdn_instructions(provider, origin, my_ip, path):
     print("  " + _c("1;" + C_TITLE, "Настройка CDN у провайдера")
           + _c(C_DIM, " · %s" % provider), flush=True)
     hr()
-    say("  Источник для CDN — %s (A -> %s), путь туннеля — %s/\n"
+    say("  Origin — %s (A -> %s), путь туннеля — %s/\n"
         % (origin, my_ip, "/" + path.strip("/")))
     if provider == "vk":
         say("""
