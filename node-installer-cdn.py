@@ -1206,6 +1206,58 @@ def _slug(prefix):
     return "%s-%s" % (prefix, rand(6, "abcdefghijklmnopqrstuvwxyz0123456789"))
 
 
+def _leftovers(paths, containers, vol_filter=""):
+    """Что осталось от прошлой установки: каталоги, контейнеры, тома."""
+    found = [p for p in paths if os.path.exists(p)]
+    names, _ = run("docker ps -a --format '{{.Names}}' 2>/dev/null")
+    found += ["контейнер " + c for c in containers if c in names.split()]
+    if vol_filter:
+        vols, _ = run("docker volume ls -q --filter name=%s 2>/dev/null" % vol_filter)
+        found += ["том " + v for v in vols.split()]
+    return found
+
+
+def wipe_previous(panel=False, node=False, assume_yes=False):
+    """Снести прошлую установку до начала новой.
+
+    Установщик ставит начисто, а остатки прежней попытки ломают новую: том
+    базы хранит пароль от самой первой инициализации, и никакой .env его уже
+    не восстановит (POSTGRES_PASSWORD применяется только один раз). Дешевле
+    удалить, чем угадывать совместимость.
+    """
+    found = []
+    if panel:
+        found += _leftovers(["/opt/remnawave"],
+                            ["remnawave", "remnawave-db", "remnawave-redis"],
+                            "remnawave")
+    if node:
+        found += _leftovers(["/opt/remnanode"], ["remnanode"])
+    if not found:
+        return
+    warn("Найдены остатки прошлой установки:")
+    for f in found:
+        say("    - %s" % f)
+    say("  Вместе с ними удалится база панели (пользователи, ноды, подписки)")
+    if not assume_yes and sys.stdin.isatty():
+        if ask("Снести и поставить начисто? (Y/n)", "y").lower() in ("n", "no", "н", "нет"):
+            say("  Оставляю как есть — установка продолжится поверх")
+            return
+    step("Удаление прошлой установки")
+    if panel:
+        run("cd /opt/remnawave && docker compose down -v --remove-orphans 2>/dev/null",
+            timeout=120)
+        run("docker rm -f remnawave remnawave-db remnawave-redis 2>/dev/null")
+        run("docker volume ls -q --filter name=remnawave "
+            "| xargs -r docker volume rm -f 2>/dev/null")
+        run("rm -rf /opt/remnawave")
+    if node:
+        run("cd /opt/remnanode && docker compose down -v --remove-orphans 2>/dev/null",
+            timeout=120)
+        run("docker rm -f remnanode 2>/dev/null")
+        run("rm -rf /opt/remnanode")
+    ok("Прошлая установка удалена")
+
+
 def resolve_pg_pass():
     """Пароль postgres, совместимый с уже существующим томом базы.
 
@@ -2210,6 +2262,10 @@ def parse_args():
     p.add_argument("--no-origin-le", action="store_true",
                    help="Do not try Let's Encrypt for the CDN origin (keep self-signed)")
     p.add_argument("--squad", help="Squad number or name (mode 3 Remnawave)")
+    p.add_argument("--wipe", action="store_true",
+                   help="Снести прошлую установку без вопросов (для автозапуска)")
+    p.add_argument("--no-wipe", action="store_true",
+                   help="Не трогать прошлую установку (ставить поверх)")
     p.add_argument("--skip-dns-wait", action="store_true")
     p.add_argument("--skip-cdn-wait", action="store_true")
     p.add_argument("--cascade", action="store_true", help="Enable cascade relay")
@@ -2359,6 +2415,12 @@ def main():
                   "CNAME %s -> [CDN CNAME после создания] (DNS only)" % domain],
                  skip=args.skip_dns_wait)
     # mode 5 (только нода) — DNS не требуется
+
+    # ── снести прошлую установку тех компонентов, которые ставим сейчас ──
+    if not args.no_wipe:
+        wipe_previous(panel=(mode in ("1", "2", "4")),
+                      node=(mode in ("1", "2", "3", "5")),
+                      assume_yes=args.wipe)
 
     # ── установка ──
     result = {}
