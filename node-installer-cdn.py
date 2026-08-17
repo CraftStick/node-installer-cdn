@@ -1573,6 +1573,7 @@ def install_remnawave(cfg):
     user_uuid = str(_uuid.uuid4())
     inbounds = [build_xhttp_inbound(xport, path, "%s-CDN" % (cfg["cdn"]),
                                     user_uuid, origin)]
+    ok("Основной вход: VLESS XHTTP packet-up, 127.0.0.1:%d, путь %s" % (xport, path))
     reality = None
     if not cfg.get("no_grpc"):
         priv, pub = gen_x25519()
@@ -2678,9 +2679,11 @@ def main():
     # там, где инбаунды вообще создаются, и только если не задано флагом.
     want_grpc = not args.no_grpc
     if mode in ("1", "2", "3", "5") and not args.no_grpc:
-        want_grpc = choose("Запасной вход, помимо CDN?", [
-            "gRPC Reality (TCP 2053) — рекомендуется, работает при отказе CDN",
-            "Только CDN — минимум открытых портов наружу"]) == 1
+        say("")
+        say("  Основной вход — VLESS XHTTP packet-up через CDN, он ставится всегда.")
+        want_grpc = choose("Добавить к нему запасной вход?", [
+            "Да, gRPC Reality (TCP 2053) — прямой вход, работает при отказе CDN",
+            "Нет, только CDN — минимум открытых портов наружу"]) == 1
 
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
