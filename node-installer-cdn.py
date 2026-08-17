@@ -8,7 +8,7 @@ node-installer-cdn.py — установщик прокси-инфраструк
 Самодостаточный установщик: разворачивает панель + ноду + CDN-обвязку и
 связывает их между собой. Никуда не «звонит», кроме официальных репозиториев
 (docker, xray, 3x-ui, remnawave, letsencrypt) и ваших серверов по SSH.
-Конфиги (nginx, Caddy, docker-compose, systemd, sysctl, SQL) вшиты как есть.
+Конфиги (nginx, docker-compose, systemd, sysctl, SQL) вшиты как есть.
 
 ЧТО ДЕЛАЕТ
 ----------
@@ -18,14 +18,14 @@ node-installer-cdn.py — установщик прокси-инфраструк
   3  Нода + CDN к уже существующей панели
   4  Только CDN перед уже работающей нодой
 Панель: Remnawave 3.x или 3x-ui. CDN: VK Cloud / Yandex Cloud / Beeline(CDNvideo)
-/ Timeweb. Опционально — каскад (relay в РФ -> exit за рубежом).
+/ Timeweb.
 
 ЗАПУСК
 ------
     sudo python3 node-installer-cdn.py                 # интерактивно
     sudo python3 node-installer-cdn.py --mode 1 --panel 1 --cdn 1 --domain example.com
 
-ТРЕБОВАНИЯ: Ubuntu/Debian, root. Для режима 2/3 и каскада — sshpass (ставится сам).
+ТРЕБОВАНИЯ: Ubuntu/Debian, root. Для режимов 2 и 3 — sshpass (ставится сам).
 
 ВНИМАНИЕ: работает под root и меняет сеть/сервисы. Обкатывайте на одноразовом VPS
 со снапшотом. Ответственность за использование — на запускающем.
@@ -65,22 +65,15 @@ RE_XPATH  = re.compile(r"^/[A-Za-z0-9._~/-]{1,120}$")
 
 # Локальный порт xhttp-инбаунда. Фиксированный, как в оригинальном
 # установщике: наружу он не смотрит (TLS снимает nginx), поэтому случайность
-# ничего не даёт, а предсказуемый порт нужен режиму 6 и ручной диагностике.
+# ничего не даёт, а предсказуемый порт нужен режиму 4 и ручной диагностике.
 XHTTP_PORT = 4443
 
 CDN_CRT = "/etc/nginx/ssl/cdn.crt"
 CDN_KEY = "/etc/nginx/ssl/cdn.key"
 
-# Reality dest/sni кандидаты
+# Reality dest/sni — «прикрытие» для gRPC-входа
 REALITY_DEST = "www.microsoft.com:443"
 REALITY_SNI  = "www.microsoft.com"
-REALITY_DEST_ALT = "www.google.com:443"
-
-
-# Русские geo-правила роутинга (для standalone xray на exit/ноде)
-RU_GEOIP   = "ext:geoip_RU.dat:ru"
-RU_GEOSITE = "ext:geosite_RU.dat:ru-available-only-inside"
-RU_REGEX   = [r"regexp:.*\.ru$", r"regexp:.*\.su$", r"regexp:.*\.xn--p1ai$"]
 
 RU_GEO_URL = ("https://github.com/runetfreedom/russia-v2ray-rules-dat"
               "/releases/latest/download")
@@ -393,7 +386,7 @@ def card(title, rows, color=C_TITLE):
 def banner():
     """Стартовая рамка."""
     inner = UI_W - 2
-    lines = [("VPN · CDN · INSTALLER", "1;" + C_TITLE),
+    lines = [("NODE · INSTALLER · CDN", "1;" + C_TITLE),
              ("XHTTP packet-up через российский CDN", C_DIM),
              ("v" + INSTALLER_VERSION, C_ACC)]
     print("", flush=True)
@@ -420,11 +413,6 @@ def callout(title, lines, color=C_ACC):
 def nap(seconds):
     """Пауза."""
     time.sleep(seconds)
-
-def _oneline(cmd):
-    s = " ".join(cmd.split())
-    return s if len(s) <= 300 else s[:297] + "..."
-
 
 def shq(value):
     """Экранировать значение для вставки в шелл-строку."""
@@ -519,10 +507,11 @@ def _ssh_prefix(cred):
     port = cred.get("port") or 22
     opts = ("-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s "
             "-o ConnectTimeout=15 -p %d" % (SSH_KNOWN_HOSTS, port))
+    host = shq("%s@%s" % (user, cred["ip"]))
     if cred.get("key"):
-        return "ssh -i %s %s %s@%s " % (shq(cred["key"]), opts, shq(user), cred["ip"])
+        return "ssh -i %s %s %s " % (shq(cred["key"]), opts, host)
     # пароль уходит в окружение (SSHPASS), а не в argv — ps его не покажет
-    return "sshpass -e ssh %s %s@%s " % (opts, shq(user), cred["ip"])
+    return "sshpass -e ssh %s %s " % (opts, host)
 
 
 def run_remote(cred, cmd, timeout=600):
@@ -544,7 +533,9 @@ def write_remote(cred, path, content, mode=None):
 
 def write_file(path, content, mode=None):
     """Записать файл; mode=0o600 для всего, что содержит секреты."""
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
     if mode is not None:
@@ -568,13 +559,6 @@ def get_ip(cred=None):
             return ip
     out, _ = runner("hostname -I 2>/dev/null | awk '{print $1}'")
     return out.strip()
-
-
-def get_country(ip=None):
-    """2-letter country code of ip (or this server). '' on failure."""
-    url = "https://ipinfo.io/%s/country" % ip if ip else "https://ipinfo.io/country"
-    out, rc = run("curl -s --max-time 8 %s" % url)
-    return out.strip().upper()[:2] if rc == 0 else ""
 
 
 def check_ubuntu():
@@ -947,7 +931,7 @@ def setup_xray_ru_geo(asset_dir="/usr/local/share/xray", cred=None):
     return True
 
 
-def build_xhttp_inbound(port, path, tag, uuid=None, host=None):
+def build_xhttp_inbound(port, path, tag, uuid=None):
     """XHTTP packet-up inbound: слушает 127.0.0.1:port, TLS снимает nginx.
 
     Набор ключей xhttpSettings взят с работающей ноды — это семейство
@@ -1015,29 +999,17 @@ def build_grpc_inbound(port, uuid, priv, pub, sid, service):
     }
 
 
-def cert_sha256(cred=None):
-    """SHA256 hex сертификата cdn.crt (для HY2 pinning)."""
-    cmd = "openssl x509 -in %s -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1" % CDN_CRT
-    out, _ = (run_remote(cred, cmd) if cred else run(cmd))
-    return out.strip().split()[0] if out else ""
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  nginx CDN-origin конфиг (сердце XHTTP-фронтинга)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def nginx_cdn_origin_config(port, path, style="prefix",
-                            crt=CDN_CRT, key=CDN_KEY, ipv6=True):
+def nginx_cdn_origin_config(port, path, crt=CDN_CRT, key=CDN_KEY):
     """Generate nginx CDN origin config.
 
-    style:
-      "prefix"  — path это каталог. Голый путь отдаёт 404, проксируется только
-                  то, что под ним: активная проба ровно по <path> неотличима от
-                  обращения к несуществующей странице, а xhttp всегда ходит на
-                  <path>/<сессия>. (Снято с рабочей ноды на Yandex CDN.)
-      "rewrite" — path это файл (/static/getFile/video/segment.ts): нужен ^~ и
-                  rewrite, добавляющий слеш, иначе xhttp не матчится.
-                  (Проверено автором на Beeline 28.07.2026.)
+    path — каталог. Голый путь отдаёт 404, проксируется только то, что под ним:
+    активная проба ровно по <path> неотличима от обращения к несуществующей
+    странице, а xhttp всегда ходит на <path>/<сессия>. (Снято с рабочей ноды
+    на Yandex CDN.)
     """
     proxy_block = """        proxy_pass http://xray_xhttp;
         proxy_http_version 1.1;
@@ -1069,24 +1041,19 @@ def nginx_cdn_origin_config(port, path, style="prefix",
         add_header Expires "0" always;
         add_header Accept-Ranges none always;
 """
-    if style == "rewrite":
-        loc = ("    location ^~ %s {\n        rewrite ^%s/ break;\n%s    }\n\n"
-               "    location = %s {\n        return 404;\n    }\n"
-               % (path, path, proxy_block, path))
-    else:
-        loc = ("    location = %s {\n        return 404;\n    }\n\n"
-               "    location %s/ {\n%s    }\n" % (path, path, proxy_block))
+    loc = ("    location = %s {\n        return 404;\n    }\n\n"
+           "    location %s/ {\n%s    }\n" % (path, path, proxy_block))
 
-    v6_80  = "\n    listen [::]:80 default_server;" if ipv6 else ""
-    v6_443 = "\n    listen [::]:443 ssl http2 default_server;" if ipv6 else ""
     return """upstream xray_xhttp {
     server 127.0.0.1:%d;
     keepalive 128;
 }
 
 server {
-    listen 80 default_server;%s
-    listen 443 ssl http2 default_server;%s
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
     server_name _;
 
     ssl_certificate %s;
@@ -1109,7 +1076,7 @@ server {
         try_files $uri $uri/ =404;
     }
 }
-""" % (port, v6_80, v6_443, crt, key, loc)
+""" % (port, crt, key, loc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1153,27 +1120,36 @@ def rw_api_local(token, method, path, data=None):
 
 
 def rw_api_ssh(cred, token, method, path, data=None):
-    """Make API call to Remnawave panel via SSH (curl to 127.0.0.1:3000)."""
+    """Make API call to Remnawave panel via SSH (curl to 127.0.0.1:3000).
+
+    Возвращает (тело, HTTP-код) — как rw_api_local. Код приезжает отдельной
+    последней строкой (-w), иначе отказ панели («A112», 401) выглядел бы для
+    вызывающего успехом: JSON-то распарсился.
+    """
     url = "http://127.0.0.1:3000/api/" + path.lstrip("/")
     base = ('RDOM=$(grep -oP "PANEL_DOMAIN=\\K.*" /opt/remnawave/.env 2>/dev/null); '
-            'curl -s -X %s -H "Content-Type: application/json" '
+            'curl -s -w "\\n%%{http_code}" -X %s -H "Content-Type: application/json" '
             '-H "X-Forwarded-Proto: https" -H "X-Forwarded-For: 127.0.0.1" '
             '-H "X-Real-IP: 127.0.0.1" -H "X-Remnawave-Client-Type: browser" '
             '-H "Host: ${RDOM:-localhost}" ' % method)
-    tok, _ = run_remote(cred, "cat /opt/remnawave/.panel_token 2>/dev/null")
-    tok = (token or tok).strip()
+    tok = (token or "").strip()
+    if not tok:
+        out, _ = run_remote(cred, "cat /opt/remnawave/.panel_token 2>/dev/null")
+        tok = out.strip()
     if tok:
         base += '-H "Authorization: Bearer %s" ' % tok
     if data is not None:
         b = base64.b64encode(json.dumps(data).encode()).decode()
         base += '-d "$(echo %s | base64 -d)" ' % b
     out, _ = run_remote(cred, base + '"%s"' % url)
-    if not out.strip():
-        return {"error": "empty response"}, 0
+    body, _, tail = out.rpartition("\n")
+    code = int(tail.strip()) if tail.strip().isdigit() else 0
+    if not body.strip():
+        return {"error": "empty response"}, code
     try:
-        return json.loads(out), 200
+        return json.loads(body), code
     except Exception:
-        return {"error": "invalid JSON", "raw": out[:200]}, 0
+        return {"error": "invalid JSON", "raw": body[:200]}, code
 
 
 def rw_login_ssh(cred, username, password):
@@ -1277,7 +1253,7 @@ def _sign_api_jwt(secret, uuid_str, days=365):
     return (seg + b"." + sig).decode()
 
 
-def mint_api_token(runner, db="remnawave-db"):
+def mint_api_token(runner):
     """Выпустить API-токен без обращения к /api/tokens.
 
     /api/tokens висит на роли ADMIN и без browser-заголовка отвечает 403, а
@@ -1306,8 +1282,8 @@ def mint_api_token(runner, db="remnawave-db"):
            "VALUES ('%s', 'installer-cdn', NOW(), NOW(), '{\"*\"}', "
            "NOW() + INTERVAL '365 days') ON CONFLICT (uuid) DO NOTHING;" % tok_uuid)
     b64 = base64.b64encode(sql.encode()).decode()
-    out, rc = runner("echo %s | base64 -d | docker exec -i %s psql -U postgres -v ON_ERROR_STOP=1"
-                     % (b64, db))
+    out, rc = runner("echo %s | base64 -d | docker exec -i remnawave-db "
+                     "psql -U postgres -v ON_ERROR_STOP=1" % b64)
     if rc != 0 or "ERROR" in (out or ""):
         err("Не удалось записать токен в БД: %s" % (out or "").strip()[:160])
         return ""
@@ -1565,17 +1541,18 @@ def install_remnawave(cfg):
     """Install Remnawave 3.x panel + node + profile + host + user (mode 1, local)."""
     domain   = cfg["domain"]
     origin   = cfg.get("origin_domain", domain)
-    cdn_dom  = cfg.get("cdn_domain", "")
     path     = cfg["path"]
     xport    = cfg["xport"]
 
+    tune_os()
     token = remnawave_bringup(cfg)
+    api = lambda m, p, d=None: rw_api_local(token, m, p, d)
 
     # Веб-слой: без него панель остаётся на 127.0.0.1:3000, а CDN-origin
     # не существует — провайдеру нечего забирать.
     setup_remnawave_web(cfg, xport, path)
 
-    # ── профиль + инбаунды (CDN xhttp + опц. gRPC + опц. BRIDGE_IN) ──
+    # ── профиль + инбаунды (CDN xhttp + опц. gRPC) ──
     step("Создание профиля, ноды, хоста и юзера через API")
     user_uuid = str(_uuid.uuid4())
     inbounds = [build_xhttp_inbound(xport, path, "%s_CDN" % cfg["cdn"].upper())]
@@ -1585,17 +1562,15 @@ def install_remnawave(cfg):
         priv, pub = gen_x25519()
         if priv:
             sid = rand(8, "0123456789abcdef")
+            service = _slug("grpc")
             inbounds.append(build_grpc_inbound(2053, user_uuid, priv, pub, sid,
-                                               _slug("grpc")))
-            reality = {"pbk": pub, "sid": sid}
+                                               service))
+            # serviceName и порт печатаются в конце: без них к запасному входу
+            # не подключиться, а придумать случайный slug клиент не может
+            reality = {"pbk": pub, "sid": sid, "service": service, "port": 2053}
             ok("Добавлен gRPC Reality inbound (TCP 2053)")
-    if cfg.get("cascade"):
-        inbounds.append(build_xhttp_inbound(8888, path, "BRIDGE_IN"))
-        ok("Добавлен BRIDGE_IN inbound (TCP 8888) для каскада")
 
-    prof_tag = _slug("cdn")
-    prof_uuid, tag2uuid = create_config_profile(
-        lambda m, p, d=None: rw_api_local(token, m, p, d), prof_tag, inbounds)
+    prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
     inbound_uuids = [tag2uuid.get(i["tag"]) for i in inbounds]
 
     # ── нода (remnanode на 127.0.0.1:2222 внутри docker gateway) ──
@@ -1608,11 +1583,13 @@ def install_remnawave(cfg):
     node = {"name": "node-local", "address": gw, "port": 2222,
             "configProfile": {"activeConfigProfileUuid": prof_uuid,
                               "activeInbounds": [u for u in inbound_uuids if u]}}
-    resp, code = rw_api_local(token, "POST", "nodes", node)
+    resp, _ = api("POST", "nodes", node)
     node_uuid = (resp.get("response", {}) or {}).get("uuid") if resp else None
     secret = (resp.get("response", {}) or {}).get("secretKey") if resp else None
     if node_uuid:
         say("  Node UUID: %s" % node_uuid)
+    else:
+        warn("Ответ создания ноды: %s" % json.dumps(resp)[:160])
 
     os.makedirs("/opt/remnanode", exist_ok=True)
     download_xray_binary("/opt/remnanode/xray-custom")
@@ -1624,24 +1601,25 @@ def install_remnawave(cfg):
     run("cd /opt/remnanode && docker compose pull", timeout=600)
     run("cd /opt/remnanode && docker compose up -d")
     # Файрвол ставим до ограничения 2222: тогда правило ноды уходит в ufw и
-    # переживает перезагрузку. Порты запасных каналов открываем явно, иначе
-    # политика deny incoming их закроет.
-    extra_tcp = ([8888] if cfg.get("cascade") else []) \
-        + ([] if cfg.get("no_grpc") else [2053])
-    extra_udp = []
-    firewall_setup(extra_tcp=extra_tcp, extra_udp=extra_udp)
+    # переживает перезагрузку. Порт запасного канала открываем явно, иначе
+    # политика deny incoming его закроет.
+    firewall_setup(extra_tcp=([] if cfg.get("no_grpc") else [2053]))
     restrict_node_port_2222(gw)
     node_wait_ready()
 
-    # ── хост CDN + опц. gRPC, юзер, сквад ──
-    create_remnawave_host(token, prof_uuid, inbounds[0]["tag"], cdn_dom or origin,
-                          origin, path, reality,
-                          inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
-    add_inbounds_to_squad(token, inbound_uuids)
-    sub_url = create_remnawave_user(token, "user1", user_uuid, domain)
+    # ── хост CDN, сквад, юзер ──
+    # Адрес хоста — origin: домена CDN на этом шаге ещё нет, провайдер выдаёт
+    # его позже. main() переставит хост на него через update_host_address().
+    host_uuid = create_remnawave_host(api, prof_uuid, inbounds[0]["tag"], origin,
+                                      path,
+                                      inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
+    add_inbounds_to_squad(api, inbound_uuids)
+    sub_url = create_remnawave_user(api, "user1", user_uuid, domain)
 
     return {"token": token, "user_uuid": user_uuid, "sub_url": sub_url,
-            "reality": reality, "prof_uuid": prof_uuid}
+            "reality": reality, "prof_uuid": prof_uuid,
+            "inbound_uuids": [u for u in inbound_uuids if u],
+            "host_uuid": host_uuid, "api": api}
 
 
 def download_xray_binary(dest):
@@ -1687,10 +1665,10 @@ def persist_iptables(runner):
            "| debconf-set-selections; "
            "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent "
            ">/dev/null 2>&1")
-    out, rc = runner("netfilter-persistent save >/dev/null 2>&1")
+    _, rc = runner("netfilter-persistent save >/dev/null 2>&1")
     if rc != 0:
         # без пакета — сохраняем дамп руками, восстановление на старте сети
-        out, rc = runner("mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4")
+        _, rc = runner("mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4")
     if rc == 0:
         ok("Правила iptables сохранены (переживут перезагрузку)")
     else:
@@ -1840,12 +1818,13 @@ def create_config_profile(api, name, inbounds, tries=3):
     return prof_uuid, tag2uuid
 
 
-def create_remnawave_host(token, prof_uuid, inbound_tag, cdn_domain, origin,
-                          path, reality, inbound_uuid=None):
+def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
+                          inbound_uuid=None):
     """Создать CDN-хост и привязать к профилю/инбаунду.
 
     Имя поля xhttp-extra зависит от версии панели: 2.7.x -> xHttpExtraParams,
     2.8+ -> xhttpExtraParams. Ставим ОБА — панель молча игнорит лишнее.
+    api(method, path, data) -> (resp, code): работает и локально, и по SSH.
     """
     if not prof_uuid:
         warn("нет profile_uuid — хост CDN не создан"); return None
@@ -1872,7 +1851,7 @@ def create_remnawave_host(token, prof_uuid, inbound_tag, cdn_domain, origin,
         "xHttpExtraParams": {"mode": "packet-up"},
         "securityLayer": "TLS",
     }
-    resp, code = rw_api_local(token, "POST", "hosts", host)
+    resp, _ = api("POST", "hosts", host)
     huuid = (resp.get("response", {}) or {}).get("uuid") if resp else None
     if huuid:
         ok("Host UUID: %s — привязан к ноде" % huuid)
@@ -1881,9 +1860,35 @@ def create_remnawave_host(token, prof_uuid, inbound_tag, cdn_domain, origin,
     return huuid
 
 
-def find_default_squad(token):
+def update_host_address(api, host_uuid, cdn_domain):
+    """Переставить хост на домен CDN, когда провайдер его наконец выдал.
+
+    Хост создаётся до настройки CDN — там ещё нечего прописать, кроме origin,
+    а клиент по такому адресу пошёл бы мимо CDN прямо на сервер и заодно
+    засветил бы его IP. Домен известен только в конце, поэтому адрес, SNI и
+    Host правим отдельным запросом.
+    """
+    if not (host_uuid and cdn_domain):
+        return False
+    resp, code = api("PATCH", "hosts", {
+        "uuid": host_uuid,
+        "remark": "CDN %s" % cdn_domain,
+        "address": cdn_domain,
+        "sni": cdn_domain,
+        "host": cdn_domain,
+    })
+    if code in (200, 201):
+        ok("Хост в панели переставлен на CDN-домен %s" % cdn_domain)
+        return True
+    warn("Не удалось переставить хост на %s: %s"
+         % (cdn_domain, json.dumps(resp)[:160]))
+    say("  Поправь адрес хоста в панели вручную — сейчас там адрес сервера")
+    return False
+
+
+def find_default_squad(api):
     """UUID сквада Default-Squad, иначе первый попавшийся."""
-    resp, _ = rw_api_local(token, "GET", "internal-squads")
+    resp, _ = api("GET", "internal-squads")
     squads = (resp.get("response", {}) or {}).get("internalSquads", []) if resp else []
     if not squads:
         return None
@@ -1893,30 +1898,30 @@ def find_default_squad(token):
     return squads[0].get("uuid")
 
 
-def add_inbounds_to_squad(token, inbound_uuids):
+def add_inbounds_to_squad(api, inbound_uuids):
     """Добавить инбаунды в Default-Squad (иначе нода получает пустой список клиентов).
 
     Обновление принимается только на корне коллекции: uuid сквада едет в теле,
     инбаунды — своими uuid. PATCH/POST/PUT по пути /internal-squads/<uuid>
     отвечают 404 (проверено на 3.2.3).
     """
-    squad = find_default_squad(token)
+    squad = find_default_squad(api)
     if not squad:
         warn("Default-Squad не найден"); return
     uuids = [u for u in (inbound_uuids or []) if u]
     if not uuids:
         warn("нет uuid инбаундов — сквад не обновлён"); return
-    resp, code = rw_api_local(token, "PATCH", "internal-squads",
-                              {"uuid": squad, "inbounds": uuids})
+    resp, code = api("PATCH", "internal-squads",
+                     {"uuid": squad, "inbounds": uuids})
     if code in (200, 201):
         ok("%d инбаунд(ов) добавлено в Default-Squad" % len(uuids))
     else:
         warn("Не удалось добавить инбаунды в сквад: %s" % json.dumps(resp)[:160])
 
 
-def create_remnawave_user(token, username, vless_uuid, domain):
+def create_remnawave_user(api, username, vless_uuid, domain):
     """Создать юзера user1 и вернуть URL подписки."""
-    squad = find_default_squad(token)
+    squad = find_default_squad(api)
     body = {
         "username": username,
         "vlessUuid": vless_uuid,
@@ -1924,7 +1929,7 @@ def create_remnawave_user(token, username, vless_uuid, domain):
         "expireAt": "2099-12-31T23:59:59.000Z",
         "activeInternalSquads": [squad] if squad else [],
     }
-    resp, code = rw_api_local(token, "POST", "users", body)
+    resp, _ = api("POST", "users", body)
     r = resp.get("response", {}) if resp else {}
     short = r.get("shortUuid", "")
     if r.get("uuid"):
@@ -1935,7 +1940,7 @@ def create_remnawave_user(token, username, vless_uuid, domain):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Let's Encrypt (certbot webroot / acme.sh)
+#  Let's Encrypt (certbot webroot)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY, cred=None):
@@ -1956,9 +1961,9 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY, cred=None):
         say("  жду DNS %s -> %s ..." % (domain, myip))
         nap(10)
     for attempt in range(3):
-        out, rc = runner("certbot certonly --webroot -w /var/www/certbot -d %s "
-                         "--non-interactive --agree-tos "
-                         "--register-unsafely-without-email" % domain, timeout=180)
+        runner("certbot certonly --webroot -w /var/www/certbot -d %s "
+               "--non-interactive --agree-tos "
+               "--register-unsafely-without-email" % domain, timeout=180)
         live = "/etc/letsencrypt/live/%s" % domain
         _, ok_rc = runner("test -f %s/fullchain.pem" % live)
         if ok_rc == 0:
@@ -2003,7 +2008,7 @@ def setup_remnawave_web(cfg, xport, path):
     ensure_nginx_base()
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
     write_decoy(origin)
-    nginx_write_conf("default", nginx_cdn_origin_config(xport, path, "prefix"))
+    nginx_write_conf("default", nginx_cdn_origin_config(xport, path))
     nginx_write_conf("panel.conf", nginx_panel_proxy(domain, 3000))
     ok("nginx: CDN :443 -> 127.0.0.1:%d, панель %s -> 127.0.0.1:3000"
        % (xport, domain))
@@ -2106,7 +2111,8 @@ def install_3xui_panel(admin_pw, port, base_path):
 
 def xui_sql(sql):
     """Выполнить SQL в /etc/x-ui/x-ui.db через sqlite3."""
-    pkg_install("sqlite3") if run("which sqlite3")[1] != 0 else None
+    if run("which sqlite3")[1] != 0:
+        pkg_install("sqlite3")
     write_file("/tmp/_xui.sql", sql, mode=0o600)   # в SQL едут uuid и пароли
     out, rc = run("sqlite3 /etc/x-ui/x-ui.db < /tmp/_xui.sql 2>&1")
     run("rm -f /tmp/_xui.sql")
@@ -2115,9 +2121,9 @@ def xui_sql(sql):
     return rc == 0
 
 
-def xui_cdn_inbound(tag, port, path, origin, uuid, sub_id):
+def xui_cdn_inbound(tag, port, path, uuid, sub_id):
     """Создать CDN xhttp inbound в 3x-ui напрямую в SQLite."""
-    stream = build_xhttp_inbound(port, path, tag, uuid, origin)["streamSettings"]
+    stream = build_xhttp_inbound(port, path, tag, uuid)["streamSettings"]
     settings = {"clients": [{"id": uuid, "email": "user1", "flow": "",
                              "subId": sub_id}], "decryption": "none", "fallbacks": []}
     sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
@@ -2154,34 +2160,50 @@ def install_3xui(cfg):
     step("Установка 3x-ui")
     domain = cfg["domain"]; origin = cfg.get("origin_domain", domain)
     path = cfg["path"]; admin_pw = cfg["admin_pass"]
+    xport = cfg["xport"]
     panel_port = random.randint(20000, 40000)
     panel_path = rand(10, "abcdefghijklmnopqrstuvwxyz0123456789")
 
+    tune_os()
     ensure_nginx_base()
     install_3xui_panel(admin_pw, panel_port, panel_path)
     setup_xray_ru_geo()
 
-    # LE или self-signed для панели
+    # Тот же веб-слой, что и у Remnawave: default_server отдаёт CDN-origin и
+    # заглушку, panel.conf — саму панель. Без origin-конфига xhttp-инбаунд
+    # 3x-ui слушал бы 127.0.0.1 в пустоту: снаружи в него никто не попадает.
+    step("nginx: панель и CDN")
+    self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
+    write_decoy(origin)
+    nginx_write_conf("default", nginx_cdn_origin_config(xport, path))
     nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
-    if not issue_le_cert(domain):
-        self_signed_cert(domain)
-    nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
+    if issue_le_cert(domain, crt=None, key=None):
+        live = "/etc/letsencrypt/live/%s" % domain
+        nginx_write_conf("panel.conf", nginx_panel_proxy(
+            domain, panel_port, live + "/fullchain.pem", live + "/privkey.pem"))
+        ok("Панель на сертификате Let's Encrypt")
+    else:
+        warn("Панель осталась на self-signed — браузер будет ругаться")
+    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
 
     # CDN xhttp inbound
     step("Создание %s CDN inbound" % cfg["cdn"])
     uuid = str(_uuid.uuid4()); sub_id = rand(16)
-    xport = XHTTP_PORT
-    xui_cdn_inbound(cfg["cdn"], xport, path, origin, uuid, sub_id)
+    xui_cdn_inbound(cfg["cdn"], xport, path, uuid, sub_id)
 
     reality = None
     if not cfg.get("no_grpc"):
         reality = xui_grpc_inbound(uuid)
 
-    firewall_setup(extra_tcp=([] if cfg.get("no_grpc") else [2053]))
+    # Порт gRPC у 3x-ui случайный, а не 2053, как в профиле Remnawave: открывать
+    # надо именно тот, который занял инбаунд, иначе запасной вход остаётся за
+    # политикой deny incoming и не работает ровно тогда, когда он нужен.
+    firewall_setup(extra_tcp=([reality["port"]] if reality else []))
 
-    return {"user_uuid": uuid, "sub_id": sub_id, "xport": xport,
-            "panel_port": panel_port, "panel_path": panel_path,
-            "reality": reality, "domain": domain}
+    # Путь панели случайный — без него в адресной строке 3x-ui отдаёт 404,
+    # и войти в только что поставленную панель нельзя.
+    return {"user_uuid": uuid, "reality": reality,
+            "panel_url": "https://%s/%s/" % (domain, panel_path)}
 
 
 def xui_grpc_inbound(uuid):
@@ -2220,27 +2242,27 @@ def xui_grpc_inbound(uuid):
 #  Инструкции по настройке CDN (ручной шаг у провайдера)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def print_cdn_instructions(provider, origin, my_ip):
+def print_cdn_instructions(provider, origin, my_ip, path):
     """Печать инструкции по созданию CDN-ресурса. provider: vk|yandex|beeline|timeweb."""
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "Настройка CDN у провайдера")
           + _c(C_DIM, " · %s" % provider), flush=True)
     hr()
+    say("  Источник для CDN — %s (A -> %s), путь туннеля — %s/\n"
+        % (origin, my_ip, "/" + path.strip("/")))
     if provider == "vk":
         say("""
-  DNS в Cloudflare:
-    A     %s        ->  %s   (DNS only, серое облако)
-    CNAME %s (cdn) ->  [VK CDN CNAME после создания] (DNS only)
-
   VK Cloud CDN:
     - Протокол к источнику: HTTP (порт 80)
     - Источник: %s
     - Заголовок Host: Пересылать
     - SSL: Let's Encrypt
     - Кеширование: ВЫКЛ (все 4 переключателя)
+    - Параметры запроса: НЕ игнорировать (sessionID и seq идут в query!)
     - HTTP методы: GET, HEAD, OPTIONS
     - Gzip: ВЫКЛ
-""" % (origin, my_ip, origin, origin))
+  CDN-домен выдаст сам VK Cloud.
+""" % origin)
     elif provider == "yandex":
         say("""
   Yandex Certificate Manager -> создать сертификат (тип проверки DNS),
@@ -2260,10 +2282,10 @@ def print_cdn_instructions(provider, origin, my_ip):
     - Кеширование 2xx/3xx/4xx/5xx/browser: НЕ кешировать
     - Кешировать с учётом query string: ВКЛ + "Учитывать все параметры"
       !!! sessionID и seq идут в query — иначе туннель не поднимется
-    - Rewrite (экспертные): /static/getFile/video/segment.ts/ -> без слеша
+    - Rewrite не нужен: nginx на origin уже слушает %s/ как каталог
     - HTTP2 ВКЛ, HTTP3 ВЫКЛ, Brotli/Gzip ВЫКЛ
   CDN-домен (xxx.a.trbcdn.net) выдаст сам CDNvideo.
-""" % (origin, origin))
+""" % (origin, origin, "/" + path.strip("/")))
     elif provider == "timeweb":
         say("""
   Timeweb (timeweb.cloud) -> CDN -> Создать ресурс:
@@ -2290,9 +2312,18 @@ def dns_wait(lines, skip=False):
 #  Режим 2: панель здесь + нода на удалённом сервере (по SSH)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport,
-                      no_origin_le=False):
-    """Install Docker + nginx CDN origin + remnanode на удалённом сервере via SSH."""
+def setup_remote_node(cred, secret, panel_ip, origin, path, xport,
+                      no_origin_le=False, no_grpc=False):
+    """Install Docker + nginx CDN origin + remnanode на удалённом сервере via SSH.
+
+    secret — secretKey ноды из панели. Без него remnanode поднимется, но панель
+    его не признает, поэтому пустое значение — это сразу отказ, а не установка,
+    которая «прошла», но не работает.
+    """
+    if not secret:
+        err("[удалённая] Нет secretKey ноды — панель не примет %s" % cred["ip"])
+        say("  Нода в панели не создалась; удалённый сервер не трогаю")
+        return False
     say("  [удалённая] Подключение к %s..." % cred["ip"])
     if not cred.get("key") and not ensure_sshpass():
         return False
@@ -2304,7 +2335,7 @@ def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport,
         return False
     say("  [удалённая] SSH OK, установка пакетов...")
     pkg_install("nginx openssl curl ca-certificates gnupg", cred)
-    firewall_setup(cred, extra_tcp=[2053])
+    firewall_setup(cred, extra_tcp=([] if no_grpc else [2053]))
     say("  [удалённая] Установка Docker...")
     if not install_docker(cred) or not ensure_compose(cred):
         err("[удалённая] Docker не установился на %s" % cred["ip"]); return False
@@ -2313,7 +2344,7 @@ def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport,
     self_signed_cert("cdn-origin", cred)
     write_decoy(origin, cred)
     # nginx CDN origin
-    conf = nginx_cdn_origin_config(xport, path, "prefix")
+    conf = nginx_cdn_origin_config(xport, path)
     write_remote(cred, "/etc/nginx/sites-available/default", conf)
     run_remote(cred, "rm -f /etc/nginx/sites-enabled/default && "
                "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
@@ -2353,27 +2384,25 @@ def install_node_only(cfg):
             say("  " + out.strip().splitlines()[-1][:200])
         sys.exit(1)
     ok("SSH к панели: OK")
-    # проверить, что Remnawave API отвечает локально на панели
-    out, _ = run_remote(panel, "curl -s http://127.0.0.1:3001/health || "
-                        "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api")
     token = resolve_panel_token(panel, cfg)
     if not token:
         sys.exit(1)
     api = lambda m, p, d=None: rw_api_ssh(panel, token, m, p, d)
 
+    origin = cfg.get("origin_domain", cfg["domain"]); path = cfg["path"]
+
     step("Подготовка системы")
     check_ubuntu()
-    pkg_install("nginx openssl curl sqlite3 ca-certificates gnupg sshpass certbot")
+    pkg_install("nginx openssl curl ca-certificates gnupg certbot")
     tune_os()
     ensure_nginx_base()
-    self_signed_cert(cfg.get("origin_domain", cfg["domain"]))
-    write_decoy(cfg.get("origin_domain", cfg["domain"]))
+    self_signed_cert(origin)
+    write_decoy(origin)
     install_docker(); ensure_compose()
 
     # создать профиль/инбаунд/ноду через API панели, поднять remnanode здесь
     step("Создание профиля через API панели")
     user_uuid = str(_uuid.uuid4())
-    origin = cfg.get("origin_domain", cfg["domain"]); path = cfg["path"]
     xport = XHTTP_PORT
     inbounds = [build_xhttp_inbound(xport, path, "%s_CDN" % cfg["cdn"].upper())]
     prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
@@ -2391,13 +2420,14 @@ def install_node_only(cfg):
     write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""),
                mode=0o600)
     setup_xray_ru_geo()
-    conf = nginx_cdn_origin_config(xport, path, "prefix")
+    conf = nginx_cdn_origin_config(xport, path)
     write_file("/etc/nginx/sites-available/default", conf)
     run("rm -f /etc/nginx/sites-enabled/default && "
         "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
         "nginx -t && systemctl restart nginx")
     upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
-    firewall_setup(extra_tcp=[2053])
+    # В профиле только CDN-вход: наружу открывать нечего, кроме 80/443.
+    firewall_setup()
     # Панель здесь удалённая и стучится к ноде на 2222 снаружи: без этого
     # правила политика deny incoming закрывает порт вообще для всех, и нода
     # появляется в панели, но остаётся неуправляемой.
@@ -2406,32 +2436,25 @@ def install_node_only(cfg):
     run("cd /opt/remnanode && docker compose up -d")
     node_wait_ready()
     ok("Нода подключена к панели %s" % panel["ip"])
-    return {"user_uuid": user_uuid, "prof_uuid": prof_uuid, "my_ip": my_ip}
+
+    # Хост, сквад и юзер — те же шаги, что и при локальной установке. Без них
+    # нода поднимается, но панель не выдаёт ей ни одного клиента, и подписки,
+    # по которой можно подключиться, тоже не появляется.
+    step("Создание хоста, сквада и юзера на панели")
+    host_uuid = create_remnawave_host(api, prof_uuid, inbounds[0]["tag"], origin,
+                                      path,
+                                      inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
+    add_inbounds_to_squad(api, inbound_uuids)
+    pdom, _ = run_remote(panel, 'grep -oP "PANEL_DOMAIN=\\K.*" '
+                         '/opt/remnawave/.env 2>/dev/null')
+    sub_url = create_remnawave_user(api, "user1", user_uuid,
+                                    pdom.strip() or panel["ip"])
+    return {"user_uuid": user_uuid, "prof_uuid": prof_uuid, "my_ip": my_ip,
+            "sub_url": sub_url, "host_uuid": host_uuid, "api": api}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Каскад (relay в РФ -> exit за рубежом). Самый сложный сценарий.
-#  Схема: BRIDGE_IN :8888, exit 3x-ui с Reality :443; API-оркестрация — как выше.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def cascade_direction_ok(exit_ip):
-    """Warn if cascade wrong: этот сервер должен быть РФ, exit — зарубежный."""
-    say("  Проверяю направление каскада...")
-    here = get_country()
-    there = get_country(exit_ip)
-    if here and there and here == there:
-        warn("Оба сервера в одной стране (%s). Каскад бессмысленен." % here)
-        return False
-    if here and here != "RU" and there == "RU":
-        err("КАСКАД НАСТРОЕН НАОБОРОТ! Трафик выйдет с РФ IP.")
-        say("  ПРАВИЛЬНО: запусти скрипт на РОССИЙСКОМ сервере, %s укажи как exit."
-            % exit_ip)
-        return False
-    return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Отдельные компоненты: только панель / только нода / только CDN
+#  Режим 4: только CDN-origin
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -2444,13 +2467,12 @@ def install_cdn_only(cfg):
     origin = cfg.get("origin_domain", cfg["domain"])
     xport = cfg["xport"]
     path = cfg["path"]
-    my_ip = get_ip() or "<SERVER_IP>"
     step("Установка CDN-фронта")
     say("  Upstream: 127.0.0.1:%d   path: %s" % (xport, path))
     ensure_nginx_base()
     self_signed_cert(origin)
     write_decoy(origin)
-    conf = nginx_cdn_origin_config(xport, path, "prefix")
+    conf = nginx_cdn_origin_config(xport, path)
     write_file("/etc/nginx/sites-available/default", conf)
     run("rm -f /etc/nginx/sites-enabled/default && "
         "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
@@ -2458,7 +2480,7 @@ def install_cdn_only(cfg):
     upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup()
     ok("CDN-фронт поднят на :443 -> 127.0.0.1:%d" % xport)
-    return {"cdn_only": True, "my_ip": my_ip}
+    return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2470,18 +2492,18 @@ def parse_args():
     p = argparse.ArgumentParser(description="VPN CDN Installer v%s" % INSTALLER_VERSION)
     p.add_argument("--mode", help="1=Panel+node here, 2=Panel here+node remote, "
                    "3=Node+CDN to existing panel, 4=CDN origin only")
-    p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (modes 1,2,4)")
+    p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (modes 1,2)")
     p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb")
     p.add_argument("--domain", help="Domain name")
-    p.add_argument("--path", help="Existing xhttp path (mode 6 CDN-only), e.g. /abc123")
+    p.add_argument("--path", help="Existing xhttp path (mode 4 CDN-only), e.g. /abc123")
     p.add_argument("--xport", type=int,
-                   help="Existing local xray upstream port on 127.0.0.1 (mode 6 CDN-only)")
+                   help="Existing local xray upstream port on 127.0.0.1 (mode 4 CDN-only)")
     p.add_argument("--node-ip", help="Remote node IP (mode 2)")
     p.add_argument("--node-user", default="root", help="SSH user for remote node")
     p.add_argument("--node-pass", help="Remote node password (mode 2)")
-    p.add_argument("--node-key", help="Path to SSH private key for remote node")
+    p.add_argument("--node-key", help="Path to SSH private key (remote node / panel)")
     p.add_argument("--panel-url", help="Panel IP (mode 3)")
-    p.add_argument("--panel-token", help="Remnawave API token (modes 3,5). "
+    p.add_argument("--panel-token", help="Remnawave API token (mode 3). "
                    "Если не задан — берётся /opt/remnawave/.panel_token с панели, "
                    "иначе логин по --panel-user/--panel-pass")
     p.add_argument("--panel-user", help="Panel Remnawave username (mode 3)")
@@ -2495,7 +2517,6 @@ def parse_args():
     p.add_argument("--no-grpc", action="store_true", help="Skip gRPC Reality")
     p.add_argument("--no-origin-le", action="store_true",
                    help="Do not try Let's Encrypt for the CDN origin (keep self-signed)")
-    p.add_argument("--squad", help="Squad number or name (mode 3 Remnawave)")
     p.add_argument("--wipe", action="store_true",
                    help="Снести прошлую установку без вопросов (для автозапуска)")
     p.add_argument("--no-wipe", action="store_true",
@@ -2504,11 +2525,6 @@ def parse_args():
                    help="Забыть сохранённый прогресс и начать с нуля")
     p.add_argument("--skip-dns-wait", action="store_true")
     p.add_argument("--skip-cdn-wait", action="store_true")
-    p.add_argument("--cascade", action="store_true", help="Enable cascade relay")
-    p.add_argument("--cascade-ip", help="Cascade relay server IP")
-    p.add_argument("--cascade-user", default="root", help="Cascade relay SSH user")
-    p.add_argument("--cascade-pass", help="Cascade relay SSH password")
-    p.add_argument("--key", help="License key (опционально)")
     return p.parse_args()
 
 
@@ -2593,6 +2609,18 @@ def state_value(key, produce):
     return val
 
 
+def no_input(what):
+    """Спросить не у кого — выйти с внятным текстом, а не крутиться вхолостую.
+
+    Без tty (пайп, cron) input() сразу отдаёт EOF, и цикл «спроси заново»
+    превращается в бесконечный. Такой запуск лечится только флагами.
+    """
+    err("Нечего прочитать со stdin — %s" % what)
+    say("  Запусти интерактивно или передай значение флагом "
+        "(--mode, --panel, --cdn, --domain, ...)")
+    sys.exit(1)
+
+
 def ask(prompt, default=None, remember=True):
     # При продолжении прошлый ответ становится подсказкой по умолчанию: Enter
     # — оставить как было, иначе набрать новое. Именно подсказкой, а не молчаливой
@@ -2623,6 +2651,8 @@ def ask_required(prompt, why):
         v = ask(prompt)
         if v:
             return v
+        if not sys.stdin.isatty():
+            no_input(why)
         warn("Пустое значение — %s" % why)
 
 
@@ -2660,6 +2690,8 @@ def choose(prompt, options):
             _STATE["answers"][prompt] = v
             state_save()
             return int(v)
+        if not sys.stdin.isatty():
+            no_input("нужен ответ на «%s»" % prompt)
 
 
 CDN_NAMES = {1: "vk", 2: "yandex", 3: "beeline", 4: "timeweb"}
@@ -2703,21 +2735,35 @@ def main():
         "Панель здесь + нода на другом сервере",
         "Нода + CDN к существующей панели",
         "Только CDN (перед уже работающей нодой)"]))
+    if mode not in ("1", "2", "3", "4"):
+        err("Режим '%s' не существует — есть 1, 2, 3 и 4" % mode); sys.exit(1)
 
-    # какие шаги нужны этому режиму
-    need_panel = mode in ("1", "2")   # тип панели спрашиваем, только если её ставим
-    # CDN-провайдер и nginx-origin нужны во всех оставшихся режимах
-
-    # ── панель ──
-    if need_panel:
+    # ── панель: выбор есть только в режиме 1 ──
+    # У 3x-ui xray встроен в саму панель, отдельной ноды у неё не бывает, так
+    # что режим 2 умеет только Remnawave. Раньше выбор «3x-ui» здесь молча
+    # игнорировался и всё равно ставилась Remnawave.
+    if mode == "1":
         panel = args.panel or str(choose("Панель (Panel)?", ["Remnawave 3.x",
                                   "3x-ui"]))
+        if panel not in ("1", "2"):
+            err("Панель '%s' не существует — 1=Remnawave, 2=3x-ui" % panel)
+            sys.exit(1)
     else:
+        if mode == "2" and args.panel == "2":
+            err("Режим 2 работает только с Remnawave: у 3x-ui нет отдельной ноды")
+            sys.exit(1)
         panel = "1"
 
     # ── CDN: нужен во всех режимах ──
-    cdn_n = int(args.cdn) if args.cdn else choose("CDN провайдер?", [
-        "VK Cloud", "Yandex Cloud", "Beeline (CDNvideo)", "Timeweb"])
+    if args.cdn:
+        cdn_n = int(args.cdn) if args.cdn.isdigit() else 0
+    else:
+        cdn_n = choose("CDN провайдер?",
+                       [CDN_LABELS[i] for i in sorted(CDN_LABELS)])
+    if cdn_n not in CDN_NAMES:
+        err("CDN '%s' не существует — %s" % (args.cdn, ", ".join(
+            "%d=%s" % (i, CDN_LABELS[i]) for i in sorted(CDN_LABELS))))
+        sys.exit(1)
     cdn_name = CDN_NAMES[cdn_n]
 
     domain = (args.domain or ask("Домен без http:// (Domain)") or "").strip()
@@ -2769,14 +2815,26 @@ def main():
 
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
-           "no_grpc": not want_grpc,
-           "cascade": args.cascade, "xport": xport,
+           "no_grpc": not want_grpc, "xport": xport,
            "no_origin_le": args.no_origin_le}
 
+    # ── адрес удалённой ноды: спрашиваем здесь, а не после установки панели ──
+    # Все вопросы задаются до первого долгого шага: узнать об отсутствии
+    # адреса через десять минут после старта — худший момент из возможных.
+    node_ip = ""
+    if mode == "2":
+        node_ip = args.node_ip or ask_required(
+            "IP удалённой ноды", "без адреса ноды подключаться некуда")
+
     # ── DNS ──
-    dns_wait(["A     %s        ->  %s   (DNS only)" % (origin, my_ip),
-              "CNAME %s -> [CDN CNAME после создания] (DNS only)" % domain],
-             skip=args.skip_dns_wait)
+    # Обе записи — A на этот сервер. Домен панели CNAME'ить на CDN нельзя:
+    # Let's Encrypt проверяет его прямо здесь, по webroot. Домен CDN клиенту
+    # выдаёт провайдер, он в DNS не заводится.
+    records = ["A     %s   ->  %s   (DNS only, серое облако)" % (origin, my_ip)]
+    if mode != "4":
+        records.append("A     %s   ->  %s   (DNS only) — панель и её сертификат"
+                       % (domain, my_ip))
+    dns_wait(records, skip=args.skip_dns_wait)
 
     # ── снести прошлую установку тех компонентов, которые ставим сейчас ──
     if state_is_done("wipe"):
@@ -2795,13 +2853,23 @@ def main():
         result = install_3xui(cfg)
     elif mode == "2":
         # панель Remnawave здесь + нода на args.node-ip
-        cfg2 = dict(cfg)
-        result = install_remnawave(cfg2)   # панель + локальная нода как основа
-        if args.node_ip:
-            cred = {"ip": args.node_ip, "user": args.node_user,
-                    "pass": args.node_pass, "key": args.node_key}
-            setup_remote_node(cred, None, my_ip, origin, cdn_name, path, cfg["xport"],
-                              no_origin_le=cfg.get("no_origin_le"))
+        result = install_remnawave(cfg)    # панель + локальная нода как основа
+        cred = {"ip": node_ip, "user": args.node_user,
+                "pass": args.node_pass, "key": args.node_key}
+        # Своя нода в панели — со своим secretKey. Раньше сюда уезжал None, и
+        # удалённый remnanode вставал с пустым SECRET_KEY: в панели он есть,
+        # трафик через него не идёт.
+        step("Регистрация удалённой ноды в панели")
+        resp, _ = result["api"]("POST", "nodes", {
+            "name": "node-%s" % node_ip, "address": node_ip, "port": 2222,
+            "configProfile": {"activeConfigProfileUuid": result["prof_uuid"],
+                              "activeInbounds": result["inbound_uuids"]}})
+        secret = (resp.get("response", {}) or {}).get("secretKey") if resp else None
+        if not secret:
+            warn("Ответ создания удалённой ноды: %s" % json.dumps(resp)[:160])
+        setup_remote_node(cred, secret, my_ip, origin, path, cfg["xport"],
+                          no_origin_le=cfg.get("no_origin_le"),
+                          no_grpc=cfg.get("no_grpc"))
     elif mode == "3":
         cfg["panel_url"] = ssh_host(args.panel_url or ask_required(
             "IP/URL панели Remnawave", "без адреса панели подключиться некуда"))
@@ -2815,6 +2883,8 @@ def main():
         else:
             cfg["panel_ssh_pass"] = args.panel_ssh_pass
             while not cfg["panel_ssh_pass"]:
+                if not sys.stdin.isatty():
+                    no_input("нужен --panel-ssh-pass или --node-key")
                 cfg["panel_ssh_pass"] = ask_secret("SSH пароль панели")
                 if not cfg["panel_ssh_pass"]:
                     warn("Пустой пароль — SSH к панели не пройдёт "
@@ -2824,7 +2894,7 @@ def main():
         result = install_cdn_only(cfg)
 
     # ── CDN-инструкция + ожидание ──
-    print_cdn_instructions(cdn_name, origin, my_ip)
+    print_cdn_instructions(cdn_name, origin, my_ip, path)
     if not args.skip_cdn_wait:
         try:
             input("\n  " + _c(C_ACC, "❯") + " Enter когда CDN настроен и серт"
@@ -2833,6 +2903,10 @@ def main():
             pass
     cdn_domain = ask("CDN домен (например xxx.cdn.twcstorage.ru)")
 
+    # Хост в панели создавался до того, как провайдер выдал домен — переставить
+    if cdn_domain and result.get("host_uuid"):
+        update_host_address(result["api"], result["host_uuid"], cdn_domain)
+
     # ── финальный отчёт ──
     cdn_val = cdn_domain or "— укажи после настройки провайдера"
     if mode == "4":
@@ -2840,12 +2914,17 @@ def main():
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
                 ("nginx", ":443 → 127.0.0.1:%d  путь %s" % (xport, path)),
                 ("CDN", cdn_val)]
+    elif mode == "3":
+        rows = [("Режим", "нода + CDN к существующей панели"),
+                ("Панель", cfg["panel_url"]),
+                ("Origin", "%s  (A → %s)" % (origin, my_ip)),
+                ("CDN", cdn_val)]
     else:
-        rows = [("Панель", "https://%s/" % domain),
-                 ("Логин", "admin"),
-                 ("Пароль", admin_pw),
-                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
-                 ("CDN", cdn_val)]
+        rows = [("Панель", result.get("panel_url") or "https://%s/" % domain),
+                ("Логин", "admin"),
+                ("Пароль", admin_pw),
+                ("Origin", "%s  (A → %s)" % (origin, my_ip)),
+                ("CDN", cdn_val)]
     if result.get("sub_url"):
         rows.append(("Подписка", result["sub_url"]))
     card("ГОТОВО · УСТАНОВКА ЗАВЕРШЕНА", rows, color=C_OK)
@@ -2860,9 +2939,17 @@ def main():
                    xpath, cdn_domain, cdn_name))
         callout("VLESS CDN ссылка", [link], color=C_TITLE)
     if result.get("reality"):
+        # Всё, что нужно клиенту для запасного входа: без serviceName и порта
+        # (у 3x-ui он случайный) подключиться по этим PBK/SID нельзя.
         r = result["reality"]
-        callout("Reality", ["PBK: %s" % r.get("pbk"),
-                            "SID: %s" % r.get("sid")], color=C_TITLE)
+        callout("Запасной вход · gRPC Reality", [
+            "Адрес:      %s:%s" % (my_ip, r.get("port")),
+            "SNI / dest: %s" % REALITY_SNI,
+            "UUID:       %s" % result.get("user_uuid", ""),
+            "PBK:        %s" % r.get("pbk"),
+            "SID:        %s" % r.get("sid"),
+            "serviceName:%s" % r.get("service"),
+        ], color=C_TITLE)
     print("", flush=True)
 
 
