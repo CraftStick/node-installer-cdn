@@ -1603,19 +1603,9 @@ def install_remnawave(cfg):
         ok("Добавлен BRIDGE_IN inbound (TCP 8888) для каскада")
 
     prof_tag = _slug("cdn")
-    profile = {"name": prof_tag, "inbounds": inbounds}
-    resp, code = None, 0
-    for attempt in range(3):
-        resp, code = rw_api_local(token, "POST", "config-profiles", profile)
-        if code in (200, 201):
-            break
-        say("  API retry профиля (%d/3), жду 10 сек..." % (attempt + 1))
-        nap(10)
-    prof_uuid = (resp.get("response", {}) or {}).get("uuid") if resp else None
-    if not prof_uuid:
-        warn("Ответ создания профиля: %s" % json.dumps(resp)[:200])
-    else:
-        say("  Profile UUID: %s" % prof_uuid)
+    prof_uuid, tag2uuid = create_config_profile(
+        lambda m, p, d=None: rw_api_local(token, m, p, d), prof_tag, inbounds)
+    inbound_uuids = [tag2uuid.get(i["tag"]) for i in inbounds]
 
     # ── нода (remnanode на 127.0.0.1:2222 внутри docker gateway) ──
     step("Настройка ноды Remnawave")
@@ -1623,9 +1613,10 @@ def install_remnawave(cfg):
                 "-f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'")
     gw = gw.strip() or "172.18.0.1"
     say("  Docker gateway: %s" % gw)
+    # activeInbounds — uuid инбаундов из ответа профиля, не теги
     node = {"name": "node-local", "address": gw, "port": 2222,
             "configProfile": {"activeConfigProfileUuid": prof_uuid,
-                              "activeInbounds": [i["tag"] for i in inbounds]}}
+                              "activeInbounds": [u for u in inbound_uuids if u]}}
     resp, code = rw_api_local(token, "POST", "nodes", node)
     node_uuid = (resp.get("response", {}) or {}).get("uuid") if resp else None
     secret = (resp.get("response", {}) or {}).get("secretKey") if resp else None
@@ -1653,8 +1644,9 @@ def install_remnawave(cfg):
 
     # ── хост CDN + опц. hy2/grpc, юзер, сквад ──
     create_remnawave_host(token, prof_uuid, inbounds[0]["tag"], cdn_dom or origin,
-                          origin, path, reality)
-    add_inbounds_to_squad(token, [i["tag"] for i in inbounds])
+                          origin, path, reality,
+                          inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
+    add_inbounds_to_squad(token, inbound_uuids)
     sub_url = create_remnawave_user(token, "user1", user_uuid, domain)
 
     return {"token": token, "user_uuid": user_uuid, "sub_url": sub_url,
@@ -1793,8 +1785,50 @@ def node_wait_ready(cred=None):
     return False
 
 
+def build_xray_profile(name, inbounds):
+    """Тело POST /api/config-profiles.
+
+    Панель 3.x ждёт целый конфиг Xray в поле config — плоское {name, inbounds}
+    отбивается валидацией («expected object, received undefined» по пути
+    config). Пустой inbounds она тоже не берёт: конфиг без входов невалиден
+    для xray, и создание падает с A112.
+    """
+    return {"name": name, "config": {
+        "log": {"loglevel": "warning"},
+        "inbounds": inbounds,
+        "outbounds": [{"tag": "DIRECT", "protocol": "freedom"},
+                      {"tag": "BLOCK", "protocol": "blackhole"}],
+        "routing": {"rules": []}}}
+
+
+def create_config_profile(api, name, inbounds, tries=3):
+    """Создать профиль. Возвращает (uuid профиля, {тег: uuid инбаунда}).
+
+    Панель раздаёт каждому инбаунду собственный uuid, и дальше на него
+    ссылаются и сквад, и нода — теги для этого не годятся.
+    api(method, path, data) -> (resp, code): работает и локально, и по SSH.
+    """
+    resp, code = None, 0
+    for attempt in range(tries):
+        resp, code = api("POST", "config-profiles", build_xray_profile(name, inbounds))
+        if code in (200, 201):
+            break
+        say("  API retry профиля (%d/%d), жду 10 сек..." % (attempt + 1, tries))
+        nap(10)
+    r = (resp or {}).get("response", {}) or {}
+    prof_uuid = r.get("uuid")
+    tag2uuid = dict((i.get("tag"), i.get("uuid")) for i in (r.get("inbounds") or []))
+    if not prof_uuid:
+        warn("Ответ создания профиля: %s" % json.dumps(resp)[:200])
+    else:
+        say("  Profile UUID: %s" % prof_uuid)
+        ok("Инбаундов в профиле: %d (%s)"
+           % (len(tag2uuid), ", ".join(sorted(t for t in tag2uuid if t))))
+    return prof_uuid, tag2uuid
+
+
 def create_remnawave_host(token, prof_uuid, inbound_tag, cdn_domain, origin,
-                          path, reality):
+                          path, reality, inbound_uuid=None):
     """Создать CDN-хост и привязать к профилю/инбаунду.
 
     Имя поля xhttp-extra зависит от версии панели: 2.7.x -> xHttpExtraParams,
@@ -1804,6 +1838,11 @@ def create_remnawave_host(token, prof_uuid, inbound_tag, cdn_domain, origin,
         warn("нет profile_uuid — хост CDN не создан"); return None
     host = {
         "profileUuid": prof_uuid,
+        "configProfileUuid": prof_uuid,
+        # 3.x ссылается на инбаунд по uuid; тег оставлен для старых панелей,
+        # лишние ключи валидатор молча срезает
+        "configProfileInboundUuid": inbound_uuid,
+        "inboundUuid": inbound_uuid,
         "inboundTag": inbound_tag,
         "remark": "CDN %s" % cdn_domain,
         "address": cdn_domain,
@@ -1836,15 +1875,23 @@ def find_default_squad(token):
     return squads[0].get("uuid")
 
 
-def add_inbounds_to_squad(token, tags):
-    """Добавить инбаунды в Default-Squad (иначе нода получает пустой список клиентов)."""
+def add_inbounds_to_squad(token, inbound_uuids):
+    """Добавить инбаунды в Default-Squad (иначе нода получает пустой список клиентов).
+
+    Обновление принимается только на корне коллекции: uuid сквада едет в теле,
+    инбаунды — своими uuid. PATCH/POST/PUT по пути /internal-squads/<uuid>
+    отвечают 404 (проверено на 3.2.3).
+    """
     squad = find_default_squad(token)
     if not squad:
         warn("Default-Squad не найден"); return
-    resp, code = rw_api_local(token, "PATCH", "internal-squads/%s" % squad,
-                              {"inbounds": tags})
+    uuids = [u for u in (inbound_uuids or []) if u]
+    if not uuids:
+        warn("нет uuid инбаундов — сквад не обновлён"); return
+    resp, code = rw_api_local(token, "PATCH", "internal-squads",
+                              {"uuid": squad, "inbounds": uuids})
     if code in (200, 201):
-        ok("%d инбаунд(ов) добавлено в Default-Squad" % len(tags))
+        ok("%d инбаунд(ов) добавлено в Default-Squad" % len(uuids))
     else:
         warn("Не удалось добавить инбаунды в сквад: %s" % json.dumps(resp)[:160])
 
@@ -2275,15 +2322,14 @@ def install_node_only(cfg):
     origin = cfg.get("origin_domain", cfg["domain"]); path = cfg["path"]
     xport = random.randint(10000, 20000)
     inbounds = [build_xhttp_inbound(xport, path, "%s-CDN" % cfg["cdn"], user_uuid, origin)]
-    prof, code = api("POST", "config-profiles",
-                     {"name": _slug("cdn"), "inbounds": inbounds})
-    prof_uuid = (prof.get("response", {}) or {}).get("uuid") if prof else None
+    prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
+    inbound_uuids = [u for u in (tag2uuid.get(i["tag"]) for i in inbounds) if u]
 
     my_ip = get_ip()
     node, code = api("POST", "nodes",
                      {"name": "cdn-%s" % my_ip, "address": my_ip, "port": 2222,
                       "configProfile": {"activeConfigProfileUuid": prof_uuid,
-                                        "activeInbounds": [i["tag"] for i in inbounds]}})
+                                        "activeInbounds": inbound_uuids}})
     secret = (node.get("response", {}) or {}).get("secretKey") if node else None
     os.makedirs("/opt/remnanode", exist_ok=True)
     download_xray_binary("/opt/remnanode/xray-custom")
