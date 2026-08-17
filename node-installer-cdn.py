@@ -981,23 +981,6 @@ def build_xhttp_inbound(port, path, tag, uuid, host):
     }
 
 
-def build_hy2_inbound(port, uuid):
-    """Hysteria2 inbound (UDP) для xray-core с cdn.crt/cdn.key."""
-    return {
-        "tag": "hy2-in-%d" % port,
-        "listen": "0.0.0.0",
-        "port": port,
-        "protocol": "hysteria2",
-        "settings": {"clients": [{"password": uuid, "email": "user1"}]},
-        "streamSettings": {
-            "security": "tls",
-            "tlsSettings": {
-                "certificates": [{"certificateFile": CDN_CRT, "keyFile": CDN_KEY}],
-            },
-        },
-    }
-
-
 def build_grpc_inbound(port, uuid, priv, pub, sid, service):
     """VLESS Reality gRPC inbound для xray-core."""
     return {
@@ -1581,15 +1564,12 @@ def install_remnawave(cfg):
 
     token = remnawave_bringup(cfg)
 
-    # ── профиль + инбаунды (CDN xhttp + опц. hy2/grpc + опц. BRIDGE_IN) ──
+    # ── профиль + инбаунды (CDN xhttp + опц. gRPC + опц. BRIDGE_IN) ──
     step("Создание профиля, ноды, хоста и юзера через API")
     user_uuid = str(_uuid.uuid4())
     inbounds = [build_xhttp_inbound(xport, path, "%s-CDN" % (cfg["cdn"]),
                                     user_uuid, origin)]
     reality = None
-    if not cfg.get("no_hy2"):
-        inbounds.append(build_hy2_inbound(8443, user_uuid))
-        ok("Добавлен Hysteria2 inbound (UDP 8443)")
     if not cfg.get("no_grpc"):
         priv, pub = gen_x25519()
         if priv:
@@ -1637,12 +1617,12 @@ def install_remnawave(cfg):
     # политика deny incoming их закроет.
     extra_tcp = ([8888] if cfg.get("cascade") else []) \
         + ([] if cfg.get("no_grpc") else [2053])
-    extra_udp = [] if cfg.get("no_hy2") else [8443]
+    extra_udp = []
     firewall_setup(extra_tcp=extra_tcp, extra_udp=extra_udp)
     restrict_node_port_2222(gw)
     node_wait_ready()
 
-    # ── хост CDN + опц. hy2/grpc, юзер, сквад ──
+    # ── хост CDN + опц. gRPC, юзер, сквад ──
     create_remnawave_host(token, prof_uuid, inbounds[0]["tag"], cdn_dom or origin,
                           origin, path, reality,
                           inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
@@ -1809,13 +1789,9 @@ def create_config_profile(api, name, inbounds, tries=3):
     api(method, path, data) -> (resp, code): работает и локально, и по SSH.
     """
     # Панель прогоняет конфиг через xray и отвергает целиком (A112), если хоть
-    # один вход невалиден — например hysteria2: xray-core такого протокола не
-    # знает, это отдельный проект. Поэтому при отказе сужаем набор, а не падаем:
-    # установка с одним рабочим входом лучше, чем никакая.
+    # один вход невалиден. Поэтому при отказе пробуем оставить только основной
+    # CDN-вход: установка с ним одним лучше, чем никакая.
     variants = [("полный", inbounds)]
-    lean = [i for i in inbounds if i.get("protocol") != "hysteria2"]
-    if lean and len(lean) != len(inbounds):
-        variants.append(("без hysteria2", lean))
     if len(inbounds) > 1:
         variants.append(("только основной вход", inbounds[:1]))
 
@@ -2140,8 +2116,7 @@ def install_3xui(cfg):
     if not cfg.get("no_grpc"):
         reality = xui_grpc_inbound(uuid)
 
-    firewall_setup(extra_tcp=([] if cfg.get("no_grpc") else [2053]),
-                   extra_udp=([] if cfg.get("no_hy2") else [8443]))
+    firewall_setup(extra_tcp=([] if cfg.get("no_grpc") else [2053]))
 
     return {"user_uuid": uuid, "sub_id": sub_id, "xport": xport,
             "panel_port": panel_port, "panel_path": panel_path,
@@ -2268,7 +2243,7 @@ def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport,
         return False
     say("  [удалённая] SSH OK, установка пакетов...")
     pkg_install("nginx openssl curl ca-certificates gnupg", cred)
-    firewall_setup(cred, extra_tcp=[2053], extra_udp=[8443])
+    firewall_setup(cred, extra_tcp=[2053])
     say("  [удалённая] Установка Docker...")
     if not install_docker(cred) or not ensure_compose(cred):
         err("[удалённая] Docker не установился на %s" % cred["ip"]); return False
@@ -2364,7 +2339,7 @@ def install_node_only(cfg):
             "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
             "nginx -t && systemctl restart nginx")
         upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
-    firewall_setup(extra_tcp=[2053], extra_udp=[8443])
+    firewall_setup(extra_tcp=[2053])
     run("cd /opt/remnanode && docker compose pull", timeout=600)
     run("cd /opt/remnanode && docker compose up -d")
     node_wait_ready()
@@ -2480,10 +2455,10 @@ def parse_args():
     p.add_argument("--panel-pass", help="Panel Remnawave password (mode 3)")
     p.add_argument("--panel-ssh-user", default="root", help="Panel SSH user (mode 3)")
     p.add_argument("--panel-ssh-pass", help="Panel SSH password (mode 3)")
-    p.add_argument("--hy2", action="store_true",
-                   help="Add Hysteria2 inbound (off by default: xray-core has "
-                        "no such protocol, the panel may reject the profile)")
-    p.add_argument("--no-hy2", action="store_true", help="Skip Hysteria2 (default)")
+    # Hysteria2 убран: это отдельный проект, а не протокол xray-core, и нода
+    # запускает стоковый xray. Флаг принимается молча, чтобы не ломать старые
+    # команды в чужих скриптах.
+    p.add_argument("--no-hy2", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--no-grpc", action="store_true", help="Skip gRPC Reality")
     p.add_argument("--no-origin-le", action="store_true",
                    help="Do not try Let's Encrypt for the CDN origin (keep self-signed)")
@@ -2654,23 +2629,17 @@ def main():
     admin_pw = rand_password()
 
     # ── запасные каналы ──
-    # Раньше gRPC и Hysteria2 добавлялись молча, и невалидный для xray-core
-    # hysteria2-вход ронял весь профиль панели. Теперь спрашиваем — но только
-    # там, где инбаунды вообще создаются, и только если не задано флагами.
+    # Раньше запасной вход добавлялся молча. Теперь спрашиваем — но только
+    # там, где инбаунды вообще создаются, и только если не задано флагом.
     want_grpc = not args.no_grpc
-    want_hy2 = args.hy2 and not args.no_hy2
-    if mode in ("1", "2", "3", "5") and not args.no_grpc and not args.hy2:
-        pick = choose("Запасные каналы, помимо CDN?", [
-            "gRPC Reality (TCP 2053) — рекомендуется, вход на случай отказа CDN",
-            "Только CDN — минимум открытых портов наружу",
-            "gRPC Reality + Hysteria2 (UDP 8443) — xray-core hysteria2 не знает, "
-            "панель может отвергнуть профиль"])
-        want_grpc = pick in (1, 3)
-        want_hy2 = pick == 3
+    if mode in ("1", "2", "3", "5") and not args.no_grpc:
+        want_grpc = choose("Запасной вход, помимо CDN?", [
+            "gRPC Reality (TCP 2053) — рекомендуется, работает при отказе CDN",
+            "Только CDN — минимум открытых портов наружу"]) == 1
 
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
-           "no_hy2": not want_hy2, "no_grpc": not want_grpc,
+           "no_grpc": not want_grpc,
            "cascade": args.cascade, "xport": xport,
            "no_origin_le": args.no_origin_le}
 
