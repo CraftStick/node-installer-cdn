@@ -1564,6 +1564,10 @@ def install_remnawave(cfg):
 
     token = remnawave_bringup(cfg)
 
+    # Веб-слой: без него панель остаётся на 127.0.0.1:3000, а CDN-origin
+    # не существует — провайдеру нечего забирать.
+    setup_remnawave_web(cfg, xport, path)
+
     # ── профиль + инбаунды (CDN xhttp + опц. gRPC + опц. BRIDGE_IN) ──
     step("Создание профиля, ноды, хоста и юзера через API")
     user_uuid = str(_uuid.uuid4())
@@ -1938,23 +1942,60 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY, cred=None):
         live = "/etc/letsencrypt/live/%s" % domain
         _, ok_rc = runner("test -f %s/fullchain.pem" % live)
         if ok_rc == 0:
-            runner("cp %s/fullchain.pem %s && cp %s/privkey.pem %s && "
-                   "nginx -s reload 2>/dev/null; docker restart remnanode 2>/dev/null || true"
-                   % (live, crt, live, key))
-            # deploy-hook на автопродление
-            hook = ("#!/bin/bash\ncp %s/fullchain.pem %s\ncp %s/privkey.pem %s\n"
-                    "nginx -s reload\ndocker restart remnanode 2>/dev/null || true\n"
-                    % (live, crt, live, key))
-            runner("mkdir -p /etc/letsencrypt/renewal-hooks/deploy && "
-                   "printf '%%b' '%s' > /etc/letsencrypt/renewal-hooks/deploy/cert.sh && "
-                   "chmod +x /etc/letsencrypt/renewal-hooks/deploy/cert.sh"
-                   % hook.replace("'", "'\\''"))
+            # crt=None — копия не нужна: vhost смотрит прямо в live-каталог,
+            # тогда и продление подхватывается без deploy-хука.
+            if crt:
+                runner("cp %s/fullchain.pem %s && cp %s/privkey.pem %s && "
+                       "nginx -s reload 2>/dev/null; docker restart remnanode 2>/dev/null || true"
+                       % (live, crt, live, key))
+                # deploy-hook на автопродление
+                hook = ("#!/bin/bash\ncp %s/fullchain.pem %s\ncp %s/privkey.pem %s\n"
+                        "nginx -s reload\ndocker restart remnanode 2>/dev/null || true\n"
+                        % (live, crt, live, key))
+                runner("mkdir -p /etc/letsencrypt/renewal-hooks/deploy && "
+                       "printf '%%b' '%s' > /etc/letsencrypt/renewal-hooks/deploy/cert.sh && "
+                       "chmod +x /etc/letsencrypt/renewal-hooks/deploy/cert.sh"
+                       % hook.replace("'", "'\\''"))
+            else:
+                runner("nginx -s reload 2>/dev/null || true")
             ok("Сертификат LE получен для %s" % domain)
             return True
         say("  certbot не прошёл (попытка %d/3), повтор через 20с..." % (attempt + 1))
         nap(20)
     warn("сертификат для %s не выпущен — self-signed" % domain)
     return False
+
+
+def setup_remnawave_web(cfg, xport, path):
+    """nginx перед панелью и CDN-origin: режим 1, всё на одном сервере.
+
+    Схема снята с работающего сервера: panel.conf на server_name <домен>
+    проксирует в 127.0.0.1:3000, а default_server отдаёт CDN-origin на
+    origin.<домен> и заглушку на всё остальное. Панель светит сертификат
+    браузеру, поэтому её vhost смотрит прямо в /etc/letsencrypt/live —
+    продление подхватывается само. Origin остаётся на cdn.crt: его CDN всё
+    равно не проверяет.
+    """
+    domain = cfg["domain"]
+    origin = cfg.get("origin_domain", domain)
+    step("nginx: панель и CDN-origin")
+    pkg_install("nginx openssl curl ca-certificates certbot")
+    ensure_nginx_base()
+    self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
+    write_decoy(origin)
+    nginx_write_conf("default", nginx_cdn_origin_config(xport, path, "prefix"))
+    nginx_write_conf("panel.conf", nginx_panel_proxy(domain, 3000))
+    ok("nginx: origin :443 -> 127.0.0.1:%d, панель %s -> 127.0.0.1:3000"
+       % (xport, domain))
+    # LE для домена панели: без копирования, vhost переписываем на live-пути
+    if issue_le_cert(domain, crt=None, key=None):
+        live = "/etc/letsencrypt/live/%s" % domain
+        nginx_write_conf("panel.conf", nginx_panel_proxy(
+            domain, 3000, live + "/fullchain.pem", live + "/privkey.pem"))
+        ok("Панель на сертификате Let's Encrypt")
+    else:
+        warn("Панель осталась на self-signed — браузер будет ругаться")
+    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
 
 
 def upgrade_origin_cert(origin_domain, cred=None, skip=False):
