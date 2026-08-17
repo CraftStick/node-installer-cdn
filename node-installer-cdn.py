@@ -1808,13 +1808,31 @@ def create_config_profile(api, name, inbounds, tries=3):
     ссылаются и сквад, и нода — теги для этого не годятся.
     api(method, path, data) -> (resp, code): работает и локально, и по SSH.
     """
+    # Панель прогоняет конфиг через xray и отвергает целиком (A112), если хоть
+    # один вход невалиден — например hysteria2: xray-core такого протокола не
+    # знает, это отдельный проект. Поэтому при отказе сужаем набор, а не падаем:
+    # установка с одним рабочим входом лучше, чем никакая.
+    variants = [("полный", inbounds)]
+    lean = [i for i in inbounds if i.get("protocol") != "hysteria2"]
+    if lean and len(lean) != len(inbounds):
+        variants.append(("без hysteria2", lean))
+    if len(inbounds) > 1:
+        variants.append(("только основной вход", inbounds[:1]))
+
     resp, code = None, 0
-    for attempt in range(tries):
-        resp, code = api("POST", "config-profiles", build_xray_profile(name, inbounds))
+    for label, inbs in variants:
+        for attempt in range(tries):
+            resp, code = api("POST", "config-profiles", build_xray_profile(name, inbs))
+            if code != 0:
+                break        # ответ получен — повтор его не изменит
+            say("  API не ответил (%d/%d), жду 10 сек..." % (attempt + 1, tries))
+            nap(10)
         if code in (200, 201):
+            if label != "полный":
+                warn("Профиль принят в варианте «%s» — остальные входы панель "
+                     "отвергла" % label)
             break
-        say("  API retry профиля (%d/%d), жду 10 сек..." % (attempt + 1, tries))
-        nap(10)
+        warn("Профиль «%s» отвергнут: %s" % (label, json.dumps(resp)[:160]))
     r = (resp or {}).get("response", {}) or {}
     prof_uuid = r.get("uuid")
     tag2uuid = dict((i.get("tag"), i.get("uuid")) for i in (r.get("inbounds") or []))
