@@ -41,6 +41,7 @@ import base64
 import random
 import string
 import shlex
+import getpass
 import argparse
 import subprocess
 
@@ -1102,6 +1103,49 @@ def rw_api_ssh(cred, token, method, path, data=None):
         return {"error": "invalid JSON", "raw": out[:200]}, 0
 
 
+def rw_login_ssh(cred, username, password):
+    """Логин в Remnawave через SSH-curl на панели. Возвращает accessToken или ''."""
+    resp, _ = rw_api_ssh(cred, "", "POST", "auth/login",
+                         {"username": username, "password": password})
+    return ((resp.get("response") or {}).get("accessToken")
+            or resp.get("accessToken") or "")
+
+
+def resolve_panel_token(cred, cfg):
+    """Достать рабочий токен API панели: --panel-token → файл на панели → логин.
+
+    Без токена все вызовы API вернут 401, а нода молча создастся без профиля,
+    поэтому токен проверяется боевым запросом до начала установки.
+    """
+    tok = (cfg.get("panel_token") or "").strip()
+    src = "--panel-token"
+    if not tok:
+        out, _ = run_remote(cred, "cat /opt/remnawave/.panel_token 2>/dev/null")
+        cand = out.strip()
+        if cand and "\n" not in cand and " " not in cand:
+            tok, src = cand, "/opt/remnawave/.panel_token"
+    if not tok:
+        user, pwd = cfg.get("panel_user"), cfg.get("panel_pass")
+        if not (user and pwd) and sys.stdin.isatty():
+            warn("Токен панели не найден — панель ставил не этот установщик")
+            say("  Введи логин админа панели (или Ctrl-C и запусти с --panel-token)")
+            user = user or ask("Логин админа панели")
+            pwd = pwd or ask_secret("Пароль админа панели")
+        if user and pwd:
+            tok, src = rw_login_ssh(cred, user, pwd), "auth/login"
+    if not tok:
+        err("Нет токена API панели — нода не сможет зарегистрироваться")
+        say("  Передай --panel-token <JWT> или --panel-user/--panel-pass")
+        return ""
+    probe, _ = rw_api_ssh(cred, tok, "GET", "nodes")
+    if "response" not in probe:
+        err("Токен панели не принят (%s): %s"
+            % (src, str(probe.get("error") or probe)[:120]))
+        return ""
+    ok("Токен API панели: OK (%s)" % src)
+    return tok
+
+
 def remnawave_register(username, password):
     """Регистрация первого админа. Возвращает JWT-токен логина или ''."""
     resp, code = rw_api_local(None, "POST", "auth/register",
@@ -1834,9 +1878,13 @@ def setup_remote_node(cred, secret, panel_ip, origin, cdn, path, xport,
                       no_origin_le=False):
     """Install Docker + nginx CDN origin + remnanode на удалённом сервере via SSH."""
     say("  [удалённая] Подключение к %s..." % cred["ip"])
+    if not cred.get("key") and not ensure_sshpass():
+        return False
     out, rc = run_remote(cred, "echo OK")
     if "OK" not in out:
         err("Не могу подключиться по SSH к %s" % cred["ip"])
+        if out.strip():
+            say("  " + out.strip().splitlines()[-1][:200])
         return False
     say("  [удалённая] SSH OK, установка пакетов...")
     pkg_install("nginx openssl curl ca-certificates gnupg", cred)
@@ -1879,14 +1927,23 @@ def install_node_only(cfg):
     step("Проверка подключения к панели")
     panel = {"ip": cfg["panel_url"], "user": cfg.get("panel_ssh_user", "root"),
              "pass": cfg.get("panel_ssh_pass", ""), "key": cfg.get("panel_key")}
+    # sshpass нужен ДО первого run_remote — на чистой ноде его ещё нет
+    if not panel["key"] and not ensure_sshpass():
+        sys.exit(1)
     out, rc = run_remote(panel, "echo ok")
     if "ok" not in out:
-        err("SSH к панели %s не удался" % panel["ip"]); sys.exit(1)
+        err("SSH к панели %s не удался" % panel["ip"])
+        if out.strip():
+            say("  " + out.strip().splitlines()[-1][:200])
+        sys.exit(1)
     ok("SSH к панели: OK")
     # проверить, что Remnawave API отвечает локально на панели
     out, _ = run_remote(panel, "curl -s http://127.0.0.1:3001/health || "
                         "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api")
-    api = lambda m, p, d=None: rw_api_ssh(panel, cfg.get("panel_token", ""), m, p, d)
+    token = resolve_panel_token(panel, cfg)
+    if not token:
+        sys.exit(1)
+    api = lambda m, p, d=None: rw_api_ssh(panel, token, m, p, d)
 
     step("Подготовка системы")
     check_ubuntu()
@@ -2037,6 +2094,9 @@ def parse_args():
     p.add_argument("--node-pass", help="Remote node password (mode 2)")
     p.add_argument("--node-key", help="Path to SSH private key for remote node")
     p.add_argument("--panel-url", help="Panel IP (mode 3)")
+    p.add_argument("--panel-token", help="Remnawave API token (modes 3,5). "
+                   "Если не задан — берётся /opt/remnawave/.panel_token с панели, "
+                   "иначе логин по --panel-user/--panel-pass")
     p.add_argument("--panel-user", help="Panel Remnawave username (mode 3)")
     p.add_argument("--panel-pass", help="Panel Remnawave password (mode 3)")
     p.add_argument("--panel-ssh-user", default="root", help="Panel SSH user (mode 3)")
@@ -2064,6 +2124,34 @@ def ask(prompt, default=None):
     except (EOFError, KeyboardInterrupt):
         v = ""
     return v or (default or "")
+
+
+def ask_required(prompt, why):
+    """Спросить и не пускать дальше с пустым значением."""
+    while True:
+        v = ask(prompt)
+        if v:
+            return v
+        warn("Пустое значение — %s" % why)
+
+
+def ask_secret(prompt):
+    """Пароль без эха в терминале."""
+    line = "  " + _c(C_ACC, "❯") + " " + prompt + _c(C_DIM, "  ")
+    try:
+        return getpass.getpass(line).strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def ssh_host(value):
+    """https://panel.example.com/xyz -> panel.example.com (SSH нужен хост, не URL)."""
+    v = (value or "").strip()
+    v = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", v)
+    v = v.split("/")[0].split("?")[0]
+    if "@" in v:
+        v = v.rsplit("@", 1)[1]
+    return v.split(":")[0] if v.count(":") == 1 else v
 
 
 def choose(prompt, options):
@@ -2184,10 +2272,22 @@ def main():
             setup_remote_node(cred, None, my_ip, origin, cdn_name, path, cfg["xport"],
                               no_origin_le=cfg.get("no_origin_le"))
     elif mode in ("3", "5"):
-        cfg["panel_url"] = args.panel_url or ask("IP/URL панели Remnawave")
+        cfg["panel_url"] = ssh_host(args.panel_url or ask_required(
+            "IP/URL панели Remnawave", "без адреса панели подключиться некуда"))
         cfg["panel_ssh_user"] = args.panel_ssh_user
-        cfg["panel_ssh_pass"] = args.panel_ssh_pass or ask("SSH пароль панели")
         cfg["panel_key"] = args.node_key
+        cfg["panel_token"] = args.panel_token
+        cfg["panel_user"] = args.panel_user
+        cfg["panel_pass"] = args.panel_pass
+        if cfg["panel_key"]:
+            cfg["panel_ssh_pass"] = args.panel_ssh_pass or ""
+        else:
+            cfg["panel_ssh_pass"] = args.panel_ssh_pass
+            while not cfg["panel_ssh_pass"]:
+                cfg["panel_ssh_pass"] = ask_secret("SSH пароль панели")
+                if not cfg["panel_ssh_pass"]:
+                    warn("Пустой пароль — SSH к панели не пройдёт "
+                         "(или запусти с --node-key /путь/к/ключу)")
         cfg["skip_cdn"] = (mode == "5")   # «только нода» — без nginx CDN-origin
         result = install_node_only(cfg)
     elif mode == "4":

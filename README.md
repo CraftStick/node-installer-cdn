@@ -171,6 +171,12 @@ CDN · файрвол · BBR, TCP Fast Open и сетевые буферы ·
 --panel-url       IP/URL панели
 --panel-ssh-user  SSH-пользователь панели (по умолчанию root)
 --panel-ssh-pass  SSH-пароль панели
+--panel-token     API-токен Remnawave. Если не задан — берётся
+                  /opt/remnawave/.panel_token с панели (есть только если
+                  панель ставил этот установщик), иначе логин по
+                  --panel-user / --panel-pass
+--panel-user      логин админа панели (для получения токена)
+--panel-pass      пароль админа панели
 --squad           номер или имя сквада (Remnawave)
 
 # режим 6 — только CDN
