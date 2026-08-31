@@ -385,17 +385,35 @@ def card(title, rows, color=C_TITLE):
     print(_c(color, "╰" + "─" * inner + "╯"), flush=True)
 
 def banner():
-    """Стартовый баннер: ASCII-логотип CDN + версия."""
-    logo = [
-        " ██████ ██████  ██   ██",
-        "██      ██   ██ ███  ██",
-        "██      ██   ██ ██ █ ██",
-        "██      ██   ██ ██  ███",
-        " ██████ ██████  ██   ██",
-    ]
+    """Стартовый баннер: объёмный ASCII-логотип CDN + версия.
+
+    Буквы 5×5 блоками, лицо — градиент cyan→фиолетовый по ширине, плюс тень,
+    выдавленная вправо-вниз на один символ (тёмно-фиолетовая) — даёт 3D.
+    """
+    C = ["█████", "█    ", "█    ", "█    ", "█████"]
+    D = ["████ ", "█   █", "█   █", "█   █", "████ "]
+    N = ["█   █", "██  █", "█ █ █", "█  ██", "█   █"]
+    rows = [C[i] + " " + D[i] + " " + N[i] for i in range(5)]
+    W, H = len(rows[0]), len(rows)
+    pal = [51, 45, 39, 38, 44, 74, 111, 141, 177, 176]   # cyan → фиолетовый
+    shadow = "38;5;53"                                     # тёмно-фиолетовая тень
+
     print("", flush=True)
-    for row in logo:
-        print("  " + _c(C_ACC, row), flush=True)
+    for i in range(H + 1):
+        face = rows[i] if i < H else " " * W
+        shad = " " + rows[i - 1][:-1] if 0 <= i - 1 < H else " " * W  # сдвиг вправо
+        line = ""
+        for c in range(W):
+            f = face[c] if c < len(face) else " "
+            s = shad[c] if c < len(shad) else " "
+            if f == "█":
+                line += _c("1;38;5;%d" % pal[min(len(pal) - 1, c * len(pal) // W)], "█")
+            elif s == "█":
+                line += _c(shadow, "█") if _TTY else "░"
+            else:
+                line += " "
+        print("  " + line, flush=True)
+
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "CDN Installer")
           + _c(C_ACC, "  v" + INSTALLER_VERSION), flush=True)
