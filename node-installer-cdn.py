@@ -390,29 +390,38 @@ def banner():
     Буквы 5×5 блоками, лицо — градиент cyan→фиолетовый по ширине, плюс тень,
     выдавленная вправо-вниз на один символ (тёмно-фиолетовая) — даёт 3D.
     """
-    C = ["█████", "█    ", "█    ", "█    ", "█████"]
-    D = ["████ ", "█   █", "█   █", "█   █", "████ "]
-    N = ["█   █", "██  █", "█ █ █", "█  ██", "█   █"]
-    rows = [C[i] + " " + D[i] + " " + N[i] for i in range(5)]
-    W, H = len(rows[0]), len(rows)
+    # Буквы 4 клетки шириной, разделитель — 2 пробела (просветы не сливались)
+    C = ["████", "█   ", "█   ", "█   ", "████"]
+    D = ["███ ", "█  █", "█  █", "█  █", "███ "]
+    N = ["█  █", "██ █", "█ ██", "█  █", "█  █"]
+    glyph = [C[i] + "  " + D[i] + "  " + N[i] for i in range(5)]
+    H, W = len(glyph), len(glyph[0])
     pal = [51, 45, 39, 38, 44, 74, 111, 141, 177, 176]   # cyan → фиолетовый
     shadow = "38;5;53"                                     # тёмно-фиолетовая тень
 
+    # Матрица «лица» с запасом на строку/столбец под тень
+    F = [[r < H and c < W and glyph[r][c] == "█" for c in range(W + 1)]
+         for r in range(H + 1)]
+
+    def enclosed(r, c):
+        """Клетка внутри буквы (есть заливка со всех сторон) — тень тут не рисуем."""
+        left  = any(F[r][x] for x in range(0, c))
+        right = any(F[r][x] for x in range(c + 1, W + 1))
+        up    = any(F[y][c] for y in range(0, r))
+        down  = any(F[y][c] for y in range(r + 1, H + 1))
+        return left and right and up and down
+
     print("", flush=True)
-    for i in range(H + 1):
-        face = rows[i] if i < H else " " * W
-        shad = " " + rows[i - 1][:-1] if 0 <= i - 1 < H else " " * W  # сдвиг вправо
+    for r in range(H + 1):
         line = ""
-        for c in range(W):
-            f = face[c] if c < len(face) else " "
-            s = shad[c] if c < len(shad) else " "
-            if f == "█":
+        for c in range(W + 1):
+            if F[r][c]:                                    # лицо — градиент
                 line += _c("1;38;5;%d" % pal[min(len(pal) - 1, c * len(pal) // W)], "█")
-            elif s == "█":
-                line += _c(shadow, "█") if _TTY else "░"
+            elif r > 0 and c > 0 and F[r - 1][c - 1] and not enclosed(r, c):
+                line += _c(shadow, "█") if _TTY else "░"   # тень только по внешнему контуру
             else:
                 line += " "
-        print("  " + line, flush=True)
+        print("  " + line.rstrip(), flush=True)
 
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "CDN Installer")
