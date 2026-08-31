@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-node-installer-cdn.py — установщик прокси-инфраструктуры за российским CDN (v1.0)
+node-installer-cdn.py — установщик прокси-инфраструктуры за российским CDN
 
 ЧТО ЭТО
 -------
@@ -52,7 +52,7 @@ import urllib.parse
 
 INSTALLER_VERSION = "2.0"             # версия установщика, печатается в баннере
 
-XRAY_MIN_VERSION = "26.7.28"          # xray-core, тянется на ноду (актуальный релиз)
+XRAY_MIN_VERSION = "26.7.28"          # точная (не минимальная) версия xray-core для ноды
 REMNAWAVE_IMAGE  = "remnawave/backend:3"       # мажорный тег 3.x (офиц. compose)
 REMNANODE_IMAGE  = "ghcr.io/remnawave/node:latest"
 XUI_VERSION      = "v3.6.0"
@@ -62,6 +62,8 @@ VALKEY_IMAGE     = "valkey/valkey:9-alpine"    # 3.x: redis через unix-со
 # Валидация пользовательского ввода: значения попадают в шелл-строки и конфиги
 RE_DOMAIN = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$")
 RE_XPATH  = re.compile(r"^/[A-Za-z0-9._~/-]{1,120}$")
+# [0-9], а не \d: \d в Python-регекспах ловит и юникодные цифры
+RE_IPV4   = re.compile(r"^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$")
 
 # Локальный порт xhttp-инбаунда. Фиксированный, как в оригинальном
 # установщике: наружу он не смотрит (TLS снимает nginx), поэтому случайность
@@ -74,9 +76,6 @@ CDN_KEY = "/etc/nginx/ssl/cdn.key"
 # Reality dest/sni — «прикрытие» для gRPC-входа
 REALITY_DEST = "www.microsoft.com:443"
 REALITY_SNI  = "www.microsoft.com"
-
-RU_GEO_URL = ("https://github.com/runetfreedom/russia-v2ray-rules-dat"
-              "/releases/latest/download")
 
 # sysctl BBR-тюнинг
 SYSCTL_TUNING = """net.core.default_qdisc = fq
@@ -252,7 +251,17 @@ networks:
 """.format(backend=REMNAWAVE_IMAGE, postgres=POSTGRES_IMAGE, valkey=VALKEY_IMAGE)
 
 # docker-compose ноды remnanode (host network)
-REMNANODE_COMPOSE = """services:
+def remnanode_compose(custom_xray=True):
+    """Compose ноды. custom_xray — монтировать ли свой бинарник xray поверх штатного.
+
+    Монтируется ТОЛЬКО когда файл реально скачан. Docker создаёт отсутствующий
+    host path каталогом, и такой каталог, наложенный на /usr/local/bin/xray,
+    закрывает собой рабочий бинарник из образа — нода перестаёт стартовать
+    вовсе. Лучше поехать на xray из образа, чем на пустом каталоге.
+    """
+    xray_mount = ("      - /opt/remnanode/xray-custom:/usr/local/bin/xray\n"
+                  if custom_xray else "")
+    return """services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
@@ -267,10 +276,12 @@ REMNANODE_COMPOSE = """services:
         hard: 1048576
     volumes:
       - /etc/nginx/ssl:/etc/nginx/ssl:ro
-      - /opt/remnanode/xray-custom:/usr/local/bin/xray
-    env_file:
+%s    env_file:
       - .env
-""" % REMNANODE_IMAGE
+""" % (REMNANODE_IMAGE, xray_mount)
+
+
+REMNANODE_COMPOSE = remnanode_compose()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,7 +347,12 @@ def _c(code, s):
     return "\033[%sm%s\033[0m" % (code, s) if _TTY else s
 
 def _pad(s, w):
-    """Обрезать/дополнить видимую строку до ширины w (по len без ANSI)."""
+    """Обрезать/дополнить строку до ширины w по len().
+
+    Символы считаются как есть, ANSI не распознаётся: цветную строку обрезка
+    порвёт посреди escape-последовательности. Красить надо снаружи — то, что
+    уже дополнено до ширины.
+    """
     return s[:w] if len(s) > w else s + " " * (w - len(s))
 
 def say(msg):
@@ -424,10 +440,6 @@ def callout(title, lines, color=C_ACC):
 #  Выполнение команд: локально и по SSH
 # ─────────────────────────────────────────────────────────────────────────────
 
-def nap(seconds):
-    """Пауза."""
-    time.sleep(seconds)
-
 def shq(value):
     """Экранировать значение для вставки в шелл-строку."""
     return shlex.quote(str(value))
@@ -443,6 +455,17 @@ HOMOGLYPHS = {
     "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X", "Ѕ": "S",
     "І": "I", "Ј": "J",
 }
+
+def is_ipv4(value):
+    """Строгая проверка IPv4: ровно четыре октета 0..255 и ничего сверх того.
+
+    Именно строгая, с якорем на конце: по прежнему `^\\d+\\.\\d+\\.\\d+\\.\\d+`
+    строка вида '1.2.3.4; что-нибудь' считалась адресом и уезжала дальше в
+    команду файрвола как есть.
+    """
+    m = RE_IPV4.match(value or "")
+    return bool(m) and all(int(g) <= 255 for g in m.groups())
+
 
 def homoglyph_hint(value):
     """Объяснить, что во вводе кириллица вместо латиницы. '' — если не она."""
@@ -567,7 +590,7 @@ def get_ip(cred=None):
     """Get server's public IP (local or remote)."""
     runner = (lambda c: run_remote(cred, c)) if cred else run
     for svc in IP_SERVICES:
-        out, rc = runner("curl -s4 --max-time 5 %s" % svc)
+        out, _ = runner("curl -s4 --max-time 5 %s" % svc)
         ip = "".join(ch for ch in out if ch in "0123456789.")
         if ip.count(".") == 3:
             return ip
@@ -587,34 +610,42 @@ def check_ubuntu():
 def check_disk(need_gb, cred=None):
     """Предупредить, если под docker-образы не хватает места на /.
 
-    Панель тянет postgres + valkey + remnawave + subscription-page: на диске
+    Панель тянет postgres + valkey + remnawave: на диске
     ~5 ГБ это упирается в «no space left on device» уже на docker compose pull,
     поэтому лучше сказать об этом до установки, а не через 5 минут ожидания.
     """
     runner = (lambda c, **k: run_remote(cred, c, **k)) if cred else run
-    out, rc = runner("df -Pm / | awk 'NR==2 {print $4}'")
+    out, _ = runner("df -Pm / | awk 'NR==2 {print $4}'")
     try:
         free_gb = int(out.strip()) / 1024.0
     except ValueError:
-        return True
+        return
     if free_gb >= need_gb:
-        return True
+        return
     warn("Свободно всего %.1f ГБ на / — нужно ~%d ГБ под образы Docker"
          % (free_gb, need_gb))
     say("  Освободи место (docker system prune -af; apt-get clean) "
         "или возьми диск побольше")
-    if sys.stdin.isatty() and ask("Всё равно продолжить? (y/N)", "n").lower() not in ("y", "yes", "д"):
+    if sys.stdin.isatty() and ask("Всё равно продолжить? (y/N)",
+                                  "n").lower() not in ("y", "yes", "д"):
         sys.exit(1)
-    return False
 
 
 def fix_dns(cred=None):
-    """Fix broken DNS (systemd-resolved stub) by writing direct nameservers."""
-    cmd = ("nslookup google.com >/dev/null 2>&1 && exit 0; "
+    """Починить сломанный DNS (stub systemd-resolved), прописав прямые nameserver'ы.
+
+    Проба — getent, а не nslookup: nslookup лежит в отдельном пакете
+    (bind9-dnsutils), которого на минимальных образах Ubuntu/Debian нет. По его
+    отсутствию функция раньше сносила исправный systemd-resolved, перезаписывала
+    resolv.conf и потом рапортовала о нерабочем DNS. getent есть всегда — он из
+    glibc и резолвит через NSS, то есть через тот же /etc/resolv.conf.
+    """
+    probe = "getent hosts google.com >/dev/null 2>&1"
+    cmd = ("%s && exit 0; "
            "systemctl disable --now systemd-resolved 2>/dev/null; "
            "rm -f /etc/resolv.conf; "
            "printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf; "
-           "nslookup google.com >/dev/null 2>&1 && echo DNS_FIXED || echo DNS_STILL_BROKEN")
+           "%s && echo DNS_FIXED || echo DNS_STILL_BROKEN" % (probe, probe))
     out, _ = (run_remote(cred, cmd) if cred else run(cmd))
     if "DNS_FIXED" in out:
         ok("DNS исправлен (8.8.8.8 / 1.1.1.1)")
@@ -690,14 +721,14 @@ def pkg_install(packages, cred=None):
            "/var/cache/apt/archives/lock 2>/dev/null; "
            "dpkg --configure -a 2>/dev/null", timeout=120)
     runner("apt-get update -qq", timeout=180)
-    out, rc = runner("DEBIAN_FRONTEND=noninteractive apt-get install -y %s"
-                     % packages, timeout=600)
+    _, rc = runner("DEBIAN_FRONTEND=noninteractive apt-get install -y %s"
+                   % packages, timeout=600)
     if rc != 0:
         say("  Повторная попытка установки...")
         runner("apt-get --fix-broken install -y 2>/dev/null; "
                "apt-get update --fix-missing", timeout=300)
-        out, rc = runner("DEBIAN_FRONTEND=noninteractive apt-get install -y %s"
-                         % packages, timeout=600)
+        _, rc = runner("DEBIAN_FRONTEND=noninteractive apt-get install -y %s"
+                       % packages, timeout=600)
     if rc != 0:
         err("Не удалось установить: %s" % packages)
         say("  Попробуй вручную: apt-get update && apt-get install -y %s" % packages)
@@ -855,10 +886,14 @@ def ensure_nginx_base(cred=None):
 
 def self_signed_cert(cn="cdn-origin", cred=None):
     """Создать self-signed cdn.crt/cdn.key если их нет (ключ — только root)."""
-    cmd = ("mkdir -p /etc/nginx/ssl && chmod 700 /etc/nginx/ssl && test -f %s || "
+    # Пара проверяется целиком: раньше смотрели только на .crt, и потерянный
+    # ключ не перевыпускался — nginx после этого просто не поднимался. Скобки
+    # вокруг test'ов обязательны, иначе `||` цепляется ещё и к mkdir/chmod.
+    cmd = ("mkdir -p /etc/nginx/ssl && chmod 700 /etc/nginx/ssl; "
+           "{ test -s %s && test -s %s; } || "
            "openssl req -x509 -nodes -days 3650 -newkey rsa:2048 "
            "-keyout %s -out %s -subj '/CN=%s' 2>/dev/null; chmod 600 %s 2>/dev/null"
-           % (CDN_CRT, CDN_KEY, CDN_CRT, cn, CDN_KEY))
+           % (CDN_CRT, CDN_KEY, CDN_KEY, CDN_CRT, cn, CDN_KEY))
     run_remote(cred, cmd) if cred else run(cmd)
 
 
@@ -879,7 +914,7 @@ def nginx_write_conf(name, content):
     write_file(path, content)
     run("rm -f /etc/nginx/sites-enabled/%s && ln -s %s /etc/nginx/sites-enabled/%s"
         % (name, path, name))
-    # server_names_hash_bucket_size + worker_connections
+    # дистрибутивный nginx.conf приезжает с worker_connections 768 — поднимаем
     run("sed -i 's/worker_connections[[:space:]]*[0-9]*/worker_connections 16384/' "
         "/etc/nginx/nginx.conf")
     out, rc = run("nginx -t && systemctl restart nginx")
@@ -902,11 +937,9 @@ def gen_x25519(cred=None):
         "/usr/local/bin/xray x25519 2>/dev/null",
         "/usr/local/x-ui/bin/xray x25519 2>/dev/null",
         "docker run --rm %s xray x25519 2>/dev/null" % REMNANODE_IMAGE,
-        # последний резерв — openssl
-        "openssl genpkey -algorithm X25519 2>/dev/null | openssl pkey -text -noout 2>/dev/null",
     ]
     for cmd in variants:
-        out, rc = runner(cmd)
+        out, _ = runner(cmd)
         if not out:
             continue
         priv = pub = None
@@ -916,33 +949,14 @@ def gen_x25519(cred=None):
                 priv = line.split(":")[-1].strip()
             elif "public" in low:
                 pub = line.split(":")[-1].strip()
-        # формат "xray x25519": "Private key: ...\nPublic key: ..."
+        # Все варианты выше — это xray: "Private key: <b64>" и "Public key:
+        # <b64>", значение на той же строке. Запасной вариант на openssl отсюда
+        # убран: он печатает priv:/pub: с hex на СЛЕДУЮЩИХ строках, разбор его
+        # не берёт, и пара из него не получалась никогда.
         if priv and pub:
             return priv, pub
     err("Не удалось сгенерировать x25519 ключи")
     return None, None
-
-
-def setup_xray_ru_geo(asset_dir="/usr/local/share/xray", cred=None):
-    """Скачать geoip_RU.dat / geosite_RU.dat (runetfreedom). Без них xray не стартует."""
-    runner = (lambda c, **k: run_remote(cred, c, **k)) if cred else run
-    files = ["geoip.dat", "geoip_RU.dat", "geosite.dat", "geosite_RU.dat"]
-    dl = " && ".join(
-        "( curl -fsSL --max-time 900 -o %s %s/%s || "
-        "curl -fsSL --max-time 900 -o %s https://gh-proxy.com/%s/%s )"
-        % (f, RU_GEO_URL, f, f, RU_GEO_URL, f) for f in files)
-    cmd = ("mkdir -p %s && cd %s && %s && test -s geoip_RU.dat && "
-           "test -s geosite_RU.dat && echo GEO_OK" % (asset_dir, asset_dir, dl))
-    out, _ = runner(cmd, timeout=1200)
-    if "GEO_OK" not in out:
-        warn("RU гео-файлы не скачались — xray может не стартовать (роутинг .ru)")
-        return False
-    # прописать XRAY_LOCATION_ASSET для systemd-xray
-    runner("mkdir -p /etc/systemd/system/xray.service.d && "
-           "printf '[Service]\\nEnvironment=XRAY_LOCATION_ASSET=%s\\n' "
-           "> /etc/systemd/system/xray.service.d/asset.conf && systemctl daemon-reload"
-           % asset_dir)
-    return True
 
 
 def build_xhttp_inbound(port, path, tag, uuid=None):
@@ -986,7 +1000,7 @@ def build_xhttp_inbound(port, path, tag, uuid=None):
     }
 
 
-def build_grpc_inbound(port, uuid, priv, pub, sid, service):
+def build_grpc_inbound(port, uuid, priv, sid, service):
     """VLESS Reality gRPC inbound для xray-core."""
     return {
         "tag": "grpc-reality-%d" % port,
@@ -1168,7 +1182,7 @@ def caddy_cdn_origin_config(port, path, crt=CDN_CRT, key=CDN_KEY,
 
 def install_caddy():
     """Поставить caddy из официального репозитория Cloudsmith (Debian/Ubuntu)."""
-    out, rc = run("command -v caddy")
+    _, rc = run("command -v caddy")
     if rc == 0:
         return True
     run("apt-get install -y debian-keyring debian-archive-keyring "
@@ -1182,7 +1196,7 @@ def install_caddy():
     return rc == 0
 
 
-def apply_caddy_front(port, path, origin, crt=CDN_CRT, key=CDN_KEY,
+def apply_caddy_front(port, path, crt=CDN_CRT, key=CDN_KEY,
                       panel_domain=None, panel_port=None):
     """Поднять caddy-фронт вместо nginx: освободить :80/:443, записать Caddyfile.
 
@@ -1205,19 +1219,21 @@ def apply_caddy_front(port, path, origin, crt=CDN_CRT, key=CDN_KEY,
     return True
 
 
-def apply_origin_front(cfg, xport, path, origin, panel_domain=None, panel_port=None):
+def apply_origin_front(cfg, xport, path, panel_domain=None, panel_port=None):
     """Единая точка подъёма origin-фронта: caddy при --front caddy, иначе nginx.
 
     Возвращает фактически поднятый фронт ("caddy"/"nginx"). При caddy панель (если
     задана) обслуживает сам caddy с авто-TLS, поэтому вызывающему не нужны ни
-    nginx-panel.conf, ни certbot. При сбое caddy — молчаливый откат на nginx."""
+    nginx-panel.conf, ни certbot. При сбое caddy печатает warn и откатывается
+    на nginx."""
     if cfg.get("front") == "caddy":
-        if apply_caddy_front(xport, path, origin, panel_domain=panel_domain,
+        if apply_caddy_front(xport, path, panel_domain=panel_domain,
                              panel_port=panel_port):
             ok("origin-фронт (caddy) на :443 -> 127.0.0.1:%d%s"
                % (xport, " + панель %s" % panel_domain if panel_domain else ""))
             return "caddy"
         cfg["front"] = "nginx"      # откат на надёжный дефолт
+    ensure_nginx_base()             # на caddy-пути nginx не нужен вовсе
     nginx_write_conf("default", nginx_cdn_origin_config(xport, path))
     return "nginx"
 
@@ -1354,7 +1370,7 @@ def remnawave_register(username, password):
         if code != 0:
             break
         say("  Панель оборвала соединение, повтор через 5 с (%d/6)..." % (attempt + 1))
-        nap(5)
+        time.sleep(5)
         resp, code = rw_api_local(None, "POST", "auth/register",
                                   {"username": username, "password": password})
     if code in (200, 201):
@@ -1655,7 +1671,7 @@ def remnawave_bringup(cfg):
                     break
             else:
                 dying = 0
-        nap(5)
+        time.sleep(5)
     if not up:
         err("Панель Remnawave не поднялась — логи контейнеров:")
         logs = run("docker compose -f /opt/remnawave/docker-compose.yml "
@@ -1667,7 +1683,6 @@ def remnawave_bringup(cfg):
         sys.exit(1)
     ok("Панель Remnawave запущена")
 
-    # nginx для панели (proxy 127.0.0.1:3000) + LE или self-signed
     say("  Регистрация админа...")
     login_jwt = remnawave_register("admin", admin_pw)
     token = remnawave_api_token(login_jwt)
@@ -1706,7 +1721,7 @@ def install_remnawave(cfg):
         if priv:
             sid = rand(8, "0123456789abcdef")
             service = _slug("grpc")
-            inbounds.append(build_grpc_inbound(2053, user_uuid, priv, pub, sid,
+            inbounds.append(build_grpc_inbound(2053, user_uuid, priv, sid,
                                                service))
             # serviceName и порт печатаются в конце: без них к запасному входу
             # не подключиться, а придумать случайный slug клиент не может
@@ -1735,11 +1750,10 @@ def install_remnawave(cfg):
         warn("Ответ создания ноды: %s" % json.dumps(resp)[:160])
 
     os.makedirs("/opt/remnanode", exist_ok=True)
-    download_xray_binary("/opt/remnanode/xray-custom")
-    write_file("/opt/remnanode/docker-compose.yml", REMNANODE_COMPOSE)
+    custom_xray = download_xray_binary("/opt/remnanode/xray-custom")
+    write_file("/opt/remnanode/docker-compose.yml", remnanode_compose(custom_xray))
     write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""),
                mode=0o600)
-    setup_xray_ru_geo()
     say("  Запуск контейнера remnanode...")
     run("cd /opt/remnanode && docker compose pull", timeout=600)
     run("cd /opt/remnanode && docker compose up -d")
@@ -1765,26 +1779,42 @@ def install_remnawave(cfg):
             "host_uuid": host_uuid, "api": api}
 
 
-def download_xray_binary(dest):
-    """Download xray XRAY_MIN_VERSION binary for volume-mount into remnanode."""
-    _, rc = run("test -x %s && %s version 2>/dev/null | head -1" % (dest, dest))
+def download_xray_binary(dest, cred=None):
+    """Скачать бинарник xray XRAY_MIN_VERSION под bind-mount в remnanode.
+
+    Возвращает True, только если по dest лежит запускаемый файл — вызывающий по
+    этому флагу решает, добавлять ли mount в compose (см. remnanode_compose).
+    Проверка через `xray version`, а не через `test -x`: на каталоге, который
+    docker мог насоздавать на месте пропавшего бинарника, `test -x` проходит.
+    """
+    runner = (lambda c, **k: run_remote(cred, c, **k)) if cred else run
+    tag = "[удалённая] " if cred else ""
+    _, rc = runner("test -f '%s' && '%s' version >/dev/null 2>&1" % (dest, dest))
     if rc == 0:
-        ok("Xray %s уже скачан" % XRAY_MIN_VERSION); return
-    say("  Скачивание xray %s..." % XRAY_MIN_VERSION)
-    arch, _ = run("uname -m")
+        ok("%sXray %s уже скачан" % (tag, XRAY_MIN_VERSION))
+        return True
+    say("  %sСкачивание xray %s..." % (tag, XRAY_MIN_VERSION))
+    arch, _ = runner("uname -m")
     zipname = ("Xray-linux-arm64-v8a.zip" if "aarch64" in arch or "arm64" in arch
                else "Xray-linux-64.zip")
     url = ("https://github.com/XTLS/Xray-core/releases/download/v%s/%s"
            % (XRAY_MIN_VERSION, zipname))
-    out, rc = run("cd /tmp && curl -sL -o xray_dl.zip '%s' && "
-                  "python3 -c \"import zipfile;z=zipfile.ZipFile('xray_dl.zip');"
-                  "z.extract('xray','xray_dl');z.close()\" && mv xray_dl/xray '%s' && "
-                  "chmod +x '%s' && rm -rf xray_dl.zip xray_dl" % (url, dest, dest),
-                  timeout=300)
-    if rc == 0:
-        ok("Xray %s готов" % XRAY_MIN_VERSION)
-    else:
-        warn("Не удалось скачать xray: %s" % out[:120])
+    # Распаковка: unzip есть не на всяком образе, python3 — тоже не всюду
+    # (сам установщик крутится на ДРУГОЙ машине), поэтому пробуем оба.
+    # rm -rf dest перед mv — на случай каталога от прошлой сломанной установки.
+    out, rc = runner(
+        "cd /tmp && rm -rf xray_dl xray_dl.zip && curl -sL -o xray_dl.zip '%s' && "
+        "mkdir -p xray_dl && ( unzip -o -q xray_dl.zip xray -d xray_dl || "
+        "python3 -c \"import zipfile;zipfile.ZipFile('xray_dl.zip')"
+        ".extract('xray','xray_dl')\" ) && rm -rf '%s' && mv xray_dl/xray '%s' && "
+        "chmod +x '%s' && test -x '%s' && rm -rf xray_dl.zip xray_dl"
+        % (url, dest, dest, dest, dest), timeout=300)
+    if rc != 0:
+        warn("%sНе удалось скачать xray: %s" % (tag, out[:120]))
+        say("     Нода поедет на xray из образа remnanode")
+        return False
+    ok("%sXray %s готов" % (tag, XRAY_MIN_VERSION))
+    return True
 
 
 def detect_ssh_port(runner):
@@ -1858,12 +1888,14 @@ def restrict_node_port_2222(panel_ip, cred=None):
     иначе — сырой iptables с последующим сохранением.
     """
     runner = (lambda c: run_remote(cred, c)) if cred else run
-    ip = panel_ip
-    if not re.match(r"^\d+\.\d+\.\d+\.\d+", ip or ""):
-        out, _ = runner("getent hosts %s | head -1 | tr -s ' ' | cut -d' ' -f1" % ip)
+    ip = (panel_ip or "").strip()
+    if not is_ipv4(ip):
+        out, _ = runner("getent hosts %s | head -1 | tr -s ' ' | cut -d' ' -f1"
+                        % shq(ip))
         ip = out.strip()
-    if not re.match(r"^\d+\.\d+\.\d+\.\d+", ip or ""):
-        warn("Не удалось определить IP панели из '%s' — порт 2222 оставлен открытым" % panel_ip)
+    if not is_ipv4(ip):
+        warn("Не удалось определить IP панели из '%s' — порт 2222 оставлен открытым"
+             % panel_ip)
         return
     if ufw_active(runner):
         runner("ufw allow from %s to any port 2222 proto tcp >/dev/null 2>&1" % ip)
@@ -1892,7 +1924,7 @@ def node_wait_ready(cred=None):
         out, _ = runner("docker logs remnanode --tail=15 2>&1")
         if "XRay Core" in out or "is up and running" in out:
             ok("Нода запущена!"); return True
-        nap(5)
+        time.sleep(5)
     warn("Нода не отрапортовала о запуске — проверь: docker logs remnanode")
     return False
 
@@ -1942,7 +1974,7 @@ def create_config_profile(api, name, inbounds, tries=3):
             if code != 0:
                 break        # ответ получен — повтор его не изменит
             say("  API не ответил (%d/%d), жду 10 сек..." % (attempt + 1, tries))
-            nap(10)
+            time.sleep(10)
         if code in (200, 201):
             if label != "полный":
                 warn("Профиль принят в варианте «%s» — остальные входы панель "
@@ -1965,8 +1997,8 @@ def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
                           inbound_uuid=None):
     """Создать CDN-хост и привязать к профилю/инбаунду.
 
-    Имя поля xhttp-extra зависит от версии панели: 2.7.x -> xHttpExtraParams,
-    2.8+ -> xhttpExtraParams. Ставим ОБА — панель молча игнорит лишнее.
+    Имя поля xhttp-extra в разных ревизиях панели пишется то xhttpExtraParams,
+    то xHttpExtraParams. Ставим ОБА — валидатор молча срезает лишнее.
     api(method, path, data) -> (resp, code): работает и локально, и по SSH.
     """
     if not prof_uuid:
@@ -2102,7 +2134,7 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY, cred=None):
         if out.strip() == myip:
             break
         say("  жду DNS %s -> %s ..." % (domain, myip))
-        nap(10)
+        time.sleep(10)
     for attempt in range(3):
         runner("certbot certonly --webroot -w /var/www/certbot -d %s "
                "--non-interactive --agree-tos "
@@ -2129,7 +2161,7 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY, cred=None):
             ok("Сертификат LE получен для %s" % domain)
             return True
         say("  certbot не прошёл (попытка %d/3), повтор через 20с..." % (attempt + 1))
-        nap(20)
+        time.sleep(20)
     warn("сертификат для %s не выпущен — self-signed" % domain)
     return False
 
@@ -2151,7 +2183,7 @@ def setup_remnawave_web(cfg, xport, path):
     ensure_nginx_base()
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
     write_decoy(origin)
-    if apply_origin_front(cfg, xport, path, origin,
+    if apply_origin_front(cfg, xport, path,
                           panel_domain=domain, panel_port=3000) == "caddy":
         ok("caddy: CDN :443 -> 127.0.0.1:%d + панель %s (авто-TLS)" % (xport, domain))
     else:
@@ -2190,8 +2222,7 @@ def upgrade_origin_cert(origin_domain, cred=None, skip=False):
     return False
 
 
-def nginx_panel_proxy(domain, upstream_port, crt=CDN_CRT, key=CDN_KEY,
-                      extra_locations=""):
+def nginx_panel_proxy(domain, upstream_port, crt=CDN_CRT, key=CDN_KEY):
     """nginx-конфиг для проксирования панели (80->443 redirect + proxy)."""
     return """server {
     listen 80;
@@ -2216,8 +2247,8 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
     }
-%s}
-""" % (domain, domain, crt, key, upstream_port, extra_locations)
+}
+""" % (domain, domain, crt, key, upstream_port)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2256,48 +2287,64 @@ def install_3xui_panel(admin_pw, port, base_path):
 
 
 def xui_sql(sql):
-    """Выполнить SQL в /etc/x-ui/x-ui.db через sqlite3."""
+    """Выполнить SQL в /etc/x-ui/x-ui.db через sqlite3. True — применилось целиком.
+
+    Скрипт едет одной транзакцией под -bail: без них sqlite3 на ошибке в
+    середине не останавливается, а идёт дальше и оставляет базу наполовину
+    обновлённой — при этом возвращает 1, так что вызывающий видит «не вышло»,
+    а строки уже вписаны. -bail роняет sqlite3 на первом же отказе, COMMIT до
+    него не доходит, и транзакция откатывается сама при закрытии соединения.
+    """
     if run("which sqlite3")[1] != 0:
         pkg_install("sqlite3")
-    write_file("/tmp/_xui.sql", sql, mode=0o600)   # в SQL едут uuid и пароли
-    out, rc = run("sqlite3 /etc/x-ui/x-ui.db < /tmp/_xui.sql 2>&1")
+    write_file("/tmp/_xui.sql", "BEGIN;\n" + sql + "COMMIT;\n",
+               mode=0o600)                          # в SQL едут uuid и пароли
+    out, rc = run("sqlite3 -bail /etc/x-ui/x-ui.db < /tmp/_xui.sql 2>&1")
     run("rm -f /tmp/_xui.sql")
     if rc != 0:
         warn("SQL ошибка: %s" % out[:160])
     return rc == 0
 
 
+XUI_CDN_EMAIL  = "user1"
+XUI_GRPC_EMAIL = "user1-grpc"
+
+
 def xui_cdn_inbound(tag, port, path, uuid, sub_id):
-    """Создать CDN xhttp inbound в 3x-ui напрямую в SQLite."""
+    """Создать CDN xhttp inbound в 3x-ui напрямую в SQLite.
+
+    Клиент живёт не отдельной таблицей, а внутри JSON в inbounds.settings —
+    так устроена схема 3x-ui (inbounds / client_traffics / settings / users,
+    таблиц clients и client_inbounds в ней нет). client_traffics нужен только
+    под счётчики, и email в нём UNIQUE на всю базу: у gRPC-инбаунда поэтому
+    свой email, иначе второй INSERT ронял бы всю транзакцию.
+    """
+    email = XUI_CDN_EMAIL
     stream = build_xhttp_inbound(port, path, tag, uuid)["streamSettings"]
-    settings = {"clients": [{"id": uuid, "email": "user1", "flow": "",
+    settings = {"clients": [{"id": uuid, "email": email, "flow": "",
                              "subId": sub_id}], "decryption": "none", "fallbacks": []}
     sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
-    ts = int(time.time() * 1000)
     sql = (
-        "DELETE FROM client_inbounds WHERE client_id IN "
-        "(SELECT id FROM clients WHERE email='user1');\n"
-        "DELETE FROM client_traffics WHERE email='user1';\n"
-        "DELETE FROM clients WHERE email='user1';\n"
+        "DELETE FROM client_traffics WHERE email='%s';\n"
         "DELETE FROM inbounds WHERE tag='%s';\n"
         "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, "
         "listen, port, protocol, settings, stream_settings, tag, sniffing) "
         "VALUES (1,0,0,0,'%s-CDN',1,0,'127.0.0.1',%d,'vless','%s','%s','%s','%s');\n"
-        "INSERT INTO clients (email, sub_id, uuid, flow, limit_ip, total_gb, "
-        "expiry_time, enable, created_at) VALUES ('user1','%s','%s','',0,0,0,1,%d);\n"
         "INSERT INTO client_traffics (inbound_id, enable, email, up, down, "
         "expiry_time, total, reset) VALUES ((SELECT id FROM inbounds WHERE tag='%s'),"
-        "1,'user1',0,0,0,0,0);\n"
-        % (tag, tag, port,
+        "1,'%s',0,0,0,0,0);\n"
+        % (email, tag, tag, port,
            json.dumps(settings).replace("'", "''"),
            json.dumps(stream).replace("'", "''"),
            tag, json.dumps(sniff).replace("'", "''"),
-           sub_id, uuid, ts, tag)
+           tag, email)
     )
     if xui_sql(sql):
         run("systemctl restart x-ui")
         ok("Inbound создан через SQLite: %s-CDN" % tag)
         return True
+    err("Inbound %s-CDN в 3x-ui не создан — основной вход через CDN не работает"
+        % tag)
     return False
 
 
@@ -2313,7 +2360,6 @@ def install_3xui(cfg):
     tune_os()
     ensure_nginx_base()
     install_3xui_panel(admin_pw, panel_port, panel_path)
-    setup_xray_ru_geo()
 
     # Тот же веб-слой, что и у Remnawave: default_server отдаёт CDN-origin и
     # заглушку, panel.conf — саму панель. Без origin-конфига xhttp-инбаунд
@@ -2321,7 +2367,7 @@ def install_3xui(cfg):
     step("nginx: панель и CDN")
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
     write_decoy(origin)
-    if apply_origin_front(cfg, xport, path, origin,
+    if apply_origin_front(cfg, xport, path,
                           panel_domain=domain, panel_port=panel_port) == "caddy":
         ok("caddy: CDN :443 -> 127.0.0.1:%d + панель %s (авто-TLS)" % (xport, domain))
     else:
@@ -2338,7 +2384,11 @@ def install_3xui(cfg):
     # CDN xhttp inbound
     step("Создание %s CDN inbound" % cfg["cdn"])
     uuid = str(_uuid.uuid4()); sub_id = rand(16)
-    xui_cdn_inbound(cfg["cdn"], xport, path, uuid, sub_id)
+    # Это и есть весь смысл установки: без инбаунда фронт проксирует в пустоту,
+    # поэтому провал здесь — отказ, а не строчка в логе.
+    if not xui_cdn_inbound(cfg["cdn"], xport, path, uuid, sub_id):
+        say("  Проверь схему базы: sqlite3 /etc/x-ui/x-ui.db '.tables'")
+        sys.exit(1)
 
     reality = None
     if not cfg.get("no_grpc"):
@@ -2364,21 +2414,23 @@ def xui_grpc_inbound(uuid):
     step("Установка VLESS Reality gRPC")
     port = random.randint(30000, 40000)
     sid = rand(8, "0123456789abcdef"); service = _slug("grpc")
-    stream = build_grpc_inbound(port, uuid, priv, pub, sid, service)["streamSettings"]
-    settings = {"clients": [{"id": uuid, "email": "user1", "flow": ""}],
+    stream = build_grpc_inbound(port, uuid, priv, sid, service)["streamSettings"]
+    email = XUI_GRPC_EMAIL
+    settings = {"clients": [{"id": uuid, "email": email, "flow": ""}],
                 "decryption": "none"}
     sniff = {"enabled": True, "destOverride": ["http", "tls"]}
     sql = (
+        "DELETE FROM client_traffics WHERE email='%s';\n"
         "DELETE FROM inbounds WHERE tag='grpc-reality';\n"
         "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, "
         "listen, port, protocol, settings, stream_settings, tag, sniffing) "
         "VALUES (1,0,0,0,'gRPC Reality',1,0,'',%d,'vless','%s','%s','grpc-reality','%s');\n"
         "INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, "
         "total, reset) VALUES ((SELECT id FROM inbounds WHERE tag='grpc-reality'),"
-        "1,'user1',0,0,0,0,0);\n"
-        % (port, json.dumps(settings).replace("'", "''"),
+        "1,'%s',0,0,0,0,0);\n"
+        % (email, port, json.dumps(settings).replace("'", "''"),
            json.dumps(stream).replace("'", "''"),
-           json.dumps(sniff).replace("'", "''"))
+           json.dumps(sniff).replace("'", "''"), email)
     )
     if xui_sql(sql):
         run("systemctl restart x-ui")
@@ -2476,7 +2528,7 @@ def setup_remote_node(cred, secret, panel_ip, origin, path, xport,
     say("  [удалённая] Подключение к %s..." % cred["ip"])
     if not cred.get("key") and not ensure_sshpass():
         return False
-    out, rc = run_remote(cred, "echo OK")
+    out, _ = run_remote(cred, "echo OK")
     if "OK" not in out:
         err("Не могу подключиться по SSH к %s" % cred["ip"])
         if out.strip():
@@ -2502,10 +2554,11 @@ def setup_remote_node(cred, secret, panel_ip, origin, path, xport,
     # remnanode
     say("  [удалённая] Настройка remnanode...")
     run_remote(cred, "mkdir -p /opt/remnanode")
-    write_remote(cred, "/opt/remnanode/docker-compose.yml", REMNANODE_COMPOSE)
+    custom_xray = download_xray_binary("/opt/remnanode/xray-custom", cred)
+    write_remote(cred, "/opt/remnanode/docker-compose.yml",
+                 remnanode_compose(custom_xray))
     write_remote(cred, "/opt/remnanode/.env",
                  "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""), mode=0o600)
-    setup_xray_ru_geo(cred=cred)
     run_remote(cred, "cd /opt/remnanode && docker compose pull", timeout=600)
     run_remote(cred, "cd /opt/remnanode && docker compose up -d")
     restrict_node_port_2222(panel_ip, cred)
@@ -2526,7 +2579,7 @@ def install_node_only(cfg):
     # sshpass нужен ДО первого run_remote — на чистой ноде его ещё нет
     if not panel["key"] and not ensure_sshpass():
         sys.exit(1)
-    out, rc = run_remote(panel, "echo ok")
+    out, _ = run_remote(panel, "echo ok")
     if "ok" not in out:
         err("SSH к панели %s не удался" % panel["ip"])
         if out.strip():
@@ -2541,7 +2594,6 @@ def install_node_only(cfg):
     origin = cfg.get("origin_domain", cfg["domain"]); path = cfg["path"]
 
     step("Подготовка системы")
-    check_ubuntu()
     pkg_install("nginx openssl curl ca-certificates gnupg certbot")
     tune_os()
     ensure_nginx_base()
@@ -2562,7 +2614,7 @@ def install_node_only(cfg):
         if priv:
             sid = rand(8, "0123456789abcdef")
             service = _slug("grpc")
-            inbounds.append(build_grpc_inbound(2053, user_uuid, priv, pub, sid,
+            inbounds.append(build_grpc_inbound(2053, user_uuid, priv, sid,
                                                service))
             reality = {"pbk": pub, "sid": sid, "service": service, "port": 2053}
             ok("Добавлен gRPC Reality inbound (TCP 2053)")
@@ -2575,13 +2627,21 @@ def install_node_only(cfg):
                       "configProfile": {"activeConfigProfileUuid": prof_uuid,
                                         "activeInbounds": inbound_uuids}})
     secret = (node.get("response", {}) or {}).get("secretKey") if node else None
+    # Без secretKey remnanode поднимется, но панель его не признает: получилась
+    # бы установка, которая «прошла», а трафика через ноду нет. Останавливаемся
+    # здесь — на этом сервере ещё ничего не запущено, откатывать нечего.
+    if not secret:
+        err("Панель не создала ноду (HTTP %s): %s"
+            % (code, str((node or {}).get("message") or node)[:160]))
+        say("  Профиль в панели создан, но без secretKey нода работать не будет")
+        say("  Проверь доступность панели %s и срок жизни токена" % panel["ip"])
+        sys.exit(1)
     os.makedirs("/opt/remnanode", exist_ok=True)
-    download_xray_binary("/opt/remnanode/xray-custom")
-    write_file("/opt/remnanode/docker-compose.yml", REMNANODE_COMPOSE)
+    custom_xray = download_xray_binary("/opt/remnanode/xray-custom")
+    write_file("/opt/remnanode/docker-compose.yml", remnanode_compose(custom_xray))
     write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""),
                mode=0o600)
-    setup_xray_ru_geo()
-    if apply_origin_front(cfg, xport, path, origin) == "nginx":
+    if apply_origin_front(cfg, xport, path) == "nginx":
         upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup(extra_tcp=([2053] if reality else []))
     # Панель здесь удалённая и стучится к ноде на 2222 снаружи: без этого
@@ -2616,37 +2676,27 @@ def install_node_only(cfg):
 
 
 def install_cdn_only(cfg):
-    """Режим 4: только nginx-фронт CDN перед уже работающей нодой на ЭТОМ сервере.
+    """Режим 4: только origin-фронт CDN перед уже работающей нодой на ЭТОМ сервере.
 
-    Не трогает панель и docker-ноду — ставит только nginx-фронт (self-signed серт
-    + decoy) на upstream 127.0.0.1:<xport> с путём <path> и печатает инструкцию
-    провайдеру."""
+    Не трогает панель и docker-ноду — поднимает фронт (nginx, либо caddy при
+    --front caddy) с self-signed сертом и заглушкой на upstream
+    127.0.0.1:<xport> с путём <path> и печатает инструкцию провайдеру."""
     origin = cfg.get("origin_domain", cfg["domain"])
     xport = cfg["xport"]
     path = cfg["path"]
-    front = cfg.get("front", "nginx")
     step("Установка CDN-фронта")
-    say("  Upstream: 127.0.0.1:%d   path: %s   фронт: %s" % (xport, path, front))
-    if front == "caddy":
-        self_signed_cert(origin)
-        write_decoy(origin)
-        if apply_caddy_front(xport, path, origin):
-            firewall_setup()
-            ok("CDN-фронт (caddy) поднят на :443 -> 127.0.0.1:%d" % xport)
-            return {}
-        # не поднялся caddy — падать в nginx как в надёжный дефолт
-        cfg["front"] = "nginx"
-    ensure_nginx_base()
+    say("  Upstream: 127.0.0.1:%d   path: %s   фронт: %s"
+        % (xport, path, cfg.get("front", "nginx")))
     self_signed_cert(origin)
     write_decoy(origin)
-    conf = nginx_cdn_origin_config(xport, path)
-    write_file("/etc/nginx/sites-available/default", conf)
-    run("rm -f /etc/nginx/sites-enabled/default && "
-        "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
-        "nginx -t && systemctl restart nginx")
-    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
+    # Подъём фронта и откат caddy->nginx живут в apply_origin_front — здесь
+    # раньше лежала его вторая копия, которая при этом забывала поднять
+    # worker_connections в nginx.conf.
+    front = apply_origin_front(cfg, xport, path)
+    if front == "nginx":
+        upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup()
-    ok("CDN-фронт поднят на :443 -> 127.0.0.1:%d" % xport)
+    ok("CDN-фронт (%s) поднят на :443 -> 127.0.0.1:%d" % (front, xport))
     return {}
 
 
@@ -2908,7 +2958,7 @@ def final_selfcheck(cfg, xport, path):
 
     # 3. сервис фронта активен
     svc = "caddy" if front == "caddy" else "nginx"
-    out, rc = run("systemctl is-active %s 2>/dev/null" % svc)
+    out, _ = run("systemctl is-active %s 2>/dev/null" % svc)
     (ok if out.strip() == "active" else warn)(
         "служба %s — %s" % (svc, out.strip() or "не активна"))
 
@@ -2919,7 +2969,7 @@ def final_selfcheck(cfg, xport, path):
                                     % (CDN_CRT, CDN_KEY)))
 
     # 5. health-заглушка отвечает (нода жива, TLS снимается)
-    out, rc = run("curl -sk --max-time 5 https://127.0.0.1/health")
+    out, _ = run("curl -sk --max-time 5 https://127.0.0.1/health")
     (ok if '"status":"ok"' in out else warn)(
         "health origin — %s" % ("ответ ok" if '"status":"ok"' in out
                                 else "нет ответа"))
@@ -3011,7 +3061,7 @@ def main():
         sys.exit(1)
     origin = "origin." + domain
 
-    # путь/upstream-порт: режим 6 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
+    # путь/upstream-порт: режим 4 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
     if mode == "4":
         path = (args.path or ask("Существующий xhttp путь (например /abc123)") or "").strip()
         if not RE_XPATH.match(path):

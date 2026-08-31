@@ -193,7 +193,7 @@ class TestXrayInbounds(unittest.TestCase):
         self.assertEqual(ib["settings"]["clients"], [{"id": "U-1", "email": "user1"}])
 
     def test_grpc_inbound_is_reality_on_all_interfaces(self):
-        ib = inst.build_grpc_inbound(2053, "U", "priv", "pub", "ab12", "svc")
+        ib = inst.build_grpc_inbound(2053, "U", "priv", "ab12", "svc")
         self.assertEqual(ib["listen"], "0.0.0.0")
         rs = ib["streamSettings"]["realitySettings"]
         self.assertEqual(rs["privateKey"], "priv")
@@ -203,7 +203,7 @@ class TestXrayInbounds(unittest.TestCase):
 
     def test_inbounds_are_json_serialisable(self):
         json.dumps(inst.build_xhttp_inbound(4443, "/a", "T"))
-        json.dumps(inst.build_grpc_inbound(2053, "U", "p", "P", "s", "svc"))
+        json.dumps(inst.build_grpc_inbound(2053, "U", "p", "s", "svc"))
 
 
 class TestXrayProfile(unittest.TestCase):
@@ -378,7 +378,7 @@ class TestConfigProfile(unittest.TestCase):
                                  "inbounds": [{"tag": "VK_CDN", "uuid": "I-1"}]}}, 201
 
         inbounds = [inst.build_xhttp_inbound(4443, "/a", "VK_CDN"),
-                    inst.build_grpc_inbound(2053, "U", "p", "P", "s", "svc")]
+                    inst.build_grpc_inbound(2053, "U", "p", "s", "svc")]
         (prof, tags), out = quiet(inst.create_config_profile, api, "cdn-x", inbounds)
         self.assertEqual(prof, "P-2")
         self.assertEqual(len(calls), 2)                      # полный, затем урезанный
@@ -662,8 +662,10 @@ class TestXuiSqlEscaping(unittest.TestCase):
                                "u-1", "sub-1")
         self.assertTrue(ok_flag)
         sql = captured["sql"]
-        self.assertIn("'u-1'", sql)
-        self.assertIn("'sub-1'", sql)
+        # uuid и subId живут внутри JSON в inbounds.settings: отдельной таблицы
+        # под клиентов в схеме 3x-ui нет
+        self.assertIn('"id": "u-1"', sql)
+        self.assertIn('"subId": "sub-1"', sql)
         # значения-JSON вставлены как литералы, кавычки внутри удвоены
         for chunk in re.findall(r"'(\{.*?\})'(?=[,)])", sql):
             self.assertNotIn("''", chunk.replace("''''", ""))
@@ -673,6 +675,15 @@ class TestXuiSqlEscaping(unittest.TestCase):
         with capture_sql(captured):
             quiet(inst.xui_cdn_inbound, "vk", 4443, "/upload/a", "u-1", "sub-1")
         self.assertIn("'127.0.0.1',4443", captured["sql"])
+
+    def test_only_tables_that_exist_in_3xui_are_touched(self):
+        """В схеме 3x-ui есть inbounds и client_traffics; clients — нет."""
+        captured = {}
+        with capture_sql(captured):
+            quiet(inst.xui_cdn_inbound, "vk", 4443, "/upload/a", "u-1", "sub-1")
+        tables = set(re.findall(r"(?:INSERT INTO|DELETE FROM)\s+(\w+)",
+                                captured["sql"]))
+        self.assertEqual(tables, {"inbounds", "client_traffics"})
 
     def test_xhttp_path_reaches_the_stream_settings(self):
         captured = {}
@@ -712,6 +723,13 @@ class TestXuiGrpcInbound(unittest.TestCase):
         reality, _ = self._run()
         self.assertNotIn("PRIV", json.dumps(reality))
 
+    def test_email_differs_from_cdn_inbound(self):
+        """client_traffics.email в 3x-ui UNIQUE — одинаковый email уронил бы INSERT."""
+        _, sql = self._run()
+        self.assertNotEqual(inst.XUI_CDN_EMAIL, inst.XUI_GRPC_EMAIL)
+        self.assertIn("'%s'" % inst.XUI_GRPC_EMAIL, sql)
+        self.assertNotIn("'%s'" % inst.XUI_CDN_EMAIL, sql)
+
     def test_no_keys_means_no_inbound(self):
         orig = inst.gen_x25519
         inst.gen_x25519 = lambda cred=None: (None, None)
@@ -719,6 +737,98 @@ class TestXuiGrpcInbound(unittest.TestCase):
             self.assertIsNone(quiet(inst.xui_grpc_inbound, "U-1")[0])
         finally:
             inst.gen_x25519 = orig
+
+
+class TestXuiSqlAgainstSchema(unittest.TestCase):
+    """Сгенерированный SQL прогоняется по схеме 3x-ui.
+
+    Ровно это и не ловилось раньше: скрипт писал в clients/client_inbounds,
+    которых в базе нет, sqlite3 возвращал 1, и `systemctl restart x-ui` не
+    выполнялся — инбаунд в панели не появлялся.
+    """
+
+    SCHEMA = """
+    CREATE TABLE inbounds (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, up INTEGER,
+      down INTEGER, total INTEGER, remark TEXT, enable NUMERIC,
+      expiry_time INTEGER, listen TEXT, port INTEGER, protocol TEXT,
+      settings TEXT, stream_settings TEXT, tag TEXT UNIQUE, sniffing TEXT,
+      allocate TEXT);
+    CREATE TABLE client_traffics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, inbound_id INTEGER, enable NUMERIC,
+      email TEXT UNIQUE, up INTEGER, down INTEGER, expiry_time INTEGER,
+      total INTEGER, reset INTEGER);
+    """
+
+    def _sql_of(self, fn, *a):
+        captured = {}
+        with capture_sql(captured):
+            quiet(fn, *a)
+        return captured["sql"]
+
+    def test_cdn_then_grpc_both_apply_to_a_real_schema(self):
+        import sqlite3
+        cdn = self._sql_of(inst.xui_cdn_inbound, "vk", 4443, "/upload/a",
+                           "u-1", "sub-1")
+        orig = inst.gen_x25519
+        inst.gen_x25519 = lambda cred=None: ("PRIV", "PUB")
+        try:
+            grpc = self._sql_of(inst.xui_grpc_inbound, "u-1")
+        finally:
+            inst.gen_x25519 = orig
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(self.SCHEMA)
+            conn.executescript(cdn)
+            conn.executescript(grpc)     # UNIQUE(email) не должен сработать
+            tags = [r[0] for r in
+                    conn.execute("SELECT tag FROM inbounds ORDER BY tag")]
+            self.assertEqual(tags, ["grpc-reality", "vk"])
+            emails = [r[0] for r in
+                      conn.execute("SELECT email FROM client_traffics ORDER BY email")]
+            self.assertEqual(emails, sorted([inst.XUI_CDN_EMAIL,
+                                             inst.XUI_GRPC_EMAIL]))
+            # client_traffics привязан к своему инбаунду, а не к NULL
+            joined = conn.execute(
+                "SELECT count(*) FROM client_traffics t "
+                "JOIN inbounds i ON i.id = t.inbound_id").fetchone()[0]
+            self.assertEqual(joined, 2)
+        finally:
+            conn.close()
+
+    def test_rerun_is_idempotent(self):
+        """Повторный запуск установщика не должен падать на UNIQUE."""
+        import sqlite3
+        cdn = self._sql_of(inst.xui_cdn_inbound, "vk", 4443, "/upload/a",
+                           "u-1", "sub-1")
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(self.SCHEMA)
+            conn.executescript(cdn)
+            conn.executescript(cdn)
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM inbounds").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM client_traffics").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+
+class TestXuiSqlTransaction(unittest.TestCase):
+    def test_script_runs_as_one_transaction_under_bail(self):
+        seen = {"cmds": []}
+        orig_run, orig_write = inst.run, inst.write_file
+        inst.write_file = lambda path, content, mode=None: seen.__setitem__("sql", content)
+        inst.run = lambda cmd, **kw: (seen["cmds"].append(cmd), ("", 0))[1]
+        try:
+            self.assertTrue(inst.xui_sql("DELETE FROM inbounds;\n"))
+        finally:
+            inst.run, inst.write_file = orig_run, orig_write
+        self.assertTrue(seen["sql"].startswith("BEGIN;"))
+        self.assertTrue(seen["sql"].rstrip().endswith("COMMIT;"))
+        self.assertTrue(any("-bail" in c for c in seen["cmds"]),
+                        "без -bail sqlite3 не останавливается на первой ошибке")
 
 
 class TestUiHelpers(unittest.TestCase):
