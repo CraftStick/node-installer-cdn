@@ -18,7 +18,7 @@ node-installer-cdn.py — установщик прокси-инфраструк
   3  Нода + CDN к уже существующей панели
   4  Только CDN перед уже работающей нодой
 Панель: Remnawave 3.x или 3x-ui. CDN: VK Cloud / Yandex Cloud / Beeline(CDNvideo)
-/ Timeweb / Selectel / TurboFlare.
+/ Timeweb.
 
 ЗАПУСК
 ------
@@ -2382,9 +2382,7 @@ def xui_grpc_inbound(uuid):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_cdn_instructions(provider, origin, my_ip, path):
-    """Печать инструкции по созданию CDN-ресурса.
-
-    provider: vk|yandex|beeline|timeweb|selectel|turboflare."""
+    """Печать инструкции по созданию CDN-ресурса. provider: vk|yandex|beeline|timeweb."""
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "Настройка CDN у провайдера")
           + _c(C_DIM, " · %s" % provider), flush=True)
@@ -2436,29 +2434,6 @@ def print_cdn_instructions(provider, origin, my_ip, path):
     - HTTP/3: ВЫКЛ, Gzip: ВЫКЛ
   Технический домен xxx.cdn.twcstorage.ru создаётся автоматически.
 """ % my_ip)
-    elif provider == "selectel":
-        say("""
-  Selectel CDN (my.selectel.ru -> CDN):
-    - Источник (origin): %s, протокол HTTPS (порт 443)
-    - Host-заголовок к источнику: передавать исходный (%s)
-    - SNI к источнику = %s, проверка сертификата источника: ВЫКЛ
-    - Кеширование: ВЫКЛ (TTL 0), «Всегда онлайн»/stale: ВЫКЛ
-    - Учитывать query string: ВКЛ, все параметры
-      !!! sessionID и seq идут в query — без этого туннель не поднимется
-    - Сжатие (gzip/brotli): ВЫКЛ, HTTP/3 (QUIC): ВЫКЛ
-  Технический CDN-домен (вида xxx.selcdn.ru / CNAME) выдаёт сам Selectel.
-""" % (origin, origin, origin))
-    elif provider == "turboflare":
-        say("""
-  TurboFlare (панель провайдера -> добавить сайт/CDN):
-    - Origin/источник: %s, схема HTTPS (порт 443)
-    - Host: передавать исходный (%s), SNI = %s
-    - Проверка сертификата origin: ВЫКЛ
-    - Кеш: ВЫКЛ / Bypass для %s/ (путь туннеля не кешировать)
-    - Query string: НЕ игнорировать (sessionID и seq идут в query!)
-    - Brotli/Gzip: ВЫКЛ, HTTP/3: ВЫКЛ, «Rocket/── ускорители»: ВЫКЛ
-  CDN-домен (CNAME) выдаёт сам TurboFlare.
-""" % (origin, origin, origin, "/" + path.strip("/")))
 
 
 def dns_wait(lines, skip=False):
@@ -2675,8 +2650,7 @@ def parse_args():
     p.add_argument("--mode", help="1=Panel+node here, 2=Panel here+node remote, "
                    "3=Node+CDN to existing panel, 4=CDN origin only")
     p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (modes 1,2)")
-    p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb "
-                   "5=Selectel 6=TurboFlare")
+    p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb")
     p.add_argument("--front", choices=["nginx", "caddy"], default="nginx",
                    help="Origin-фронт: nginx (по умолчанию) или caddy "
                         "(локальные режимы 1/3/4; в режиме с панелью caddy "
@@ -2881,10 +2855,9 @@ def choose(prompt, options):
             no_input("нужен ответ на «%s»" % prompt)
 
 
-CDN_NAMES = {1: "vk", 2: "yandex", 3: "beeline", 4: "timeweb",
-             5: "selectel", 6: "turboflare"}
+CDN_NAMES = {1: "vk", 2: "yandex", 3: "beeline", 4: "timeweb"}
 CDN_LABELS = {1: "VK Cloud", 2: "Yandex Cloud", 3: "Beeline (CDNvideo)",
-              4: "Timeweb", 5: "Selectel", 6: "TurboFlare"}
+              4: "Timeweb"}
 
 
 def final_selfcheck(cfg, xport, path):
