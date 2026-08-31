@@ -1,6 +1,6 @@
 <div align="center">
 
-# node-installer-cdn
+# CDN-Installer
 
 </div>
 
