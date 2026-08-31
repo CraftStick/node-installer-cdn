@@ -18,7 +18,7 @@ node-installer-cdn.py — установщик прокси-инфраструк
   3  Нода + CDN к уже существующей панели
   4  Только CDN перед уже работающей нодой
 Панель: Remnawave 3.x или 3x-ui. CDN: VK Cloud / Yandex Cloud / Beeline(CDNvideo)
-/ Timeweb.
+/ Timeweb / Selectel / TurboFlare.
 
 ЗАПУСК
 ------
@@ -41,6 +41,7 @@ import base64
 import random
 import string
 import shlex
+import signal
 import getpass
 import argparse
 import subprocess
@@ -50,7 +51,7 @@ import urllib.parse
 #  Константы
 # ─────────────────────────────────────────────────────────────────────────────
 
-INSTALLER_VERSION = "1.0"             # версия установщика, печатается в баннере
+INSTALLER_VERSION = "2.0"             # версия установщика, печатается в баннере
 
 XRAY_MIN_VERSION = "26.7.28"          # xray-core, тянется на ноду (актуальный релиз)
 REMNAWAVE_IMAGE  = "remnawave/backend:3"       # мажорный тег 3.x (офиц. compose)
@@ -384,19 +385,22 @@ def card(title, rows, color=C_TITLE):
     print(_c(color, "╰" + "─" * inner + "╯"), flush=True)
 
 def banner():
-    """Стартовая рамка."""
-    inner = UI_W - 2
-    lines = [("NODE · INSTALLER · CDN", "1;" + C_TITLE),
-             ("XHTTP packet-up через российский CDN", C_DIM),
-             ("v" + INSTALLER_VERSION, C_ACC)]
+    """Стартовый баннер: ASCII-логотип CDN + версия."""
+    logo = [
+        " ██████ ██████  ██   ██",
+        "██      ██   ██ ███  ██",
+        "██      ██   ██ ██ █ ██",
+        "██      ██   ██ ██  ███",
+        " ██████ ██████  ██   ██",
+    ]
     print("", flush=True)
-    print(_c(C_TITLE, "╭" + "─" * inner + "╮"), flush=True)
-    for text, col in lines:
-        left = (inner - len(text)) // 2
-        right = inner - len(text) - left
-        print(_c(C_TITLE, "│") + " " * left + _c(col, text) + " " * right
-              + _c(C_TITLE, "│"), flush=True)
-    print(_c(C_TITLE, "╰" + "─" * inner + "╯"), flush=True)
+    for row in logo:
+        print("  " + _c(C_ACC, row), flush=True)
+    print("", flush=True)
+    print("  " + _c("1;" + C_TITLE, "CDN Installer")
+          + _c(C_ACC, "  v" + INSTALLER_VERSION), flush=True)
+    print("  " + _c(C_DIM, "XHTTP packet-up через российский CDN"), flush=True)
+    print(_c(C_ACC, "  " + "━" * (UI_W - 3)), flush=True)
 
 def callout(title, lines, color=C_ACC):
     """Врезка с левым рельсом (для DNS-записей, подсказок)."""
@@ -1077,6 +1081,135 @@ server {
     }
 }
 """ % (port, crt, key, loc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Caddy CDN-origin конфиг (альтернатива nginx: тот же XHTTP-фронтинг)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def caddy_cdn_origin_config(port, path, crt=CDN_CRT, key=CDN_KEY,
+                            panel_domain=None, panel_port=None):
+    """Caddyfile-аналог nginx_cdn_origin_config.
+
+    Origin-сайт — catch-all на :80/:443 с готовым сертификатом (self-signed /
+    certbot), Caddy свой ACME для него не запускает. Поведение 1:1 с nginx:
+    голый путь отдаёт 404, проксируется только <path>/*, кеш и буферизация
+    выключены (flush_interval -1 — стриминг для packet-up).
+
+    Если задан panel_domain — добавляется отдельный сайт панели на своём домене
+    с авто-TLS (Let's Encrypt), тогда глобальный auto_https не выключаем.
+    """
+    p = path.strip("/")
+    globals_block = "{\n    admin off\n}" if panel_domain else \
+                    "{\n    admin off\n    auto_https off\n}"
+    origin = """
+:80, :443 {
+    tls %s %s
+
+    @acme path /.well-known/acme-challenge/*
+    handle @acme {
+        root * /var/www/certbot
+        file_server
+    }
+
+    handle /health {
+        header Content-Type application/json
+        respond `{"status":"ok","service":"media-gateway","version":"4.2.1"}` 200
+    }
+
+    @tunnel_bare path /%s
+    handle @tunnel_bare {
+        respond 404
+    }
+
+    @tunnel path /%s/*
+    handle @tunnel {
+        reverse_proxy 127.0.0.1:%d {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Proto https
+            flush_interval -1
+        }
+        header Cache-Control "no-store, no-cache"
+        header CDN-Cache-Control "no-store"
+        header Pragma "no-cache"
+        header X-Accel-Buffering "no"
+    }
+
+    handle {
+        root * /var/www/html
+        file_server
+    }
+}
+""" % (crt, key, p, p, port)
+    panel = ""
+    if panel_domain:
+        # Панель на своём домене: Caddy сам выпускает и продлевает LE-сертификат
+        # (SNI разводит трафик — origin ловит всё, кроме этого домена).
+        panel = """
+%s {
+    reverse_proxy 127.0.0.1:%d {
+        header_up X-Forwarded-Proto https
+    }
+}
+""" % (panel_domain, panel_port)
+    return globals_block + "\n" + origin + panel
+
+
+def install_caddy():
+    """Поставить caddy из официального репозитория Cloudsmith (Debian/Ubuntu)."""
+    out, rc = run("command -v caddy")
+    if rc == 0:
+        return True
+    run("apt-get install -y debian-keyring debian-archive-keyring "
+        "apt-transport-https curl gnupg")
+    run("curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' "
+        "| gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg")
+    run("curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' "
+        "> /etc/apt/sources.list.d/caddy-stable.list")
+    run("apt-get update")
+    _, rc = run("apt-get install -y caddy")
+    return rc == 0
+
+
+def apply_caddy_front(port, path, origin, crt=CDN_CRT, key=CDN_KEY,
+                      panel_domain=None, panel_port=None):
+    """Поднять caddy-фронт вместо nginx: освободить :80/:443, записать Caddyfile.
+
+    Сертификат origin — self-signed (у всех CDN проверка сертификата источника
+    выключена, валидный LE тут не обязателен). Если задан panel_domain — Caddy
+    дополнительно обслуживает панель на своём домене с авто-TLS."""
+    if not install_caddy():
+        warn("caddy не установился — фронт остаётся на nginx")
+        return False
+    # nginx освобождает порты, иначе caddy не встанет на :443
+    run("systemctl disable --now nginx 2>/dev/null")
+    write_file("/etc/caddy/Caddyfile",
+               caddy_cdn_origin_config(port, path, crt, key, panel_domain, panel_port))
+    out, rc = run("caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile "
+                  "2>&1 && systemctl enable --now caddy && systemctl restart caddy")
+    if rc != 0:
+        warn("проблема с caddy:\n" + out)
+        say("  Проверь: caddy validate --config /etc/caddy/Caddyfile")
+        return False
+    return True
+
+
+def apply_origin_front(cfg, xport, path, origin, panel_domain=None, panel_port=None):
+    """Единая точка подъёма origin-фронта: caddy при --front caddy, иначе nginx.
+
+    Возвращает фактически поднятый фронт ("caddy"/"nginx"). При caddy панель (если
+    задана) обслуживает сам caddy с авто-TLS, поэтому вызывающему не нужны ни
+    nginx-panel.conf, ни certbot. При сбое caddy — молчаливый откат на nginx."""
+    if cfg.get("front") == "caddy":
+        if apply_caddy_front(xport, path, origin, panel_domain=panel_domain,
+                             panel_port=panel_port):
+            ok("origin-фронт (caddy) на :443 -> 127.0.0.1:%d%s"
+               % (xport, " + панель %s" % panel_domain if panel_domain else ""))
+            return "caddy"
+        cfg["front"] = "nginx"      # откат на надёжный дефолт
+    nginx_write_conf("default", nginx_cdn_origin_config(xport, path))
+    return "nginx"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2008,19 +2141,22 @@ def setup_remnawave_web(cfg, xport, path):
     ensure_nginx_base()
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
     write_decoy(origin)
-    nginx_write_conf("default", nginx_cdn_origin_config(xport, path))
-    nginx_write_conf("panel.conf", nginx_panel_proxy(domain, 3000))
-    ok("nginx: CDN :443 -> 127.0.0.1:%d, панель %s -> 127.0.0.1:3000"
-       % (xport, domain))
-    # LE для домена панели: без копирования, vhost переписываем на live-пути
-    if issue_le_cert(domain, crt=None, key=None):
-        live = "/etc/letsencrypt/live/%s" % domain
-        nginx_write_conf("panel.conf", nginx_panel_proxy(
-            domain, 3000, live + "/fullchain.pem", live + "/privkey.pem"))
-        ok("Панель на сертификате Let's Encrypt")
+    if apply_origin_front(cfg, xport, path, origin,
+                          panel_domain=domain, panel_port=3000) == "caddy":
+        ok("caddy: CDN :443 -> 127.0.0.1:%d + панель %s (авто-TLS)" % (xport, domain))
     else:
-        warn("Панель осталась на self-signed — браузер будет ругаться")
-    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
+        nginx_write_conf("panel.conf", nginx_panel_proxy(domain, 3000))
+        ok("nginx: CDN :443 -> 127.0.0.1:%d, панель %s -> 127.0.0.1:3000"
+           % (xport, domain))
+        # LE для домена панели: без копирования, vhost переписываем на live-пути
+        if issue_le_cert(domain, crt=None, key=None):
+            live = "/etc/letsencrypt/live/%s" % domain
+            nginx_write_conf("panel.conf", nginx_panel_proxy(
+                domain, 3000, live + "/fullchain.pem", live + "/privkey.pem"))
+            ok("Панель на сертификате Let's Encrypt")
+        else:
+            warn("Панель осталась на self-signed — браузер будет ругаться")
+        upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
 
 
 def upgrade_origin_cert(origin_domain, cred=None, skip=False):
@@ -2175,16 +2311,19 @@ def install_3xui(cfg):
     step("nginx: панель и CDN")
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
     write_decoy(origin)
-    nginx_write_conf("default", nginx_cdn_origin_config(xport, path))
-    nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
-    if issue_le_cert(domain, crt=None, key=None):
-        live = "/etc/letsencrypt/live/%s" % domain
-        nginx_write_conf("panel.conf", nginx_panel_proxy(
-            domain, panel_port, live + "/fullchain.pem", live + "/privkey.pem"))
-        ok("Панель на сертификате Let's Encrypt")
+    if apply_origin_front(cfg, xport, path, origin,
+                          panel_domain=domain, panel_port=panel_port) == "caddy":
+        ok("caddy: CDN :443 -> 127.0.0.1:%d + панель %s (авто-TLS)" % (xport, domain))
     else:
-        warn("Панель осталась на self-signed — браузер будет ругаться")
-    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
+        nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
+        if issue_le_cert(domain, crt=None, key=None):
+            live = "/etc/letsencrypt/live/%s" % domain
+            nginx_write_conf("panel.conf", nginx_panel_proxy(
+                domain, panel_port, live + "/fullchain.pem", live + "/privkey.pem"))
+            ok("Панель на сертификате Let's Encrypt")
+        else:
+            warn("Панель осталась на self-signed — браузер будет ругаться")
+        upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
 
     # CDN xhttp inbound
     step("Создание %s CDN inbound" % cfg["cdn"])
@@ -2243,7 +2382,9 @@ def xui_grpc_inbound(uuid):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_cdn_instructions(provider, origin, my_ip, path):
-    """Печать инструкции по созданию CDN-ресурса. provider: vk|yandex|beeline|timeweb."""
+    """Печать инструкции по созданию CDN-ресурса.
+
+    provider: vk|yandex|beeline|timeweb|selectel|turboflare."""
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "Настройка CDN у провайдера")
           + _c(C_DIM, " · %s" % provider), flush=True)
@@ -2295,6 +2436,29 @@ def print_cdn_instructions(provider, origin, my_ip, path):
     - HTTP/3: ВЫКЛ, Gzip: ВЫКЛ
   Технический домен xxx.cdn.twcstorage.ru создаётся автоматически.
 """ % my_ip)
+    elif provider == "selectel":
+        say("""
+  Selectel CDN (my.selectel.ru -> CDN):
+    - Источник (origin): %s, протокол HTTPS (порт 443)
+    - Host-заголовок к источнику: передавать исходный (%s)
+    - SNI к источнику = %s, проверка сертификата источника: ВЫКЛ
+    - Кеширование: ВЫКЛ (TTL 0), «Всегда онлайн»/stale: ВЫКЛ
+    - Учитывать query string: ВКЛ, все параметры
+      !!! sessionID и seq идут в query — без этого туннель не поднимется
+    - Сжатие (gzip/brotli): ВЫКЛ, HTTP/3 (QUIC): ВЫКЛ
+  Технический CDN-домен (вида xxx.selcdn.ru / CNAME) выдаёт сам Selectel.
+""" % (origin, origin, origin))
+    elif provider == "turboflare":
+        say("""
+  TurboFlare (панель провайдера -> добавить сайт/CDN):
+    - Origin/источник: %s, схема HTTPS (порт 443)
+    - Host: передавать исходный (%s), SNI = %s
+    - Проверка сертификата origin: ВЫКЛ
+    - Кеш: ВЫКЛ / Bypass для %s/ (путь туннеля не кешировать)
+    - Query string: НЕ игнорировать (sessionID и seq идут в query!)
+    - Brotli/Gzip: ВЫКЛ, HTTP/3: ВЫКЛ, «Rocket/── ускорители»: ВЫКЛ
+  CDN-домен (CNAME) выдаёт сам TurboFlare.
+""" % (origin, origin, origin, "/" + path.strip("/")))
 
 
 def dns_wait(lines, skip=False):
@@ -2432,12 +2596,8 @@ def install_node_only(cfg):
     write_file("/opt/remnanode/.env", "NODE_PORT=2222\nSECRET_KEY=%s\n" % (secret or ""),
                mode=0o600)
     setup_xray_ru_geo()
-    conf = nginx_cdn_origin_config(xport, path)
-    write_file("/etc/nginx/sites-available/default", conf)
-    run("rm -f /etc/nginx/sites-enabled/default && "
-        "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
-        "nginx -t && systemctl restart nginx")
-    upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
+    if apply_origin_front(cfg, xport, path, origin) == "nginx":
+        upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup(extra_tcp=([2053] if reality else []))
     # Панель здесь удалённая и стучится к ноде на 2222 снаружи: без этого
     # правила политика deny incoming закрывает порт вообще для всех, и нода
@@ -2479,8 +2639,18 @@ def install_cdn_only(cfg):
     origin = cfg.get("origin_domain", cfg["domain"])
     xport = cfg["xport"]
     path = cfg["path"]
+    front = cfg.get("front", "nginx")
     step("Установка CDN-фронта")
-    say("  Upstream: 127.0.0.1:%d   path: %s" % (xport, path))
+    say("  Upstream: 127.0.0.1:%d   path: %s   фронт: %s" % (xport, path, front))
+    if front == "caddy":
+        self_signed_cert(origin)
+        write_decoy(origin)
+        if apply_caddy_front(xport, path, origin):
+            firewall_setup()
+            ok("CDN-фронт (caddy) поднят на :443 -> 127.0.0.1:%d" % xport)
+            return {}
+        # не поднялся caddy — падать в nginx как в надёжный дефолт
+        cfg["front"] = "nginx"
     ensure_nginx_base()
     self_signed_cert(origin)
     write_decoy(origin)
@@ -2501,11 +2671,16 @@ def install_cdn_only(cfg):
 
 def parse_args():
     """Parse CLI args for non-interactive mode."""
-    p = argparse.ArgumentParser(description="VPN CDN Installer v%s" % INSTALLER_VERSION)
+    p = argparse.ArgumentParser(description="CDN Installer v%s" % INSTALLER_VERSION)
     p.add_argument("--mode", help="1=Panel+node here, 2=Panel here+node remote, "
                    "3=Node+CDN to existing panel, 4=CDN origin only")
     p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (modes 1,2)")
-    p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb")
+    p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb "
+                   "5=Selectel 6=TurboFlare")
+    p.add_argument("--front", choices=["nginx", "caddy"], default="nginx",
+                   help="Origin-фронт: nginx (по умолчанию) или caddy "
+                        "(локальные режимы 1/3/4; в режиме с панелью caddy "
+                        "обслуживает и панель с авто-TLS)")
     p.add_argument("--domain", help="Domain name")
     p.add_argument("--path", help="Existing xhttp path (mode 4 CDN-only), e.g. /abc123")
     p.add_argument("--xport", type=int,
@@ -2706,14 +2881,88 @@ def choose(prompt, options):
             no_input("нужен ответ на «%s»" % prompt)
 
 
-CDN_NAMES = {1: "vk", 2: "yandex", 3: "beeline", 4: "timeweb"}
+CDN_NAMES = {1: "vk", 2: "yandex", 3: "beeline", 4: "timeweb",
+             5: "selectel", 6: "turboflare"}
 CDN_LABELS = {1: "VK Cloud", 2: "Yandex Cloud", 3: "Beeline (CDNvideo)",
-              4: "Timeweb"}
+              4: "Timeweb", 5: "Selectel", 6: "TurboFlare"}
+
+
+def final_selfcheck(cfg, xport, path):
+    """Локальная проверка готовности origin-фронта после установки.
+
+    Не падает и ничего не чинит — только печатает ✔/▲ по каждому пункту, чтобы
+    сразу видеть, что xray слушает upstream, фронт поднят на :443, сертификат
+    на месте и голый путь туннеля отвечает как надо. Проверки локальные
+    (127.0.0.1), состояние самого CDN у провайдера отсюда не видно.
+    """
+    step("Проверка служб и портов")
+    front = cfg.get("front", "nginx")
+
+    # 1. xray upstream на 127.0.0.1:xport
+    out, _ = run("ss -ltnH 2>/dev/null | grep -E '127.0.0.1:%d|\\*:%d' | head -1"
+                 % (xport, xport))
+    (ok if out.strip() else warn)(
+        "xray upstream 127.0.0.1:%d — %s"
+        % (xport, "слушает" if out.strip() else "порт не слушается"))
+
+    # 2. фронт на :443
+    out, _ = run("ss -ltnH 2>/dev/null | grep -E ':443\\b' | head -1")
+    (ok if out.strip() else warn)(
+        "origin-фронт :443 — %s" % ("слушает" if out.strip() else "порт закрыт"))
+
+    # 3. сервис фронта активен
+    svc = "caddy" if front == "caddy" else "nginx"
+    out, rc = run("systemctl is-active %s 2>/dev/null" % svc)
+    (ok if out.strip() == "active" else warn)(
+        "служба %s — %s" % (svc, out.strip() or "не активна"))
+
+    # 4. сертификат origin на месте
+    have_crt = os.path.exists(CDN_CRT) and os.path.exists(CDN_KEY)
+    (ok if have_crt else warn)(
+        "сертификат origin — %s" % ("найден" if have_crt else "нет %s/%s"
+                                    % (CDN_CRT, CDN_KEY)))
+
+    # 5. health-заглушка отвечает (нода жива, TLS снимается)
+    out, rc = run("curl -sk --max-time 5 https://127.0.0.1/health")
+    (ok if '"status":"ok"' in out else warn)(
+        "health origin — %s" % ("ответ ok" if '"status":"ok"' in out
+                                else "нет ответа"))
+
+    # 6. голый путь туннеля обязан отдавать 404 (неотличим от 404 несущест-ей)
+    code, _ = run("curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 "
+                  "https://127.0.0.1/%s" % path.strip("/"))
+    (ok if code.strip() == "404" else warn)(
+        "голый путь /%s — %s" % (path.strip("/"),
+                                 "404 как надо" if code.strip() == "404"
+                                 else "код %s (ожидался 404)" % code.strip()))
+
+
+def _on_sigint(signum, frame):
+    """Ctrl+C не рвёт установку сразу — сперва спрашивает подтверждение.
+
+    Пока висит вопрос, повторный Ctrl+C = мгновенный выход (SIGINT на это время
+    возвращаем дефолтному обработчику). Ответ «нет» — продолжаем с того же места.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    try:
+        sys.stdout.write("\n")
+        ans = input("Прервать установку? / Cancel? (y/n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "y"
+    if ans in ("y", "yes", "д", "да"):
+        print("", flush=True)
+        warn("Установка отменена")
+        sys.exit(130)
+    signal.signal(signal.SIGINT, _on_sigint)   # вернуть перехват для следующего раза
 
 
 def main():
     args = parse_args()
     banner()
+    # Подтверждение отмены по Ctrl+C — только в интерактиве: в неинтерактивном
+    # режиме (-p / пайп) вопрос y/n завис бы без ответа, поэтому там дефолт.
+    if sys.stdin.isatty():
+        signal.signal(signal.SIGINT, _on_sigint)
 
     if os.geteuid() != 0:
         err("Нужны права root — запусти через sudo")
@@ -2828,7 +3077,7 @@ def main():
     cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
            "no_grpc": not want_grpc, "xport": xport,
-           "no_origin_le": args.no_origin_le}
+           "no_origin_le": args.no_origin_le, "front": args.front}
 
     # ── адрес удалённой ноды: спрашиваем здесь, а не после установки панели ──
     # Все вопросы задаются до первого долгого шага: узнать об отсутствии
@@ -2918,6 +3167,12 @@ def main():
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
     if cdn_domain and result.get("host_uuid"):
         update_host_address(result["api"], result["host_uuid"], cdn_domain)
+
+    # ── проверка служб/портов/конфига ──
+    try:
+        final_selfcheck(cfg, xport, path)
+    except Exception as e:
+        warn("Само-проверка не завершилась: %s" % e)
 
     # ── финальный отчёт ──
     cdn_val = cdn_domain or "— укажи после настройки провайдера"
