@@ -401,6 +401,8 @@ def banner():
             "38;2;124;252;255", "38;2;204;153;255", "38;2;224;102;255"]
 
     print("", flush=True)
+    print(_c(C_ACC, "  " + "━" * (UI_W - 3)), flush=True)   # верхняя линия
+    print("", flush=True)
     for col, row in zip(grad, rows):
         print("  " + _c(col, row), flush=True)
 
