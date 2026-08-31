@@ -41,7 +41,6 @@ import base64
 import random
 import string
 import shlex
-import signal
 import getpass
 import argparse
 import subprocess
@@ -385,43 +384,25 @@ def card(title, rows, color=C_TITLE):
     print(_c(color, "╰" + "─" * inner + "╯"), flush=True)
 
 def banner():
-    """Стартовый баннер: объёмный ASCII-логотип CDN + версия.
+    """Стартовый баннер: логотип CDN (шрифт ANSI Shadow) + версия.
 
-    Буквы 5×5 блоками, лицо — градиент cyan→фиолетовый по ширине, плюс тень,
-    выдавленная вправо-вниз на один символ (тёмно-фиолетовая) — даёт 3D.
+    3D даёт сам шрифт (тень «зашита» в глифы ╗╝═║╚), цвет — truecolor-градиент
+    по строкам cyan→фиолетовый. Вне TTY _c печатает строки без ANSI.
     """
-    # Буквы 4 клетки шириной, разделитель — 2 пробела (просветы не сливались)
-    C = ["████", "█   ", "█   ", "█   ", "████"]
-    D = ["███ ", "█  █", "█  █", "█  █", "███ "]
-    N = ["█  █", "██ █", "█ ██", "█  █", "█  █"]
-    glyph = [C[i] + "  " + D[i] + "  " + N[i] for i in range(5)]
-    H, W = len(glyph), len(glyph[0])
-    pal = [51, 45, 39, 38, 44, 74, 111, 141, 177, 176]   # cyan → фиолетовый
-    shadow = "38;5;53"                                     # тёмно-фиолетовая тень
-
-    # Матрица «лица» с запасом на строку/столбец под тень
-    F = [[r < H and c < W and glyph[r][c] == "█" for c in range(W + 1)]
-         for r in range(H + 1)]
-
-    def enclosed(r, c):
-        """Клетка внутри буквы (есть заливка со всех сторон) — тень тут не рисуем."""
-        left  = any(F[r][x] for x in range(0, c))
-        right = any(F[r][x] for x in range(c + 1, W + 1))
-        up    = any(F[y][c] for y in range(0, r))
-        down  = any(F[y][c] for y in range(r + 1, H + 1))
-        return left and right and up and down
+    rows = [
+        " ██████╗██████╗ ███╗   ██╗",
+        "██╔════╝██╔══██╗████╗  ██║",
+        "██║     ██║  ██║██╔██╗ ██║",
+        "██║     ██║  ██║██║╚██╗██║",
+        "╚██████╗██████╔╝██║ ╚████║",
+        " ╚═════╝╚═════╝ ╚═╝  ╚═══╝",
+    ]
+    grad = ["38;2;0;162;255", "38;2;0;212;255", "38;2;0;255;255",
+            "38;2;124;252;255", "38;2;204;153;255", "38;2;224;102;255"]
 
     print("", flush=True)
-    for r in range(H + 1):
-        line = ""
-        for c in range(W + 1):
-            if F[r][c]:                                    # лицо — градиент
-                line += _c("1;38;5;%d" % pal[min(len(pal) - 1, c * len(pal) // W)], "█")
-            elif r > 0 and c > 0 and F[r - 1][c - 1] and not enclosed(r, c):
-                line += _c(shadow, "█") if _TTY else "░"   # тень только по внешнему контуру
-            else:
-                line += " "
-        print("  " + line.rstrip(), flush=True)
+    for col, row in zip(grad, rows):
+        print("  " + _c(col, row), flush=True)
 
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "CDN Installer")
@@ -2821,8 +2802,21 @@ def ask(prompt, default=None, remember=True):
         flush_stdin()
         try:
             v = input(line).strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             v = ""
+        except KeyboardInterrupt:
+            # Ctrl+C ловим тут (input уже развернулся — readline свободен, повторно
+            # войти в него безопасно). Спрашиваем подтверждение отмены.
+            print("", flush=True)
+            try:
+                a = input("  Прервать установку? / Cancel? (y/n): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                a = "y"
+            if a in ("y", "yes", "д", "да"):
+                print("", flush=True)
+                warn("Установка отменена")
+                sys.exit(130)
+            continue                      # «нет» — переспросить исходный вопрос
         except UnicodeDecodeError:
             warn("Ввод не похож на UTF-8 (обрывок прошлого нажатия) — повтори")
             continue
@@ -2937,32 +2931,9 @@ def final_selfcheck(cfg, xport, path):
                                  else "код %s (ожидался 404)" % code.strip()))
 
 
-def _on_sigint(signum, frame):
-    """Ctrl+C не рвёт установку сразу — сперва спрашивает подтверждение.
-
-    Пока висит вопрос, повторный Ctrl+C = мгновенный выход (SIGINT на это время
-    возвращаем дефолтному обработчику). Ответ «нет» — продолжаем с того же места.
-    """
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    try:
-        sys.stdout.write("\n")
-        ans = input("Прервать установку? / Cancel? (y/n): ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        ans = "y"
-    if ans in ("y", "yes", "д", "да"):
-        print("", flush=True)
-        warn("Установка отменена")
-        sys.exit(130)
-    signal.signal(signal.SIGINT, _on_sigint)   # вернуть перехват для следующего раза
-
-
 def main():
     args = parse_args()
     banner()
-    # Подтверждение отмены по Ctrl+C — только в интерактиве: в неинтерактивном
-    # режиме (-p / пайп) вопрос y/n завис бы без ответа, поэтому там дефолт.
-    if sys.stdin.isatty():
-        signal.signal(signal.SIGINT, _on_sigint)
 
     if os.geteuid() != 0:
         err("Нужны права root — запусти через sudo")
