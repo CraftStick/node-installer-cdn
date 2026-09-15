@@ -17,6 +17,7 @@ import hmac
 import hashlib
 import os
 import re
+import shlex
 import contextlib
 import importlib.util
 import tempfile
@@ -303,9 +304,13 @@ class TestDecoyAndCompose(unittest.TestCase):
                       inst.REMNAWAVE_COMPOSE)
 
     def test_node_compose_mounts_custom_xray(self):
-        self.assertIn("/opt/remnanode/xray-custom:/usr/local/bin/xray",
-                      inst.REMNANODE_COMPOSE)
-        self.assertIn("network_mode: host", inst.REMNANODE_COMPOSE)
+        compose = inst.remnanode_compose()
+        self.assertIn("/opt/remnanode/xray-custom:/usr/local/bin/xray", compose)
+        self.assertIn("network_mode: host", compose)
+
+    def test_node_compose_without_custom_xray_has_no_mount(self):
+        # иначе docker создаст каталог на месте бинарника и нода не стартует
+        self.assertNotIn("xray-custom", inst.remnanode_compose(custom_xray=False))
 
 
 class TestApiJwt(unittest.TestCase):
@@ -503,8 +508,8 @@ class TestRwApiSsh(unittest.TestCase):
         seen = {}
         orig = inst.run_remote
 
-        def fake(cred, cmd, timeout=600):
-            seen["cmd"] = cmd
+        def fake(cred, cmd, timeout=600, input=None):
+            seen["cmd"], seen["input"] = cmd, input
             return remote_output, 0
 
         inst.run_remote = fake
@@ -533,27 +538,37 @@ class TestRwApiSsh(unittest.TestCase):
         self.assertEqual(code, 502)
         self.assertEqual(body["error"], "invalid JSON")
 
-    def test_token_is_sent_and_panel_file_not_read(self):
+    def test_token_is_sent_via_stdin_and_panel_file_not_read(self):
         _, seen = self._call('{}\n200', token="TOK")
-        self.assertIn("Authorization: Bearer TOK", seen["cmd"])
+        self.assertIn('header = "Authorization: Bearer TOK"', seen["input"])
+        self.assertIn("-K -", seen["cmd"])
+        # в argv токен увидел бы любой пользователь панели через ps
+        self.assertNotIn("TOK", seen["cmd"])
         self.assertNotIn(".panel_token", seen["cmd"])
 
     def test_browser_client_type_header_always_present(self):
         _, seen = self._call('{}\n200')
         self.assertIn("X-Remnawave-Client-Type: browser", seen["cmd"])
 
-    def test_body_travels_base64_encoded(self):
+    def test_body_travels_via_stdin_curl_config(self):
         orig = inst.run_remote
         seen = {}
-        inst.run_remote = lambda cred, cmd, timeout=600: (seen.setdefault("cmd", cmd),
-                                                          "{}\n200")[1:] and ("{}\n200", 0)
+
+        def fake(cred, cmd, timeout=600, input=None):
+            seen["cmd"], seen["input"] = cmd, input
+            return "{}\n200", 0
+
+        inst.run_remote = fake
+        body = {"name": "it's a \"node\"", "password": "pw\\x"}
         try:
-            inst.rw_api_ssh({"ip": "1.2.3.4"}, "T", "POST", "nodes",
-                            {"name": "it's a node"})
+            inst.rw_api_ssh({"ip": "1.2.3.4"}, "T", "POST", "nodes", body)
         finally:
             inst.run_remote = orig
-        payload = base64.b64encode(json.dumps({"name": "it's a node"}).encode()).decode()
-        self.assertIn(payload, seen["cmd"])
+        self.assertIn("data = " + inst._curl_quote(json.dumps(body)), seen["input"])
+        self.assertNotIn("password", seen["cmd"])
+
+    def test_curl_quote_escapes_backslash_quote_and_drops_newlines(self):
+        self.assertEqual(inst._curl_quote('a"b\\c\nd'), '"a\\"b\\\\cd"')
 
 
 class TestState(unittest.TestCase):
@@ -628,20 +643,26 @@ class TestWriteFile(unittest.TestCase):
 
 
 class TestWriteRemote(unittest.TestCase):
-    def test_content_travels_as_base64_and_path_is_quoted(self):
+    def test_content_travels_via_stdin_not_argv(self):
         seen = {}
         orig = inst.run_remote
-        inst.run_remote = lambda cred, cmd, **kw: (seen.setdefault("cmd", cmd), ("", 0))[1]
+
+        def fake(cred, cmd, **kw):
+            seen["cmd"], seen["input"] = cmd, kw.get("input")
+            return "", 0
+
+        inst.run_remote = fake
         try:
             inst.write_remote({"ip": "1.2.3.4"}, "/opt/x/.env",
                               "SECRET='a b'\n", mode=0o600)
         finally:
             inst.run_remote = orig
-        payload = base64.b64encode("SECRET='a b'\n".encode()).decode()
-        self.assertIn(payload, seen["cmd"])
+        self.assertEqual(seen["input"], "SECRET='a b'\n")
         self.assertIn("chmod 600 /opt/x/.env", seen["cmd"])
-        # секрет уходит только внутри base64, открытым текстом его в команде нет
-        self.assertNotIn("SECRET='a b'", seen["cmd"].replace(payload, ""))
+        # ни открытым текстом, ни base64 — команда видна в ps
+        payload = base64.b64encode("SECRET='a b'\n".encode()).decode()
+        self.assertNotIn("SECRET", seen["cmd"])
+        self.assertNotIn(payload, seen["cmd"])
 
     def test_path_with_spaces_is_quoted(self):
         seen = {}
@@ -885,6 +906,202 @@ class TestConstants(unittest.TestCase):
     def test_sysctl_tuning_enables_bbr(self):
         self.assertIn("tcp_congestion_control = bbr", inst.SYSCTL_TUNING)
         self.assertIn("default_qdisc = fq", inst.SYSCTL_TUNING)
+
+
+@contextlib.contextmanager
+def fake_run(replies=None):
+    """Подменить run: команды копятся в список, ответ — по первой подстроке."""
+    cmds, orig = [], inst.run
+
+    def fake(cmd, **kw):
+        cmds.append(cmd)
+        for needle, reply in (replies or {}).items():
+            if needle in cmd:
+                return reply
+        return "", 0
+
+    inst.run = fake
+    try:
+        yield cmds
+    finally:
+        inst.run = orig
+
+
+class TestReviewRegressions(unittest.TestCase):
+    def test_secrets_use_system_rng(self):
+        self.assertIsInstance(inst._rng, inst.random.SystemRandom)
+
+    def test_write_file_tightens_mode_of_existing_file(self):
+        path = os.path.join(tempfile.mkdtemp(), ".env")
+        with open(path, "w") as f:
+            f.write("old")
+        os.chmod(path, 0o644)
+        inst.write_file(path, "SECRET=1\n", mode=0o600)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path) as f:
+            self.assertEqual(f.read(), "SECRET=1\n")
+
+    def test_write_remote_command_really_writes_file(self):
+        """Команду write_remote исполняет настоящий sh — как на сервере."""
+        path = os.path.join(tempfile.mkdtemp(), "new dir", "x.env")
+        orig = inst.run_remote
+        inst.run_remote = lambda cred, cmd, **kw: inst.run(cmd, **kw)
+        try:
+            _, rc = inst.write_remote({"ip": "1.2.3.4"}, path, "A='b c'\n", mode=0o600)
+        finally:
+            inst.run_remote = orig
+        self.assertEqual(rc, 0)
+        with open(path) as f:
+            self.assertEqual(f.read(), "A='b c'\n")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_docker_mirror_skipped_on_401(self):
+        # реестр без авторизации отвечает 401 — он доступен, зеркало не нужно
+        with fake_run({"registry-1.docker.io": ("401", 0)}) as cmds:
+            quiet(inst.setup_docker_mirror)
+        self.assertFalse(any("daemon.json" in c for c in cmds))
+
+    def test_docker_mirror_configured_when_unreachable(self):
+        with fake_run({"registry-1.docker.io": ("000", 0)}) as cmds:
+            quiet(inst.setup_docker_mirror)
+        self.assertTrue(any("daemon.json" in c for c in cmds))
+
+    def test_swap_fstab_append_is_grouped(self):
+        orig = inst.put_file
+        inst.put_file = lambda *a, **kw: None
+        try:
+            with fake_run({"swapon --show": ("", 1)}) as cmds:
+                quiet(inst.tune_os)
+        finally:
+            inst.put_file = orig
+        swap = next(c for c in cmds if "fallocate" in c)
+        self.assertIn("{ grep -q swapfile /etc/fstab || echo", swap)
+
+    def test_detect_ssh_ports_merges_sources(self):
+        runner = lambda cmd, **kw: ("2222\n22\n\n2222\n", 0)
+        self.assertEqual(inst.detect_ssh_ports(runner), [22, 2222])
+        self.assertEqual(inst.detect_ssh_ports(lambda c, **k: ("", 1)), [22])
+
+    def test_restrict_2222_resolves_ipv4_only(self):
+        with fake_run({"getent": ("5.6.7.8", 0), "ufw status": ("", 1)}) as cmds:
+            quiet(inst.restrict_node_port_2222, "panel.example.com")
+        self.assertTrue(any("ahostsv4" in c for c in cmds))
+        self.assertTrue(any("-s 5.6.7.8" in c for c in cmds))
+
+    def test_caddy_failure_reenables_nginx(self):
+        orig = (inst.apply_caddy_front, inst.ensure_nginx_base, inst.nginx_write_conf)
+        inst.apply_caddy_front = lambda *a, **kw: False
+        inst.ensure_nginx_base = lambda *a, **kw: None
+        inst.nginx_write_conf = lambda *a, **kw: True
+        cfg = {"front": "caddy"}
+        try:
+            with fake_run() as cmds:
+                front, _ = quiet(inst.apply_origin_front, cfg, 4443, "/p")
+        finally:
+            inst.apply_caddy_front, inst.ensure_nginx_base, inst.nginx_write_conf = orig
+        self.assertEqual(front, "nginx")
+        self.assertTrue(any("systemctl enable nginx" in c for c in cmds))
+
+    def test_api_response_tolerates_garbage(self):
+        self.assertEqual(inst.api_response(None), {})
+        self.assertEqual(inst.api_response({"response": None}), {})
+        self.assertEqual(inst.api_response([1, 2]), {})
+        self.assertEqual(inst.access_token({"accessToken": "t"}), "t")
+        self.assertEqual(inst.access_token({"response": {"accessToken": "r"}}), "r")
+
+    def test_create_node_returns_empty_secret_on_refusal(self):
+        api = lambda m, p, d=None: ({"message": "A112"}, 400)
+        secret, out = quiet(inst.create_remnawave_node, api, "n", "1.2.3.4", "p", ["i"])
+        self.assertEqual(secret, "")
+        self.assertIn("A112", out)
+
+    def test_xui_sql_uses_private_tempfile(self):
+        seen = {}
+        orig_write = inst.write_file
+        inst.write_file = lambda path, content, mode=None: seen.__setitem__("path", path)
+        try:
+            with fake_run() as cmds:
+                quiet(inst.xui_sql, "SELECT 1;\n")
+        finally:
+            inst.write_file = orig_write
+        self.assertNotEqual(seen["path"], "/tmp/_xui.sql")
+        self.assertFalse(os.path.exists(seen["path"]))
+
+
+class TestSupplyChainAndApt(unittest.TestCase):
+    def test_xui_install_hash_is_sha256_hex(self):
+        self.assertRegex(inst.XUI_INSTALL_SHA256, r"^[0-9a-f]{64}$")
+
+    def _download(self, files, sha):
+        """download_verified, где curl «скачивает» содержимое из files[url]."""
+        def fake(cmd, **kw):
+            *_, dest, url = shlex.split(cmd)      # curl ... -o <dest> <url>
+            if url not in files:
+                return "", 22
+            with open(dest, "w") as f:
+                f.write(files[url])
+            return "", 0
+
+        orig = inst.run
+        inst.run = fake
+        try:
+            return quiet(inst.download_verified, list(files) + ["http://down"], sha)
+        finally:
+            inst.run = orig
+
+    def test_download_verified_rejects_tampered_mirror(self):
+        good = hashlib.sha256(b"echo ok\n").hexdigest()
+        path, out = self._download({"http://proxy": "rm -rf /\n"}, good)
+        self.assertEqual(path, "")
+        self.assertIn("не совпал", out)
+
+    def test_download_verified_falls_back_to_matching_source(self):
+        good = hashlib.sha256(b"echo ok\n").hexdigest()
+        path, _ = self._download({"http://evil": "evil\n", "http://mirror": "echo ok\n"},
+                                 good)
+        try:
+            with open(path) as f:
+                self.assertEqual(f.read(), "echo ok\n")
+            self.assertFalse(path.startswith("/tmp/3xui"))
+        finally:
+            os.remove(path)
+
+    def test_xui_installer_is_pinned_and_gets_panel_port(self):
+        orig = (inst.download_verified, inst.run)
+        seen = {"cmds": []}
+
+        def fake_dl(urls, sha):
+            seen["urls"], seen["sha"] = urls, sha
+            return "/nonexistent/dl-x"
+
+        def fake_run(cmd, **kw):
+            seen["cmds"].append(cmd)
+            # «x-ui ещё не стоит», дальше всё успешно
+            return ("", 1) if cmd.startswith("test -f /usr/local/x-ui") else ("", 0)
+
+        inst.download_verified, inst.run = fake_dl, fake_run
+        try:
+            quiet(inst.install_3xui_panel, "Pw1", 23456, "base")
+        finally:
+            inst.download_verified, inst.run = orig
+        self.assertTrue(all("/%s/install.sh" % inst.XUI_VERSION in u for u in seen["urls"]))
+        self.assertFalse(any("/master/" in u for u in seen["urls"]))
+        self.assertEqual(seen["sha"], inst.XUI_INSTALL_SHA256)
+        runner = next(c for c in seen["cmds"] if "XUI_NONINTERACTIVE" in c)
+        self.assertIn("XUI_PANEL_PORT=23456", runner)
+
+    def test_pkg_install_waits_for_lock_instead_of_killing(self):
+        orig = (inst.fix_dns, inst.ensure_apt_mirror)
+        inst.fix_dns = inst.ensure_apt_mirror = lambda cred=None: None
+        try:
+            with fake_run() as cmds:
+                quiet(inst.pkg_install, "curl")
+        finally:
+            inst.fix_dns, inst.ensure_apt_mirror = orig
+        joined = "\n".join(cmds)
+        self.assertNotIn("kill -9", joined)
+        self.assertNotIn("rm -f /var/lib/dpkg/lock", joined)
+        self.assertTrue(all("DPkg::Lock::Timeout" in c for c in cmds if "apt-get" in c))
 
 
 if __name__ == "__main__":
