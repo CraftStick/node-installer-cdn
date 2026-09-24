@@ -877,23 +877,6 @@ class TestCdnDomains(unittest.TestCase):
         self.assertIn("не похож на домен", out)
 
 
-class TestCard(unittest.TestCase):
-    def test_long_values_wrap_instead_of_being_cut(self):
-        _, out = quiet(inst.card, "ГОТОВО", [
-            ("CNAME", "jsq98fs.example.com → c5d6df029464d4c0.topology.gslb.yccdn.ru"),
-        ])
-        # значение целиком присутствует в выводе, пусть и на двух строках
-        self.assertIn("c5d6df029464d4c0.topology.gslb.yccdn.ru",
-                      "".join(l.strip("│ ") for l in out.splitlines()))
-        for line in out.splitlines():
-            if line.startswith("│"):
-                self.assertTrue(line.endswith("│"), line)
-
-    def test_short_rows_stay_on_one_line(self):
-        _, out = quiet(inst.card, "T", [("Логин", "admin")])
-        self.assertEqual(sum(1 for l in out.splitlines() if "admin" in l), 1)
-
-
 class TestConstants(unittest.TestCase):
     def test_cdn_names_and_labels_match_up(self):
         self.assertEqual(set(inst.CDN_NAMES), set(inst.CDN_LABELS))

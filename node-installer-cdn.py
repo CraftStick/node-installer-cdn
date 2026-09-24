@@ -416,17 +416,11 @@ def card(title, rows, color=C_TITLE):
     print(_c(color, "├" + "─" * inner + "┤"), flush=True)
     for row in rows:
         if isinstance(row, tuple):
-            head, value = "  %s " % _pad(row[0], 9), str(row[1])
+            label, value = row
+            body = "  %s %s" % (_pad(label, 9), value)
         else:
-            head, value = "  ", str(row)
-        # Длинное значение переносится, а не обрезается: CNAME и ссылка на
-        # подписку в 64 колонки не влезают, а обрубок посреди домена
-        # бесполезен — его не скопируешь
-        room = max(8, inner - len(head))
-        parts = [value[i:i + room] for i in range(0, len(value), room)] or [""]
-        for n, part in enumerate(parts):
-            body = (head if n == 0 else " " * len(head)) + part
-            print(_c(color, "│") + _pad(body, inner) + _c(color, "│"), flush=True)
+            body = "  " + row
+        print(_c(color, "│") + _pad(body, inner) + _c(color, "│"), flush=True)
     print(_c(color, "╰" + "─" * inner + "╯"), flush=True)
 
 def banner():
