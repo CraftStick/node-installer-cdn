@@ -984,13 +984,15 @@ class TestChoose(unittest.TestCase):
     def _choose(self, answers):
         """choose() с подставными ответами: возвращает (выбор, вывод)."""
         replies = list(answers)
-        orig_ask, orig_save = inst.ask, inst.state_save
+        orig_ask, orig_save, orig_stdin = inst.ask, inst.state_save, sys.stdin
         inst.ask = lambda *a, **kw: replies.pop(0)
         inst.state_save = lambda: None
+        # за терминалом переспрашивают, без него choose выходит через no_input
+        sys.stdin = type("Tty", (), {"isatty": staticmethod(lambda: True)})()
         try:
             return quiet(inst.choose, "Режим?", ["раз", "два"])
         finally:
-            inst.ask, inst.state_save = orig_ask, orig_save
+            inst.ask, inst.state_save, sys.stdin = orig_ask, orig_save, orig_stdin
 
     def test_valid_number_is_returned(self):
         self.assertEqual(self._choose(["2"])[0], 2)
@@ -1000,6 +1002,16 @@ class TestChoose(unittest.TestCase):
         self.assertEqual(value, 1)
         self.assertIn("Нужен номер от 1 до 2", out)
         self.assertIn("че", out)
+
+    def test_without_tty_it_exits_instead_of_looping(self):
+        orig_ask, orig_stdin = inst.ask, sys.stdin
+        inst.ask = lambda *a, **kw: "че"
+        sys.stdin = io.StringIO()
+        try:
+            with self.assertRaises(SystemExit):
+                quiet(inst.choose, "Режим?", ["раз", "два"])
+        finally:
+            inst.ask, sys.stdin = orig_ask, orig_stdin
 
     def test_number_out_of_range_is_rejected(self):
         value, out = self._choose(["9", "1"])
