@@ -2434,9 +2434,9 @@ def print_cdn_instructions(provider, origin, my_ip, path):
        - Query string: НЕ игнорировать (sessionID и seq идут в query!)
        - Проверка сертификата источника: ВЫКЛ
 
-  3. Ресурс получит технический домен вида cl-xxxxx.edgecdn.ru. Направьте на
-     него клиентский домен CNAME-записью — установщик спросит оба домена и
-     покажет готовую запись.
+  3. На странице ресурса, блок "Настройки DNS", Yandex покажет значение вида
+     xxxxxxxx.topology.gslb.yccdn.ru — направьте на него клиентский домен
+     CNAME-записью. Установщик спросит оба домена и покажет готовую запись.
 """ % (origin, origin, origin))
     elif provider == "timeweb":
         say("""
