@@ -974,11 +974,14 @@ def gen_x25519():
 def build_xhttp_inbound(port, path, tag, uuid=None):
     """XHTTP packet-up inbound: слушает 127.0.0.1:port, TLS снимает nginx.
 
-    Набор ключей xhttpSettings взят с работающей ноды — это семейство
-    xPaddingObfs: паддинг уезжает в query и в заголовок X-Cache, аплинк идёт
-    методом GET. Реконструкция раньше писала другой набор
-    (scMaxEachPostBytes/xmux/noSSEHeader) — он валиден для xray, но маскировкой
-    под кэш-трафик CDN не занимается.
+    xhttpSettings намеренно минимальны: только mode и path. Раньше сюда писался
+    набор обфускации паддинга (xPaddingKey "_dc", xPaddingHeader "X-Cache",
+    xPaddingMethod, xPaddingObfsMode, xPaddingPlacement, uplinkHTTPMethod) —
+    сервер ждал паддинг в своём виде, а клиент, собранный панелью из хоста,
+    этих параметров не знает и шлёт обычный ?x_padding=. На живой установке
+    это давало 400 на КАЖДЫЙ запрос туннеля: 931 GET и 51 POST подряд, при
+    полностью исправных CDN, nginx и ноде. Обфускация имеет смысл, только если
+    те же параметры уезжают клиенту — а мы их в хост не кладём.
 
     path у xray со слешем на конце: nginx проксирует всё, что под путём, а сам
     путь без слеша отдаёт 404. clients пустой — пользователей в конфиг ноды
@@ -1001,12 +1004,6 @@ def build_xhttp_inbound(port, path, tag, uuid=None):
             "xhttpSettings": {
                 "mode": "packet-up",
                 "path": "/" + path.strip("/") + "/",
-                "xPaddingKey": "_dc",
-                "xPaddingHeader": "X-Cache",
-                "xPaddingMethod": "tokenish",
-                "uplinkHTTPMethod": "get",
-                "xPaddingObfsMode": True,
-                "xPaddingPlacement": "queryInHeader",
             },
         },
     }
@@ -2124,7 +2121,7 @@ def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
         "sni": cdn_domain,
         "host": cdn_domain,
         "path": "/" + path.strip("/") + "/",
-        "alpn": "h3,h2,http/1.1",
+        "alpn": "h2,http/1.1",
         "fingerprint": "random",
         "xhttpExtraParams": {"mode": "packet-up"},
         "xHttpExtraParams": {"mode": "packet-up"},
@@ -3184,7 +3181,7 @@ def main():
         link = ("vless://%s@%s:443?type=xhttp&security=tls&sni=%s&fp=random"
                 "&alpn=%s&path=%s&host=%s&mode=packet-up&encryption=none#user1-%s"
                 % (result["user_uuid"], public_domain, public_domain,
-                   urllib.parse.quote("h3,h2,http/1.1", safe=""),
+                   urllib.parse.quote("h2,http/1.1", safe=""),
                    xpath, public_domain, cdn_name))
         callout("VLESS CDN ссылка", [link], color=C_TITLE)
     if result.get("reality"):

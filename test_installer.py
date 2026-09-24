@@ -177,7 +177,9 @@ class TestXrayInbounds(unittest.TestCase):
         xs = ib["streamSettings"]["xhttpSettings"]
         self.assertEqual(ib["streamSettings"]["security"], "none")
         self.assertEqual(xs["mode"], "packet-up")
-        self.assertEqual(xs["uplinkHTTPMethod"], "get")
+        # только mode и path: любые лишние ключи сервер ждёт и от клиента,
+        # а клиент их не знает — живая установка отвечала 400 на всё
+        self.assertEqual(set(xs), {"mode", "path"})
 
     def test_xhttp_path_is_normalised_to_directory(self):
         for raw in ("/abc", "abc", "/abc/", "abc/"):
@@ -395,6 +397,13 @@ class TestConfigProfile(unittest.TestCase):
 
 
 class TestHostAndSquad(unittest.TestCase):
+    def test_host_alpn_has_no_h3(self):
+        api = FakeApi({("POST", "hosts"): ({"response": {"uuid": "H-1"}}, 201)})
+        quiet(inst.create_remnawave_host, api, "P-1", "T", "c.net", "/a",
+              inbound_uuid="I-1")
+        # HTTP/3 у CDN выключен по инструкции: клиент не должен его пробовать
+        self.assertEqual(api.calls[0][2]["alpn"], "h2,http/1.1")
+
     def test_host_body_points_at_cdn_and_binds_inbound_uuid(self):
         api = FakeApi({("POST", "hosts"): ({"response": {"uuid": "H-1"}}, 201)})
         huuid, _ = quiet(inst.create_remnawave_host, api, "P-1", "VK_CDN",
