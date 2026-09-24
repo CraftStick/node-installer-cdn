@@ -934,5 +934,71 @@ class TestModeRenumbering(unittest.TestCase):
         self.assertFalse(hasattr(args, "node_pass"))
 
 
+class TestMainFlow(unittest.TestCase):
+    """main() целиком на заглушках: без tty он обязан доезжать до конца."""
+
+    def _main(self, argv, installs=("install_remnawave", "install_node_only",
+                                    "install_cdn_only")):
+        saved = {n: getattr(inst, n) for n in installs}
+        saved.update({n: getattr(inst, n) for n in
+                      ("run", "run_remote", "check_ubuntu", "state_load", "state_save",
+                       "state_clear", "wipe_previous", "final_selfcheck",
+                       "update_host_address")})
+        geteuid, argv_saved, stdin = os.geteuid, sys.argv, sys.stdin
+        saved["ask"] = inst.ask
+        seen = {}
+        try:
+            # без терминала: isatty() -> False, чтение сразу упирается в EOF
+            sys.stdin = io.StringIO()
+            inst.ask = lambda prompt, default=None, remember=True: default or ""
+            inst.run = lambda cmd, **kw: (("203.0.113.9", 0) if "curl -s4" in cmd
+                                          else ("", 0))
+            inst.run_remote = lambda cred, cmd, **kw: ("ok", 0)
+            inst.check_ubuntu = lambda: None
+            inst.state_load = lambda: False
+            inst.state_save = inst.state_clear = lambda: None
+            inst.wipe_previous = lambda **kw: None
+            inst.final_selfcheck = lambda *a: None
+            inst.update_host_address = lambda api, h, dom: True
+            for name in installs:
+                setattr(inst, name, lambda cfg, _n=name: (seen.setdefault(_n, dict(cfg)),
+                                                          {})[1])
+            os.geteuid = lambda: 0
+            sys.argv = ["installer"] + argv
+            _, out = quiet(inst.main)
+            return seen, out
+        finally:
+            for n, v in saved.items():
+                setattr(inst, n, v)
+            os.geteuid, sys.argv, sys.stdin = geteuid, argv_saved, stdin
+
+    BASE = ["--domain", "e.com", "--skip-dns-wait", "--skip-cdn-wait", "--no-wipe",
+            "--cdn-domain", "xxx.cdn.twcstorage.ru"]
+
+    def test_grpc_question_is_skipped_without_tty(self):
+        # без --no-grpc и без терминала установщик раньше падал на вопросе
+        seen, out = self._main(["--mode", "1", "--cdn", "yandex"] + self.BASE)
+        self.assertIn("install_remnawave", seen)
+        self.assertFalse(seen["install_remnawave"]["no_grpc"])   #по умолчанию вход добавляется
+        self.assertIn("ГОТОВО", out)
+
+    def test_cdn_only_mode_reports_and_keeps_given_path(self):
+        seen, out = self._main(["--mode", "3", "--cdn", "timeweb", "--path",
+                                "/upload/data/ab", "--xport", "4443"] + self.BASE)
+        self.assertEqual(seen["install_cdn_only"]["path"], "/upload/data/ab")
+        self.assertIn("только CDN", out)
+
+    def test_client_domain_goes_into_link_and_dns(self):
+        seen, out = self._main(["--mode", "1", "--cdn", "yandex",
+                                "--client-domain", "cdn.e.com"] + self.BASE)
+        self.assertIn("CNAME  cdn.e.com  ->  xxx.cdn.twcstorage.ru", out)
+        self.assertIn("A      origin.e.com  ->  203.0.113.9", out)
+
+    def test_bad_domain_stops_installation(self):
+        with self.assertRaises(SystemExit):
+            self._main(["--mode", "1", "--cdn", "yandex", "--domain", "не.домен",
+                        "--skip-dns-wait", "--skip-cdn-wait"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
