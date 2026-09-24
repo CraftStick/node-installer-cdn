@@ -14,9 +14,8 @@ node-installer-cdn.py — установщик прокси-инфраструк
 ----------
 Разворачивает XHTTP(packet-up)-прокси за российским CDN. Режимы:
   1  Панель + нода на этом сервере
-  2  Панель здесь + нода на другом сервере (по SSH)
-  3  Нода + CDN к уже существующей панели
-  4  Только CDN перед уже работающей нодой
+  2  Нода + CDN к уже существующей панели (панель — по SSH)
+  3  Только CDN перед уже работающей нодой
 Панель: Remnawave 3.x или 3x-ui. CDN: VK Cloud / Yandex Cloud / Beeline(CDNvideo)
 / Timeweb.
 
@@ -25,7 +24,7 @@ node-installer-cdn.py — установщик прокси-инфраструк
     sudo python3 node-installer-cdn.py                 # интерактивно
     sudo python3 node-installer-cdn.py --mode 1 --panel 1 --cdn 1 --domain example.com
 
-ТРЕБОВАНИЯ: Ubuntu/Debian, root. Для режимов 2 и 3 — sshpass (ставится сам).
+ТРЕБОВАНИЯ: Ubuntu/Debian, root. Для режима 2 — sshpass (ставится сам).
 
 ВНИМАНИЕ: работает под root и меняет сеть/сервисы. Обкатывайте на одноразовом VPS
 со снапшотом. Ответственность за использование — на запускающем.
@@ -85,7 +84,7 @@ RE_IPV4   = re.compile(r"^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})
 
 # Локальный порт xhttp-инбаунда. Фиксированный, как в оригинальном
 # установщике: наружу он не смотрит (TLS снимает nginx), поэтому случайность
-# ничего не даёт, а предсказуемый порт нужен режиму 4 и ручной диагностике.
+# ничего не даёт, а предсказуемый порт нужен режиму 3 и ручной диагностике.
 XHTTP_PORT = 4443
 GRPC_PORT  = 2053          # запасной gRPC Reality-вход ноды Remnawave
 
@@ -581,29 +580,9 @@ def run_remote(cred, cmd, timeout=600, input=None):
                env_extra=env_extra, input=input)
 
 
-def _runner(cred=None):
-    """runner(cmd, **kw) -> (out, rc): по SSH, если есть учётка, иначе локально."""
-    if cred:
-        return lambda cmd, **kw: run_remote(cred, cmd, **kw)
-    return run
-
-
-def write_remote(cred, path, content, mode=None):
-    """Write file to remote server over SSH.
-
-    Содержимое едет через stdin, а не base64-строкой в команде: команда
-    видна в ps (а base64 — не шифрование), и в .env ноды лежит SECRET_KEY.
-    """
-    parent = os.path.dirname(path)
-    # umask 077 до записи: файл с секретом не должен ни мгновения быть
-    # читаемым для всех, пока до него не дошёл chmod
-    cmd = "(umask 077; " if mode is not None else "("
-    if parent:
-        cmd += "mkdir -p %s && " % shq(parent)
-    cmd += "cat > %s)" % shq(path)
-    if mode is not None:
-        cmd += " && chmod %o %s" % (mode, shq(path))
-    return run_remote(cred, cmd, input=content)
+def _runner(cred):
+    """runner(cmd, **kw) -> (out, rc) на сервере панели (тот же вид, что у run)."""
+    return lambda cmd, **kw: run_remote(cred, cmd, **kw)
 
 
 def write_file(path, content, mode=None):
@@ -623,14 +602,6 @@ def write_file(path, content, mode=None):
         f.write(content)
 
 
-def put_file(cred, path, content, mode=None):
-    """Записать файл локально или на удалённый сервер — по наличию cred."""
-    if cred:
-        write_remote(cred, path, content, mode)
-    else:
-        write_file(path, content, mode)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Сеть / окружение
 # ─────────────────────────────────────────────────────────────────────────────
@@ -638,17 +609,16 @@ def put_file(cred, path, content, mode=None):
 IP_SERVICES = ["ifconfig.me", "icanhazip.com", "api.ipify.org",
                "ipinfo.io/ip", "checkip.amazonaws.com"]
 
-def get_ip(cred=None):
-    """Get server's public IP (local or remote)."""
-    runner = _runner(cred)
+def get_ip():
+    """Get server's public IP."""
     for svc in IP_SERVICES:
-        out, _ = runner("curl -s4 --max-time 5 %s" % svc)
+        out, _ = run("curl -s4 --max-time 5 %s" % svc)
         # строгая проверка: страница ошибки или капча с цифрами внутри
         # не должна превратиться в «адрес» для файрвола и DNS-записей
         ip = out.strip()
         if is_ipv4(ip):
             return ip
-    out, _ = runner("hostname -I 2>/dev/null | awk '{print $1}'")
+    out, _ = run("hostname -I 2>/dev/null | awk '{print $1}'")
     return out.strip()
 
 
@@ -661,14 +631,14 @@ def check_ubuntu():
         sys.exit(1)
 
 
-def check_disk(need_gb, cred=None):
+def check_disk(need_gb):
     """Предупредить, если под docker-образы не хватает места на /.
 
     Панель тянет postgres + valkey + remnawave: на диске
     ~5 ГБ это упирается в «no space left on device» уже на docker compose pull,
     поэтому лучше сказать об этом до установки, а не через 5 минут ожидания.
     """
-    out, _ = _runner(cred)("df -Pm / | awk 'NR==2 {print $4}'")
+    out, _ = run("df -Pm / | awk 'NR==2 {print $4}'")
     try:
         free_gb = int(out.strip()) / 1024.0
     except ValueError:
@@ -684,7 +654,7 @@ def check_disk(need_gb, cred=None):
         sys.exit(1)
 
 
-def fix_dns(cred=None):
+def fix_dns():
     """Починить сломанный DNS (stub systemd-resolved), прописав прямые nameserver'ы.
 
     Проба — getent, а не nslookup: nslookup лежит в отдельном пакете
@@ -699,26 +669,26 @@ def fix_dns(cred=None):
            "rm -f /etc/resolv.conf; "
            "printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf; "
            "%s && echo DNS_FIXED || echo DNS_STILL_BROKEN" % (probe, probe))
-    out, _ = _runner(cred)(cmd)
+    out, _ = run(cmd)
     if "DNS_FIXED" in out:
         ok("DNS исправлен (8.8.8.8 / 1.1.1.1)")
     elif "DNS_STILL_BROKEN" in out:
         warn("DNS всё ещё не работает")
 
 
-_APT_MIRROR_FIXED = set()
+_apt_mirror_fixed = False
 
-def ensure_apt_mirror(cred=None):
+def ensure_apt_mirror():
     """Если apt-зеркало недоступно — переключить на archive.ubuntu.com.
 
     Приватные образы VPS (Fornex, Beget) часто ставят своё зеркало, которое
     отваливается -> падает apt install и get.docker.com. Ubuntu-only, no-op на
-    прочих ОС и при рабочем зеркале. Кешируется per-host.
+    прочих ОС и при рабочем зеркале. За запуск делается один раз.
     """
-    host = cred["ip"] if cred else "local"
-    if host in _APT_MIRROR_FIXED:
+    global _apt_mirror_fixed
+    if _apt_mirror_fixed:
         return
-    _APT_MIRROR_FIXED.add(host)
+    _apt_mirror_fixed = True
     script = r'''set +e
 . /etc/os-release 2>/dev/null
 [ "$ID" = "ubuntu" ] || exit 0
@@ -761,31 +731,30 @@ fi
 timeout 90 apt-get update -o Acquire::Retries=3 2>&1 | tail -3
 exit 0
 '''
-    _runner(cred)(script)
+    run(script)
 
 
-def pkg_install(packages, cred=None):
+def pkg_install(packages):
     """Установить пакеты apt: чинит DNS, зеркало, ждёт блокировку, повторяет."""
-    fix_dns(cred)
-    ensure_apt_mirror(cred)
-    runner = _runner(cred)
+    fix_dns()
+    ensure_apt_mirror()
     # Автообновление держит блокировку dpkg. Раньше его убивали kill -9 и
     # стирали lock-файлы: посреди распаковки пакета это ломает базу dpkg, и
     # чинить её приходится руками. Теперь останавливаем штатно — по SIGTERM
     # unattended-upgrade доделывает текущий пакет и выходит, systemctl stop
     # этого дожидается. Таймеры не выключаются насовсем: после перезагрузки
     # они снова в строю.
-    runner("systemctl stop apt-daily.timer apt-daily-upgrade.timer "
+    run("systemctl stop apt-daily.timer apt-daily-upgrade.timer "
            "apt-daily.service apt-daily-upgrade.service 2>/dev/null; "
            "dpkg --configure -a 2>/dev/null", timeout=900)
-    runner("%s update -qq" % APT_GET, timeout=180)
+    run("%s update -qq" % APT_GET, timeout=180)
     install = "%s install -y %s" % (APT_GET, packages)
-    _, rc = runner(install, timeout=600)
+    _, rc = run(install, timeout=600)
     if rc != 0:
         say("  Повторная попытка установки...")
-        runner("%s --fix-broken install -y 2>/dev/null; "
+        run("%s --fix-broken install -y 2>/dev/null; "
                "%s update --fix-missing" % (APT_GET, APT_GET), timeout=300)
-        _, rc = runner(install, timeout=600)
+        _, rc = run(install, timeout=600)
     if rc != 0:
         err("Не удалось установить: %s" % packages)
         say("  Попробуй вручную: apt-get update && apt-get install -y %s" % packages)
@@ -809,29 +778,27 @@ def ensure_sshpass():
 #  Docker
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_docker_mirror(cred=None):
+def setup_docker_mirror():
     """Configure Docker Hub mirror if registry-1.docker.io is blocked."""
-    runner = _runner(cred)
-    code, _ = runner("curl -s -o /dev/null -m 5 -w '%{http_code}' "
+    code, _ = run("curl -s -o /dev/null -m 5 -w '%{http_code}' "
                      "https://registry-1.docker.io/v2/ 2>/dev/null")
     # Без авторизации реестр отвечает 401 — это и есть «доступен». Раньше
     # ждали 200, которого не бывает, и daemon.json перезаписывался всегда.
     if code.strip() in ("200", "401"):
         return
     say("  Настраиваю зеркало Docker Hub...")
-    runner('mkdir -p /etc/docker && echo \'{"registry-mirrors":'
+    run('mkdir -p /etc/docker && echo \'{"registry-mirrors":'
            '["https://huecker.io","https://dockerhub.timeweb.cloud",'
            '"https://mirror.gcr.io"]}\' > /etc/docker/daemon.json '
            '&& systemctl restart docker')
     ok("Зеркало Docker Hub настроено")
 
 
-def install_docker(cred=None):
+def install_docker():
     """Robustly install Docker: get.docker.com -> docker.io -> docker-ce -> static."""
-    runner = _runner(cred)
 
     def has_docker():
-        return runner("docker --version")[1] == 0
+        return run("docker --version")[1] == 0
 
     if has_docker():
         return True
@@ -862,29 +829,28 @@ def install_docker(cred=None):
         if msg:
             say("  " + msg)
         if i == 1:
-            ensure_apt_mirror(cred)
-        runner(cmd, timeout=600)
+            ensure_apt_mirror()
+        run(cmd, timeout=600)
         if has_docker():
-            setup_docker_mirror(cred)
+            setup_docker_mirror()
             return True
     return False
 
 
-def ensure_compose(cred=None):
+def ensure_compose():
     """Гарантировать docker compose plugin."""
-    runner = _runner(cred)
-    _, rc = runner("docker compose version 2>/dev/null")
+    _, rc = run("docker compose version 2>/dev/null")
     if rc == 0:
         return True
     say("  docker compose plugin не найден, устанавливаю...")
-    runner(APT_GET + ' install -y -qq docker-compose-plugin 2>/dev/null || '
+    run(APT_GET + ' install -y -qq docker-compose-plugin 2>/dev/null || '
          + APT_GET + ' install -y -qq docker-compose-v2 2>/dev/null || '
            '(mkdir -p /usr/local/lib/docker/cli-plugins && '
            'curl -fsSL https://github.com/docker/compose/releases/latest/download/'
            'docker-compose-linux-$(uname -m) '
            '-o /usr/local/lib/docker/cli-plugins/docker-compose && '
            'chmod +x /usr/local/lib/docker/cli-plugins/docker-compose)', timeout=300)
-    _, rc = runner("docker compose version 2>/dev/null")
+    _, rc = run("docker compose version 2>/dev/null")
     return rc == 0
 
 
@@ -892,43 +858,41 @@ def ensure_compose(cred=None):
 #  Тюнинг ОС, swap, nginx-база, SSL, заглушка
 # ─────────────────────────────────────────────────────────────────────────────
 
-def tune_os(cred=None):
+def tune_os():
     """sysctl BBR + limits + swap 2G."""
-    runner = _runner(cred)
-    put_file(cred, "/etc/sysctl.d/99-vpn-tuning.conf", SYSCTL_TUNING)
-    put_file(cred, "/etc/security/limits.d/99-nofile.conf", LIMITS_NOFILE)
-    runner("sysctl --system > /dev/null 2>&1")
-    if runner("swapon --show | grep -q /")[1] == 0:
+    write_file("/etc/sysctl.d/99-vpn-tuning.conf", SYSCTL_TUNING)
+    write_file("/etc/security/limits.d/99-nofile.conf", LIMITS_NOFILE)
+    run("sysctl --system > /dev/null 2>&1")
+    if run("swapon --show | grep -q /")[1] == 0:
         ok("Swap уже есть")
         return
     say("  Создание swap 2G...")
     # Скобки вокруг fstab обязательны: без них `a && b || echo` дописывал
     # swap в fstab и тогда, когда fallocate/mkswap упали (btrfs, нет места).
-    runner("fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && "
+    run("fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && "
            "swapon /swapfile && "
            "{ grep -q swapfile /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; }")
 
 
-def ensure_nginx_base(cred=None):
+def ensure_nginx_base():
     """Гарантировать /etc/nginx/nginx.conf (битое зеркало / удалённый conffile)."""
-    runner = _runner(cred)
-    runner("mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled "
+    run("mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled "
            "/etc/nginx/conf.d /etc/nginx/ssl /var/www/html")
-    if runner("test -s /etc/nginx/nginx.conf")[1] == 0:
+    if run("test -s /etc/nginx/nginx.conf")[1] == 0:
         return
-    ensure_apt_mirror(cred)
-    runner(APT_GET + " install -y nginx-common nginx-core 2>&1 | tail -3", timeout=300)
-    runner(APT_GET + " install -y --reinstall "
+    ensure_apt_mirror()
+    run(APT_GET + " install -y nginx-common nginx-core 2>&1 | tail -3", timeout=300)
+    run(APT_GET + " install -y --reinstall "
            "-o Dpkg::Options::=--force-confmiss nginx-common 2>&1 | tail -3", timeout=300)
-    if runner("test -s /etc/nginx/nginx.conf")[1] == 0:
+    if run("test -s /etc/nginx/nginx.conf")[1] == 0:
         return
-    put_file(cred, "/etc/nginx/nginx.conf", NGINX_MINIMAL_CONF)
-    if runner("test -s /etc/nginx/mime.types")[1] != 0:
-        put_file(cred, "/etc/nginx/mime.types", NGINX_MINIMAL_MIME)
+    write_file("/etc/nginx/nginx.conf", NGINX_MINIMAL_CONF)
+    if run("test -s /etc/nginx/mime.types")[1] != 0:
+        write_file("/etc/nginx/mime.types", NGINX_MINIMAL_MIME)
     say("  nginx.conf восстановлен (минимальный конфиг)")
 
 
-def self_signed_cert(cn="cdn-origin", cred=None):
+def self_signed_cert(cn="cdn-origin"):
     """Создать self-signed cdn.crt/cdn.key если их нет (ключ — только root)."""
     # Пара проверяется целиком: раньше смотрели только на .crt, и потерянный
     # ключ не перевыпускался — nginx после этого просто не поднимался. Скобки
@@ -938,12 +902,12 @@ def self_signed_cert(cn="cdn-origin", cred=None):
            "openssl req -x509 -nodes -days 3650 -newkey rsa:2048 "
            "-keyout %s -out %s -subj '/CN=%s' 2>/dev/null; chmod 600 %s 2>/dev/null"
            % (CDN_CRT, CDN_KEY, CDN_KEY, CDN_CRT, cn, CDN_KEY))
-    _runner(cred)(cmd)
+    run(cmd)
 
 
-def write_decoy(domain, cred=None):
+def write_decoy(domain):
     """Написать страницу-заглушку в /var/www/html/index.html."""
-    put_file(cred, "/var/www/html/index.html", DECOY_HTML.format(domain=domain))
+    write_file("/var/www/html/index.html", DECOY_HTML.format(domain=domain))
 
 
 def nginx_write_conf(name, content):
@@ -967,9 +931,8 @@ def nginx_write_conf(name, content):
 #  Xray: бинарник на ноду, x25519, RU-гео, инбаунды
 # ─────────────────────────────────────────────────────────────────────────────
 
-def gen_x25519(cred=None):
+def gen_x25519():
     """Generate x25519 keypair for Reality. Returns (private, public) or (None,None)."""
-    runner = _runner(cred)
     variants = [
         "docker exec remnanode xray x25519 2>/dev/null",
         "xray x25519 2>/dev/null",
@@ -978,7 +941,7 @@ def gen_x25519(cred=None):
         "docker run --rm %s xray x25519 2>/dev/null" % REMNANODE_IMAGE,
     ]
     for cmd in variants:
-        out, _ = runner(cmd)
+        out, _ = run(cmd)
         if not out:
             continue
         priv = pub = None
@@ -1633,8 +1596,8 @@ def resolve_pg_pass():
 def remnawave_bringup(cfg):
     """Docker + compose + .env + запуск контейнеров + регистрация админа + API-токен.
 
-    Общая часть панели Remnawave для режима 1 (панель+нода) и режима 4 (только
-    панель). Возвращает API-токен (или '' при неудаче)."""
+    Общая часть подъёма панели Remnawave. Возвращает API-токен
+    (или '' при неудаче)."""
     domain   = cfg["domain"]
     admin_pw = cfg["admin_pass"]
 
@@ -1786,7 +1749,7 @@ def install_remnawave(cfg):
     gw = gw.strip() or "172.18.0.1"
     say("  Docker gateway: %s" % gw)
     secret = create_remnawave_node(api, "node-local", gw, prof_uuid, inbound_uuids)
-    # Как и в режиме 3: без secretKey remnanode встаёт с пустым SECRET_KEY,
+    # Как и в режиме 2: без secretKey remnanode встаёт с пустым SECRET_KEY,
     # панель его не признаёт, а установка рапортует «ГОТОВО».
     if not secret:
         say("  Панель работает, но нода без secretKey к ней не подключится — "
@@ -1857,26 +1820,25 @@ def create_remnawave_node(api, name, address, prof_uuid, inbound_uuids):
     return secret
 
 
-def deploy_remnanode_files(secret, cred=None):
-    """Каталог, бинарник xray, compose и .env ноды — локально или по SSH."""
-    _runner(cred)("mkdir -p /opt/remnanode")
-    custom_xray = download_xray_binary("/opt/remnanode/xray-custom", cred)
-    put_file(cred, "/opt/remnanode/docker-compose.yml", remnanode_compose(custom_xray))
-    put_file(cred, "/opt/remnanode/.env",
-             "NODE_PORT=2222\nSECRET_KEY=%s\n" % secret, mode=0o600)
+def deploy_remnanode_files(secret):
+    """Каталог, бинарник xray, compose и .env ноды."""
+    run("mkdir -p /opt/remnanode")
+    custom_xray = download_xray_binary("/opt/remnanode/xray-custom")
+    write_file("/opt/remnanode/docker-compose.yml", remnanode_compose(custom_xray))
+    write_file("/opt/remnanode/.env",
+               "NODE_PORT=2222\nSECRET_KEY=%s\n" % secret, mode=0o600)
 
 
-def start_remnanode(cred=None):
+def start_remnanode():
     """docker compose pull + up для remnanode."""
-    runner = _runner(cred)
-    runner("cd /opt/remnanode && docker compose pull", timeout=600)
-    out, rc = runner("cd /opt/remnanode && docker compose up -d 2>&1")
+    run("cd /opt/remnanode && docker compose pull", timeout=600)
+    out, rc = run("cd /opt/remnanode && docker compose up -d 2>&1")
     if rc != 0:
         warn("remnanode не запустился: %s" % out.strip()[-200:])
     return rc == 0
 
 
-def download_xray_binary(dest, cred=None):
+def download_xray_binary(dest):
     """Скачать бинарник xray XRAY_MIN_VERSION под bind-mount в remnanode.
 
     Возвращает True, только если по dest лежит запускаемый файл — вызывающий по
@@ -1884,14 +1846,12 @@ def download_xray_binary(dest, cred=None):
     Проверка через `xray version`, а не через `test -x`: на каталоге, который
     docker мог насоздавать на месте пропавшего бинарника, `test -x` проходит.
     """
-    runner = _runner(cred)
-    tag = "[удалённая] " if cred else ""
-    _, rc = runner("test -f '%s' && '%s' version >/dev/null 2>&1" % (dest, dest))
+    _, rc = run("test -f '%s' && '%s' version >/dev/null 2>&1" % (dest, dest))
     if rc == 0:
-        ok("%sXray %s уже скачан" % (tag, XRAY_MIN_VERSION))
+        ok("Xray %s уже скачан" % XRAY_MIN_VERSION)
         return True
-    say("  %sСкачивание xray %s..." % (tag, XRAY_MIN_VERSION))
-    arch, _ = runner("uname -m")
+    say("  Скачивание xray %s..." % XRAY_MIN_VERSION)
+    arch, _ = run("uname -m")
     zipname = ("Xray-linux-arm64-v8a.zip" if "aarch64" in arch or "arm64" in arch
                else "Xray-linux-64.zip")
     url = ("https://github.com/XTLS/Xray-core/releases/download/v%s/%s"
@@ -1899,7 +1859,7 @@ def download_xray_binary(dest, cred=None):
     # Распаковка: unzip есть не на всяком образе, python3 — тоже не всюду
     # (сам установщик крутится на ДРУГОЙ машине), поэтому пробуем оба.
     # rm -rf dest перед mv — на случай каталога от прошлой сломанной установки.
-    out, rc = runner(
+    out, rc = run(
         "cd /tmp && rm -rf xray_dl xray_dl.zip && curl -sL -o xray_dl.zip '%s' && "
         "mkdir -p xray_dl && ( unzip -o -q xray_dl.zip xray -d xray_dl || "
         "python3 -c \"import zipfile;zipfile.ZipFile('xray_dl.zip')"
@@ -1907,14 +1867,14 @@ def download_xray_binary(dest, cred=None):
         "chmod +x '%s' && test -x '%s' && rm -rf xray_dl.zip xray_dl"
         % (url, dest, dest, dest, dest), timeout=300)
     if rc != 0:
-        warn("%sНе удалось скачать xray: %s" % (tag, out[:120]))
+        warn("Не удалось скачать xray: %s" % out[:120])
         say("     Нода поедет на xray из образа remnanode")
         return False
-    ok("%sXray %s готов" % (tag, XRAY_MIN_VERSION))
+    ok("Xray %s готов" % XRAY_MIN_VERSION)
     return True
 
 
-def detect_ssh_ports(runner):
+def detect_ssh_ports():
     """Порты sshd — чтобы политика deny incoming не отрезала доступ к серверу.
 
     Одного sshd_config мало: на Ubuntu 22.10+ порт живёт в sshd_config.d/ или
@@ -1924,7 +1884,7 @@ def detect_ssh_ports(runner):
     SSH-сессии из $SSH_CONNECTION — тот, через который мы сейчас работаем;
     плюс ListenStream у ssh.socket, если sshd запускается сокетом.
     """
-    out, _ = runner("{ sshd -T 2>/dev/null | awk '$1==\"port\"{print $2}'; "
+    out, _ = run("{ sshd -T 2>/dev/null | awk '$1==\"port\"{print $2}'; "
                     "awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2}' "
                     "/etc/ssh/sshd_config 2>/dev/null; "
                     "systemctl show -p Listen ssh.socket 2>/dev/null "
@@ -1934,22 +1894,22 @@ def detect_ssh_ports(runner):
     return sorted(ports) or [22]
 
 
-def ufw_active(runner):
-    out, _ = runner("ufw status 2>/dev/null")
+def ufw_active():
+    out, _ = run("ufw status 2>/dev/null")
     return "Status: active" in out or "активен" in out
 
 
-def persist_iptables(runner):
+def persist_iptables():
     """Сохранить правила iptables, иначе они исчезнут после перезагрузки."""
-    runner("echo 'iptables-persistent iptables-persistent/autosave_v4 boolean true' "
+    run("echo 'iptables-persistent iptables-persistent/autosave_v4 boolean true' "
            "| debconf-set-selections; "
            "echo 'iptables-persistent iptables-persistent/autosave_v6 boolean true' "
-           "| debconf-set-selections; "
-           + APT_GET + " install -y -qq iptables-persistent >/dev/null 2>&1")
-    _, rc = runner("netfilter-persistent save >/dev/null 2>&1")
+        "| debconf-set-selections; "
+        + APT_GET + " install -y -qq iptables-persistent >/dev/null 2>&1")
+    _, rc = run("netfilter-persistent save >/dev/null 2>&1")
     if rc != 0:
         # без пакета — сохраняем дамп руками, восстановление на старте сети
-        _, rc = runner("mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4")
+        _, rc = run("mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4")
     if rc == 0:
         ok("Правила iptables сохранены (переживут перезагрузку)")
     else:
@@ -1958,28 +1918,27 @@ def persist_iptables(runner):
     return rc == 0
 
 
-def firewall_setup(cred=None, extra_tcp=(), extra_udp=()):
+def firewall_setup(extra_tcp=(), extra_udp=()):
     """ufw с политикой deny incoming: SSH, 80/443 и явно перечисленные порты.
 
     Порт sshd открывается ПЕРВЫМ и только потом включается политика, иначе
     установка обрывает сама себя вместе с SSH-сессией.
     """
-    runner = _runner(cred)
-    if runner("which ufw")[1] != 0:
-        pkg_install("ufw", cred)
-    if runner("which ufw")[1] != 0:
+    if run("which ufw")[1] != 0:
+        pkg_install("ufw")
+    if run("which ufw")[1] != 0:
         warn("ufw не установился — базовый файрвол не настроен")
         return False
-    ssh_ports = detect_ssh_ports(runner)
+    ssh_ports = detect_ssh_ports()
     tcp = list(ssh_ports) + [80, 443] + list(extra_tcp)
     for p in tcp:
-        runner("ufw allow %s/tcp >/dev/null 2>&1" % p)
+        run("ufw allow %s/tcp >/dev/null 2>&1" % p)
     for p in extra_udp:
-        runner("ufw allow %s/udp >/dev/null 2>&1" % p)
-    runner("ufw default deny incoming >/dev/null 2>&1")
-    runner("ufw default allow outgoing >/dev/null 2>&1")
-    runner("ufw --force enable >/dev/null 2>&1")
-    if ufw_active(runner):
+        run("ufw allow %s/udp >/dev/null 2>&1" % p)
+    run("ufw default deny incoming >/dev/null 2>&1")
+    run("ufw default allow outgoing >/dev/null 2>&1")
+    run("ufw --force enable >/dev/null 2>&1")
+    if ufw_active():
         extra = [str(p) for p in list(extra_tcp) + list(extra_udp)]
         ok("Файрвол: deny incoming, открыты SSH %s, %s"
            % ("/".join(map(str, ssh_ports)), ", ".join(["80", "443"] + extra)))
@@ -1988,48 +1947,46 @@ def firewall_setup(cred=None, extra_tcp=(), extra_udp=()):
     return False
 
 
-def restrict_node_port_2222(panel_ip, cred=None):
+def restrict_node_port_2222(panel_ip):
     """Порт ноды 2222 доступен только панели.
 
     При активном ufw правила уходят в него (переживают перезагрузку сами),
     иначе — сырой iptables с последующим сохранением.
     """
-    runner = _runner(cred)
     ip = (panel_ip or "").strip()
     if not is_ipv4(ip):
         # ahostsv4, а не hosts: у домена с AAAA getent hosts отдаёт IPv6,
         # is_ipv4 его не пропускает, и порт 2222 оставался открытым всем
-        out, _ = runner("getent ahostsv4 %s | awk 'NR==1{print $1}'" % shq(ip))
+        out, _ = run("getent ahostsv4 %s | awk 'NR==1{print $1}'" % shq(ip))
         ip = out.strip()
     if not is_ipv4(ip):
         warn("Не удалось определить IP панели из '%s' — порт 2222 оставлен открытым"
              % panel_ip)
         return
-    if ufw_active(runner):
-        runner("ufw allow from %s to any port 2222 proto tcp >/dev/null 2>&1" % ip)
-        runner("ufw allow from 172.16.0.0/12 to any port 2222 proto tcp >/dev/null 2>&1")
-        runner("ufw deny 2222/tcp >/dev/null 2>&1")
+    if ufw_active():
+        run("ufw allow from %s to any port 2222 proto tcp >/dev/null 2>&1" % ip)
+        run("ufw allow from 172.16.0.0/12 to any port 2222 proto tcp >/dev/null 2>&1")
+        run("ufw deny 2222/tcp >/dev/null 2>&1")
         ok("Порт 2222 ограничен через ufw: панель %s" % ip)
         return
     # Идемпотентно: -C проверяет наличие правила, добавляем только если нет,
     # иначе повторные запуски скрипта плодят дубликаты в INPUT.
     def _rule(spec, where="-I"):
-        runner("iptables -C INPUT %s 2>/dev/null || iptables %s INPUT %s"
+        run("iptables -C INPUT %s 2>/dev/null || iptables %s INPUT %s"
                % (spec, where, spec))
     _rule("-p tcp --dport 2222 -s %s -j ACCEPT" % ip)
     _rule("-p tcp --dport 2222 -s 127.0.0.1 -j ACCEPT")
     _rule("-p tcp --dport 2222 -s 172.16.0.0/12 -j ACCEPT")
     _rule("-p tcp --dport 2222 -j DROP", where="-A")
     ok("Порт 2222 ограничен: панель %s" % ip)
-    persist_iptables(runner)
+    persist_iptables()
 
 
-def node_wait_ready(cred=None):
+def node_wait_ready():
     """Дождаться 'XRay Core' в логах remnanode (нода запустилась)."""
-    runner = _runner(cred)
     say("  Ожидание запуска ноды...")
     for _ in range(24):
-        out, _ = runner("docker logs remnanode --tail=15 2>&1")
+        out, _ = run("docker logs remnanode --tail=15 2>&1")
         if "XRay Core" in out or "is up and running" in out:
             ok("Нода запущена!"); return True
         time.sleep(5)
@@ -2226,46 +2183,45 @@ def create_remnawave_user(api, username, vless_uuid, domain):
 #  Let's Encrypt (certbot webroot)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY, cred=None):
+def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY):
     """Выпустить LE через certbot webroot, скопировать в cdn.crt/cdn.key.
 
     Requires nginx с location /.well-known/acme-challenge/ -> /var/www/certbot.
     Возвращает True при успехе.
     """
-    runner = _runner(cred)
-    pkg_install("certbot", cred)
-    runner("mkdir -p /var/www/certbot")
+    pkg_install("certbot")
+    run("mkdir -p /var/www/certbot")
     # дождаться, пока DNS домена укажет на этот сервер
-    myip = get_ip(cred)
+    myip = get_ip()
     for _ in range(12):
         # ahostsv4: при AAAA-записи getent hosts отдаёт IPv6, и сравнение с
         # IPv4 сервера не сходилось никогда — две минуты ожидания впустую
-        out, _ = runner("getent ahostsv4 %s | awk 'NR==1{print $1}'" % shq(domain))
+        out, _ = run("getent ahostsv4 %s | awk 'NR==1{print $1}'" % shq(domain))
         if out.strip() == myip:
             break
         say("  жду DNS %s -> %s ..." % (domain, myip))
         time.sleep(10)
     for attempt in range(3):
-        runner("certbot certonly --webroot -w /var/www/certbot -d %s "
+        run("certbot certonly --webroot -w /var/www/certbot -d %s "
                "--non-interactive --agree-tos "
                "--register-unsafely-without-email" % domain, timeout=180)
         live = "/etc/letsencrypt/live/%s" % domain
-        _, ok_rc = runner("test -f %s/fullchain.pem" % live)
+        _, ok_rc = run("test -f %s/fullchain.pem" % live)
         if ok_rc == 0:
             # crt=None — копия не нужна: vhost смотрит прямо в live-каталог,
             # тогда и продление подхватывается без deploy-хука.
             if crt:
-                runner("cp %s/fullchain.pem %s && cp %s/privkey.pem %s && "
+                run("cp %s/fullchain.pem %s && cp %s/privkey.pem %s && "
                        "nginx -s reload 2>/dev/null; docker restart remnanode 2>/dev/null || true"
                        % (live, crt, live, key))
                 # deploy-hook на автопродление
                 hook = ("#!/bin/bash\ncp %s/fullchain.pem %s\ncp %s/privkey.pem %s\n"
                         "nginx -s reload\ndocker restart remnanode 2>/dev/null || true\n"
                         % (live, crt, live, key))
-                put_file(cred, "/etc/letsencrypt/renewal-hooks/deploy/cert.sh",
-                         hook, mode=0o755)
+                write_file("/etc/letsencrypt/renewal-hooks/deploy/cert.sh",
+                           hook, mode=0o755)
             else:
-                runner("nginx -s reload 2>/dev/null || true")
+                run("nginx -s reload 2>/dev/null || true")
             ok("Сертификат LE получен для %s" % domain)
             return True
         say("  certbot не прошёл (попытка %d/3), повтор через 20с..." % (attempt + 1))
@@ -2309,7 +2265,7 @@ def setup_panel_web(cfg, xport, path, panel_port):
     upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
 
 
-def upgrade_origin_cert(origin_domain, cred=None, skip=False):
+def upgrade_origin_cert(origin_domain, skip=False):
     """Заменить self-signed на Let's Encrypt для origin, если получится.
 
     Self-signed CDN не может проверить — у провайдера приходится включать
@@ -2321,8 +2277,8 @@ def upgrade_origin_cert(origin_domain, cred=None, skip=False):
     if skip:
         return False
     say("  Пробую выпустить Let's Encrypt для origin %s..." % origin_domain)
-    if issue_le_cert(origin_domain, cred=cred):
-        _runner(cred)("chmod 600 %s" % shq(CDN_KEY))
+    if issue_le_cert(origin_domain):
+        run("chmod 600 %s" % shq(CDN_KEY))
         return True
     say("  Остаётся self-signed — у CDN-провайдера включи "
         "«игнорировать сертификат origin»")
@@ -2644,64 +2600,11 @@ def dns_wait(lines, skip=False):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Режим 2: панель здесь + нода на удалённом сервере (по SSH)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def setup_remote_node(cred, secret, panel_ip, origin, path, xport,
-                      no_origin_le=False, no_grpc=False):
-    """Install Docker + nginx CDN origin + remnanode на удалённом сервере via SSH.
-
-    secret — secretKey ноды из панели. Без него remnanode поднимется, но панель
-    его не признает, поэтому пустое значение — это сразу отказ, а не установка,
-    которая «прошла», но не работает.
-    """
-    if not secret:
-        err("[удалённая] Нет secretKey ноды — панель не примет %s" % cred["ip"])
-        say("  Нода в панели не создалась; удалённый сервер не трогаю")
-        return False
-    say("  [удалённая] Подключение к %s..." % cred["ip"])
-    if not cred.get("key") and not ensure_sshpass():
-        return False
-    out, _ = run_remote(cred, "echo OK")
-    if "OK" not in out:
-        err("Не могу подключиться по SSH к %s" % cred["ip"])
-        if out.strip():
-            say("  " + out.strip().splitlines()[-1][:200])
-        return False
-    say("  [удалённая] SSH OK, установка пакетов...")
-    pkg_install("nginx openssl curl ca-certificates gnupg", cred)
-    firewall_setup(cred, extra_tcp=([] if no_grpc else [GRPC_PORT]))
-    say("  [удалённая] Установка Docker...")
-    if not install_docker(cred) or not ensure_compose(cred):
-        err("[удалённая] Docker не установился на %s" % cred["ip"]); return False
-    tune_os(cred)
-    ensure_nginx_base(cred)
-    self_signed_cert("cdn-origin", cred)
-    write_decoy(origin, cred)
-    # nginx CDN origin
-    conf = nginx_cdn_origin_config(xport, path)
-    write_remote(cred, "/etc/nginx/sites-available/default", conf)
-    run_remote(cred, "rm -f /etc/nginx/sites-enabled/default && "
-               "ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && "
-               "nginx -t && systemctl restart nginx")
-    upgrade_origin_cert(origin, cred, skip=no_origin_le)
-    # remnanode
-    say("  [удалённая] Настройка remnanode...")
-    deploy_remnanode_files(secret, cred)
-    started = start_remnanode(cred)
-    restrict_node_port_2222(panel_ip, cred)
-    if not (node_wait_ready(cred) and started):
-        return False
-    ok("[удалённая] Нода запущена на %s" % cred["ip"])
-    return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Режим 3: только нода/CDN к существующей панели (Remnawave, по SSH API)
+#  Режим 2: только нода/CDN к существующей панели (Remnawave, по SSH API)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def install_node_only(cfg):
-    """Install node + CDN origin on THIS server, connect to existing panel via SSH."""
+    """Режим 2: нода + CDN-origin на ЭТОМ сервере, панель — существующая, по SSH."""
     step("Проверка подключения к панели")
     panel = {"ip": cfg["panel_url"], "user": cfg.get("panel_ssh_user", "root"),
              "pass": cfg.get("panel_ssh_pass", ""), "key": cfg.get("panel_key")}
@@ -2758,7 +2661,7 @@ def install_node_only(cfg):
     if apply_origin_front(cfg, xport, path) == "nginx":
         upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
     firewall_setup(extra_tcp=([reality["port"]] if reality else []))
-    # Панель здесь удалённая и стучится к ноде на 2222 снаружи: без этого
+    # Панель стоит на другом сервере и стучится к ноде на 2222 снаружи: без этого
     # правила политика deny incoming закрывает порт вообще для всех, и нода
     # появляется в панели, но остаётся неуправляемой.
     restrict_node_port_2222(panel["ip"])
@@ -2784,12 +2687,12 @@ def install_node_only(cfg):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Режим 4: только CDN-origin
+#  Режим 3: только CDN-origin
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def install_cdn_only(cfg):
-    """Режим 4: только origin-фронт CDN перед уже работающей нодой на ЭТОМ сервере.
+    """Режим 3: только origin-фронт CDN перед уже работающей нодой на ЭТОМ сервере.
 
     Не трогает панель и docker-ноду — поднимает фронт (nginx, либо caddy при
     --front caddy) с self-signed сертом и заглушкой на upstream
@@ -2820,30 +2723,30 @@ def install_cdn_only(cfg):
 def parse_args():
     """Parse CLI args for non-interactive mode."""
     p = argparse.ArgumentParser(description="CDN Installer v%s" % INSTALLER_VERSION)
-    p.add_argument("--mode", help="1=Panel+node here, 2=Panel here+node remote, "
-                   "3=Node+CDN to existing panel, 4=CDN origin only")
-    p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (modes 1,2)")
+    p.add_argument("--mode", help="1=Panel+node here, "
+                   "2=Node+CDN to existing panel, 3=CDN origin only")
+    p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (mode 1)")
     p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb")
     p.add_argument("--front", choices=["nginx", "caddy"], default="nginx",
                    help="Origin-фронт: nginx (по умолчанию) или caddy "
-                        "(локальные режимы 1/3/4; в режиме с панелью caddy "
-                        "обслуживает и панель с авто-TLS)")
+                        "(в режиме с панелью caddy обслуживает и панель "
+                        "с авто-TLS)")
     p.add_argument("--domain", help="Domain name")
-    p.add_argument("--path", help="Existing xhttp path (mode 4 CDN-only), e.g. /abc123")
+    p.add_argument("--path", help="Existing xhttp path (mode 3 CDN-only), e.g. /abc123")
     p.add_argument("--xport", type=int,
-                   help="Existing local xray upstream port on 127.0.0.1 (mode 4 CDN-only)")
-    p.add_argument("--node-ip", help="Remote node IP (mode 2)")
-    p.add_argument("--node-user", default="root", help="SSH user for remote node")
-    p.add_argument("--node-pass", help="Remote node password (mode 2)")
-    p.add_argument("--node-key", help="Path to SSH private key (remote node / panel)")
-    p.add_argument("--panel-url", help="Panel IP (mode 3)")
-    p.add_argument("--panel-token", help="Remnawave API token (mode 3). "
+                   help="Existing local xray upstream port on 127.0.0.1 (mode 3 CDN-only)")
+    # --node-key — прежнее имя ключа к панели (когда-то он же вёл на удалённую
+    # ноду). Принимается молча, чтобы не ломать чужие команды.
+    p.add_argument("--panel-key", "--node-key", dest="panel_key",
+                   help="Path to SSH private key for the panel (mode 2)")
+    p.add_argument("--panel-url", help="Panel IP (mode 2)")
+    p.add_argument("--panel-token", help="Remnawave API token (mode 2). "
                    "Если не задан — берётся /opt/remnawave/.panel_token с панели, "
                    "иначе логин по --panel-user/--panel-pass")
-    p.add_argument("--panel-user", help="Panel Remnawave username (mode 3)")
-    p.add_argument("--panel-pass", help="Panel Remnawave password (mode 3)")
-    p.add_argument("--panel-ssh-user", default="root", help="Panel SSH user (mode 3)")
-    p.add_argument("--panel-ssh-pass", help="Panel SSH password (mode 3)")
+    p.add_argument("--panel-user", help="Panel Remnawave username (mode 2)")
+    p.add_argument("--panel-pass", help="Panel Remnawave password (mode 2)")
+    p.add_argument("--panel-ssh-user", default="root", help="Panel SSH user (mode 2)")
+    p.add_argument("--panel-ssh-pass", help="Panel SSH password (mode 2)")
     # Hysteria2 убран: это отдельный проект, а не протокол xray-core, и нода
     # запускает стоковый xray. Флаг принимается молча, чтобы не ломать старые
     # команды в чужих скриптах.
@@ -2860,6 +2763,28 @@ def parse_args():
     p.add_argument("--skip-dns-wait", action="store_true")
     p.add_argument("--skip-cdn-wait", action="store_true")
     return p.parse_args()
+
+
+def check_mode_renumbering(mode):
+    """Предупредить про смену нумерации режимов (был «панель + удалённая нода»).
+
+    Старый режим 2 (нода на другом сервере по SSH) убран, режимы сдвинулись:
+    3 -> 2 и 4 -> 3. Команда `--mode 3` из старого скрипта сделала бы теперь не
+    то, что делала раньше, поэтому о ней говорим вслух, а несуществующий
+    `--mode 4` объясняем вместо глухого «режим не существует».
+    """
+    if mode == "4":
+        err("Режим 4 больше не существует: нумерация сдвинулась, "
+            "«только CDN» — это теперь --mode 3")
+        sys.exit(1)
+    if mode == "3":
+        warn("Нумерация режимов изменилась: --mode 3 теперь «только CDN», "
+             "а «нода + CDN к существующей панели» — это --mode 2")
+        if sys.stdin.isatty() and ask("Ставить «только CDN»? (y/N)", "n").lower() \
+                not in ("y", "yes", "д", "да"):
+            say("  Перезапусти с нужным номером режима")
+            sys.exit(1)
+    return mode
 
 
 def flush_stdin():
@@ -3128,16 +3053,14 @@ def main():
     # ── режим ──
     mode = args.mode or str(choose("Режим установки?", [
         "Панель + нода (всё на этом сервере)",
-        "Панель здесь + нода на другом сервере",
         "Нода + CDN к существующей панели",
         "Только CDN (перед уже работающей нодой)"]))
-    if mode not in ("1", "2", "3", "4"):
-        err("Режим '%s' не существует — есть 1, 2, 3 и 4" % mode); sys.exit(1)
+    if args.mode:
+        mode = check_mode_renumbering(args.mode)
+    if mode not in ("1", "2", "3"):
+        err("Режим '%s' не существует — есть 1, 2 и 3" % mode); sys.exit(1)
 
     # ── панель: выбор есть только в режиме 1 ──
-    # У 3x-ui xray встроен в саму панель, отдельной ноды у неё не бывает, так
-    # что режим 2 умеет только Remnawave. Раньше выбор «3x-ui» здесь молча
-    # игнорировался и всё равно ставилась Remnawave.
     if mode == "1":
         panel = args.panel or str(choose("Панель (Panel)?", ["Remnawave 3.x",
                                   "3x-ui"]))
@@ -3145,9 +3068,6 @@ def main():
             err("Панель '%s' не существует — 1=Remnawave, 2=3x-ui" % panel)
             sys.exit(1)
     else:
-        if mode == "2" and args.panel == "2":
-            err("Режим 2 работает только с Remnawave: у 3x-ui нет отдельной ноды")
-            sys.exit(1)
         panel = "1"
 
     # ── CDN: нужен во всех режимах ──
@@ -3173,8 +3093,8 @@ def main():
         sys.exit(1)
     origin = "origin." + domain
 
-    # путь/upstream-порт: режим 4 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
-    if mode == "4":
+    # путь/upstream-порт: режим 3 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
+    if mode == "3":
         path = (args.path or ask("Существующий xhttp путь (например /abc123)") or "").strip()
         if not RE_XPATH.match(path):
             err("Путь '%s' невалиден: ожидается вид /abc123 "
@@ -3202,7 +3122,7 @@ def main():
     # Раньше запасной вход добавлялся молча. Теперь спрашиваем — но только
     # там, где инбаунды вообще создаются, и только если не задано флагом.
     want_grpc = not args.no_grpc
-    if mode in ("1", "2", "3") and not args.no_grpc:
+    if mode in ("1", "2") and not args.no_grpc:
         say("")
         say("  Основной вход — VLESS XHTTP packet-up через CDN, он ставится всегда.")
         want_grpc = choose("Добавить к нему запасной вход?", [
@@ -3214,20 +3134,12 @@ def main():
            "no_grpc": not want_grpc, "xport": xport,
            "no_origin_le": args.no_origin_le, "front": args.front}
 
-    # ── адрес удалённой ноды: спрашиваем здесь, а не после установки панели ──
-    # Все вопросы задаются до первого долгого шага: узнать об отсутствии
-    # адреса через десять минут после старта — худший момент из возможных.
-    node_ip = ""
-    if mode == "2":
-        node_ip = args.node_ip or ask_required(
-            "IP удалённой ноды", "без адреса ноды подключаться некуда")
-
     # ── DNS ──
     # Обе записи — A на этот сервер. Домен панели CNAME'ить на CDN нельзя:
     # Let's Encrypt проверяет его прямо здесь, по webroot. Домен CDN клиенту
     # выдаёт провайдер, он в DNS не заводится.
     records = ["A     %s   ->  %s   (DNS only, серое облако)" % (origin, my_ip)]
-    if mode != "4":
+    if mode != "3":
         records.append("A     %s   ->  %s   (DNS only) — панель и её сертификат"
                        % (domain, my_ip))
     dns_wait(records, skip=args.skip_dns_wait)
@@ -3236,8 +3148,7 @@ def main():
     if state_is_done("wipe"):
         say("  Прошлая установка уже снесена на прошлом запуске — пропускаю")
     elif not args.no_wipe:
-        wipe_previous(panel=(mode in ("1", "2")),
-                      node=(mode in ("1", "2", "3")),
+        wipe_previous(panel=(mode == "1"), node=(mode in ("1", "2")),
                       assume_yes=args.wipe)
         state_done("wipe")
 
@@ -3248,26 +3159,10 @@ def main():
     elif mode == "1" and panel == "2":
         result = install_3xui(cfg)
     elif mode == "2":
-        # панель Remnawave здесь + нода на args.node-ip
-        result = install_remnawave(cfg)    # панель + локальная нода как основа
-        cred = {"ip": node_ip, "user": args.node_user,
-                "pass": args.node_pass, "key": args.node_key}
-        # Своя нода в панели — со своим secretKey. Раньше сюда уезжал None, и
-        # удалённый remnanode вставал с пустым SECRET_KEY: в панели он есть,
-        # трафик через него не идёт.
-        step("Регистрация удалённой ноды в панели")
-        secret = create_remnawave_node(result["api"], "node-%s" % node_ip, node_ip,
-                                       result["prof_uuid"], result["inbound_uuids"])
-        # Панель и локальная нода уже работают, поэтому не выходим — но и
-        # «ГОТОВО» без оговорки про удалённую ноду печатать нельзя
-        result["remote_ok"] = setup_remote_node(
-            cred, secret, my_ip, origin, path, cfg["xport"],
-            no_origin_le=cfg.get("no_origin_le"), no_grpc=cfg.get("no_grpc"))
-    elif mode == "3":
         cfg["panel_url"] = ssh_host(args.panel_url or ask_required(
             "IP/URL панели Remnawave", "без адреса панели подключиться некуда"))
         cfg["panel_ssh_user"] = args.panel_ssh_user
-        cfg["panel_key"] = args.node_key
+        cfg["panel_key"] = args.panel_key
         cfg["panel_token"] = args.panel_token
         cfg["panel_user"] = args.panel_user
         cfg["panel_pass"] = args.panel_pass
@@ -3277,13 +3172,13 @@ def main():
             cfg["panel_ssh_pass"] = args.panel_ssh_pass
             while not cfg["panel_ssh_pass"]:
                 if not sys.stdin.isatty():
-                    no_input("нужен --panel-ssh-pass или --node-key")
+                    no_input("нужен --panel-ssh-pass или --panel-key")
                 cfg["panel_ssh_pass"] = ask_secret("SSH пароль панели")
                 if not cfg["panel_ssh_pass"]:
                     warn("Пустой пароль — SSH к панели не пройдёт "
-                         "(или запусти с --node-key /путь/к/ключу)")
+                         "(или запусти с --panel-key /путь/к/ключу)")
         result = install_node_only(cfg)
-    elif mode == "4":
+    elif mode == "3":
         result = install_cdn_only(cfg)
 
     # ── CDN-инструкция + ожидание ──
@@ -3320,12 +3215,12 @@ def main():
 
     # ── финальный отчёт ──
     cdn_val = cdn_domain or "— укажи после настройки провайдера"
-    if mode == "4":
+    if mode == "3":
         rows = [("Режим", "только CDN"),
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
-                ("nginx", ":443 → 127.0.0.1:%d  путь %s" % (xport, path)),
+                ("Фронт", ":443 → 127.0.0.1:%d  путь %s" % (xport, path)),
                 ("CDN", cdn_val)]
-    elif mode == "3":
+    elif mode == "2":
         rows = [("Режим", "нода + CDN к существующей панели"),
                 ("Панель", cfg["panel_url"]),
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
@@ -3338,8 +3233,6 @@ def main():
                 ("CDN", cdn_val)]
     if result.get("sub_url"):
         rows.append(("Подписка", result["sub_url"]))
-    if result.get("remote_ok") is False:
-        rows.append(("Уд. нода", "%s НЕ поднята — см. ошибки выше" % node_ip))
     card("ГОТОВО · УСТАНОВКА ЗАВЕРШЕНА", rows, color=C_OK)
     state_clear()      # дошли до конца — продолжать нечего
 

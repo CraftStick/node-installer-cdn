@@ -18,6 +18,7 @@ import hashlib
 import os
 import re
 import shlex
+import sys
 import contextlib
 import importlib.util
 import tempfile
@@ -642,39 +643,6 @@ class TestWriteFile(unittest.TestCase):
             os.chdir(cwd)
 
 
-class TestWriteRemote(unittest.TestCase):
-    def test_content_travels_via_stdin_not_argv(self):
-        seen = {}
-        orig = inst.run_remote
-
-        def fake(cred, cmd, **kw):
-            seen["cmd"], seen["input"] = cmd, kw.get("input")
-            return "", 0
-
-        inst.run_remote = fake
-        try:
-            inst.write_remote({"ip": "1.2.3.4"}, "/opt/x/.env",
-                              "SECRET='a b'\n", mode=0o600)
-        finally:
-            inst.run_remote = orig
-        self.assertEqual(seen["input"], "SECRET='a b'\n")
-        self.assertIn("chmod 600 /opt/x/.env", seen["cmd"])
-        # ни открытым текстом, ни base64 — команда видна в ps
-        payload = base64.b64encode("SECRET='a b'\n".encode()).decode()
-        self.assertNotIn("SECRET", seen["cmd"])
-        self.assertNotIn(payload, seen["cmd"])
-
-    def test_path_with_spaces_is_quoted(self):
-        seen = {}
-        orig = inst.run_remote
-        inst.run_remote = lambda cred, cmd, **kw: (seen.setdefault("cmd", cmd), ("", 0))[1]
-        try:
-            inst.write_remote({"ip": "1.2.3.4"}, "/opt/a b/.env", "x")
-        finally:
-            inst.run_remote = orig
-        self.assertIn("'/opt/a b/.env'", seen["cmd"])
-
-
 class TestXuiSqlEscaping(unittest.TestCase):
     def test_json_single_quotes_are_doubled_for_sqlite(self):
         captured = {}
@@ -721,7 +689,7 @@ class TestXuiGrpcInbound(unittest.TestCase):
     def _run(self):
         captured = {}
         orig_keys = inst.gen_x25519
-        inst.gen_x25519 = lambda cred=None: ("PRIV", "PUB")
+        inst.gen_x25519 = lambda: ("PRIV", "PUB")
         try:
             with capture_sql(captured):
                 reality, _ = quiet(inst.xui_grpc_inbound, "U-1")
@@ -753,7 +721,7 @@ class TestXuiGrpcInbound(unittest.TestCase):
 
     def test_no_keys_means_no_inbound(self):
         orig = inst.gen_x25519
-        inst.gen_x25519 = lambda cred=None: (None, None)
+        inst.gen_x25519 = lambda: (None, None)
         try:
             self.assertIsNone(quiet(inst.xui_grpc_inbound, "U-1")[0])
         finally:
@@ -792,7 +760,7 @@ class TestXuiSqlAgainstSchema(unittest.TestCase):
         cdn = self._sql_of(inst.xui_cdn_inbound, "vk", 4443, "/upload/a",
                            "u-1", "sub-1")
         orig = inst.gen_x25519
-        inst.gen_x25519 = lambda cred=None: ("PRIV", "PUB")
+        inst.gen_x25519 = lambda: ("PRIV", "PUB")
         try:
             grpc = self._sql_of(inst.xui_grpc_inbound, "u-1")
         finally:
@@ -941,20 +909,6 @@ class TestReviewRegressions(unittest.TestCase):
         with open(path) as f:
             self.assertEqual(f.read(), "SECRET=1\n")
 
-    def test_write_remote_command_really_writes_file(self):
-        """Команду write_remote исполняет настоящий sh — как на сервере."""
-        path = os.path.join(tempfile.mkdtemp(), "new dir", "x.env")
-        orig = inst.run_remote
-        inst.run_remote = lambda cred, cmd, **kw: inst.run(cmd, **kw)
-        try:
-            _, rc = inst.write_remote({"ip": "1.2.3.4"}, path, "A='b c'\n", mode=0o600)
-        finally:
-            inst.run_remote = orig
-        self.assertEqual(rc, 0)
-        with open(path) as f:
-            self.assertEqual(f.read(), "A='b c'\n")
-        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-
     def test_docker_mirror_skipped_on_401(self):
         # реестр без авторизации отвечает 401 — он доступен, зеркало не нужно
         with fake_run({"registry-1.docker.io": ("401", 0)}) as cmds:
@@ -967,20 +921,21 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertTrue(any("daemon.json" in c for c in cmds))
 
     def test_swap_fstab_append_is_grouped(self):
-        orig = inst.put_file
-        inst.put_file = lambda *a, **kw: None
+        orig = inst.write_file
+        inst.write_file = lambda *a, **kw: None
         try:
             with fake_run({"swapon --show": ("", 1)}) as cmds:
                 quiet(inst.tune_os)
         finally:
-            inst.put_file = orig
+            inst.write_file = orig
         swap = next(c for c in cmds if "fallocate" in c)
         self.assertIn("{ grep -q swapfile /etc/fstab || echo", swap)
 
     def test_detect_ssh_ports_merges_sources(self):
-        runner = lambda cmd, **kw: ("2222\n22\n\n2222\n", 0)
-        self.assertEqual(inst.detect_ssh_ports(runner), [22, 2222])
-        self.assertEqual(inst.detect_ssh_ports(lambda c, **k: ("", 1)), [22])
+        with fake_run({"sshd -T": ("2222\n22\n\n2222\n", 0)}):
+            self.assertEqual(inst.detect_ssh_ports(), [22, 2222])
+        with fake_run({"sshd -T": ("", 1)}):
+            self.assertEqual(inst.detect_ssh_ports(), [22])
 
     def test_restrict_2222_resolves_ipv4_only(self):
         with fake_run({"getent": ("5.6.7.8", 0), "ufw status": ("", 1)}) as cmds:
@@ -1102,6 +1057,51 @@ class TestSupplyChainAndApt(unittest.TestCase):
         self.assertNotIn("kill -9", joined)
         self.assertNotIn("rm -f /var/lib/dpkg/lock", joined)
         self.assertTrue(all("DPkg::Lock::Timeout" in c for c in cmds if "apt-get" in c))
+
+
+class TestModeRenumbering(unittest.TestCase):
+    """Старый режим 2 (нода по SSH) убран, 3 -> 2 и 4 -> 3."""
+
+    def test_removed_remote_node_mode_is_gone(self):
+        for name in ("setup_remote_node", "write_remote", "put_file"):
+            self.assertFalse(hasattr(inst, name), name)
+
+    def test_mode_4_is_refused_with_explanation(self):
+        with self.assertRaises(SystemExit):
+            quiet(inst.check_mode_renumbering, "4")
+        _, out = quiet(lambda: self.assertRaises(
+            SystemExit, inst.check_mode_renumbering, "4"))
+        self.assertIn("--mode 3", out)
+
+    def test_mode_3_warns_about_changed_meaning(self):
+        _, out = quiet(inst.check_mode_renumbering, "3")   # не tty: только предупреждение
+        self.assertIn("только CDN", out)
+        self.assertIn("--mode 2", out)
+
+    def test_current_modes_pass_through_silently(self):
+        for mode in ("1", "2"):
+            value, out = quiet(inst.check_mode_renumbering, mode)
+            self.assertEqual(value, mode)
+            self.assertEqual(out, "")
+
+    def test_panel_key_accepts_old_node_key_spelling(self):
+        for flag in ("--panel-key", "--node-key"):
+            argv = sys.argv
+            sys.argv = ["installer", "--mode", "2", flag, "/root/id_rsa"]
+            try:
+                self.assertEqual(inst.parse_args().panel_key, "/root/id_rsa", flag)
+            finally:
+                sys.argv = argv
+
+    def test_help_mentions_three_modes_only(self):
+        argv = sys.argv
+        sys.argv = ["installer"]
+        try:
+            args = inst.parse_args()
+        finally:
+            sys.argv = argv
+        self.assertFalse(hasattr(args, "node_ip"))
+        self.assertFalse(hasattr(args, "node_pass"))
 
 
 if __name__ == "__main__":
