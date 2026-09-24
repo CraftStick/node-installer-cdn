@@ -1789,7 +1789,7 @@ def install_remnawave(cfg):
                                       path,
                                       inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
     add_inbounds_to_squad(api, inbound_uuids)
-    sub_url = create_remnawave_user(api, "user1", user_uuid, domain)
+    sub_url, user_uuid = create_remnawave_user(api, "user1", user_uuid, domain)
 
     return {"token": token, "user_uuid": user_uuid, "sub_url": sub_url,
             "reality": reality, "prof_uuid": prof_uuid,
@@ -2101,20 +2101,20 @@ def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
                           inbound_uuid=None):
     """Создать CDN-хост и привязать к профилю/инбаунду.
 
+    Привязка едет ВЛОЖЕННЫМ объектом inbound — так с 3.4: плоские
+    configProfileUuid/configProfileInboundUuid панель отвергает целиком
+    («Validation failed», path ["inbound"], expected object), и хост не
+    создавался вовсе.
+
     Имя поля xhttp-extra в разных ревизиях панели пишется то xhttpExtraParams,
-    то xHttpExtraParams. Ставим ОБА — валидатор молча срезает лишнее.
+    то xHttpExtraParams. Ставим ОБА — лишнее валидатор срезает.
     api(method, path, data) -> (resp, code): работает и локально, и по SSH.
     """
     if not prof_uuid:
         warn("нет profile_uuid — хост CDN не создан"); return None
     host = {
-        "profileUuid": prof_uuid,
-        "configProfileUuid": prof_uuid,
-        # 3.x ссылается на инбаунд по uuid; тег оставлен для старых панелей,
-        # лишние ключи валидатор молча срезает
-        "configProfileInboundUuid": inbound_uuid,
-        "inboundUuid": inbound_uuid,
-        "inboundTag": inbound_tag,
+        "inbound": {"configProfileUuid": prof_uuid,
+                    "configProfileInboundUuid": inbound_uuid},
         "remark": "CDN %s" % cdn_domain,
         "address": cdn_domain,
         "port": 443,
@@ -2135,7 +2135,8 @@ def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
     if huuid:
         ok("Host UUID: %s — привязан к ноде" % huuid)
     else:
-        warn("Ответ создания хоста: %s" % json.dumps(resp)[:160])
+        warn("Хост CDN не создан — клиенту некуда подключаться:")
+        say("  " + json.dumps(resp, ensure_ascii=False)[:400])
     return huuid
 
 
@@ -2241,12 +2242,21 @@ def create_remnawave_user(api, username, vless_uuid, domain):
     }
     resp, _ = api("POST", "users", body)
     r = api_response(resp)
-    short = r.get("shortUuid", "")
-    if r.get("uuid"):
-        ok("User UUID: %s  Short: %s" % (r.get("uuid"), short))
+    short = r.get("shortUuid") or ""
+    # 3.x не кладёт в ответ uuid — признак успеха тут shortUuid, по нему и
+    # строится подписка. Раньше по отсутствию uuid печаталось предупреждение
+    # о «неудаче» при полностью созданном пользователе.
+    if short:
+        ok("Юзер %s создан, Short: %s" % (username, short))
     else:
-        warn("Ответ создания юзера: %s" % json.dumps(resp)[:160])
-    return "https://%s/api/sub/%s" % (domain, short) if short else ""
+        warn("Юзер не создан — подписки не будет:")
+        say("  " + json.dumps(resp, ensure_ascii=False)[:400])
+    # Панель может выдать клиенту свой vless-uuid: в ссылку должен уйти именно
+    # он, иначе клиент подключается с id, которого нода не знает.
+    real_uuid = r.get("vlessUuid") or vless_uuid
+    if real_uuid != vless_uuid:
+        say("  Панель выдала свой VLESS UUID: %s" % real_uuid)
+    return ("https://%s/api/sub/%s" % (domain, short) if short else ""), real_uuid
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2551,8 +2561,8 @@ def install_node_only(cfg):
     add_inbounds_to_squad(api, inbound_uuids)
     pdom, _ = run_remote(panel, 'grep -oP "PANEL_DOMAIN=\\K.*" '
                          '/opt/remnawave/.env 2>/dev/null')
-    sub_url = create_remnawave_user(api, "user1", user_uuid,
-                                    pdom.strip() or panel["ip"])
+    sub_url, user_uuid = create_remnawave_user(api, "user1", user_uuid,
+                                               pdom.strip() or panel["ip"])
     return {"user_uuid": user_uuid, "prof_uuid": prof_uuid, "my_ip": my_ip,
             "sub_url": sub_url, "host_uuid": host_uuid, "api": api,
             "reality": reality}
@@ -3146,6 +3156,9 @@ def main():
                 ("Пароль", admin_pw),
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
                 ("CDN", cdn_val)]
+    if mode in ("1", "2") and not result.get("host_uuid"):
+        # Без хоста подписка пустая: клиенту не к чему подключаться
+        rows.append(("Хост", "НЕ создан — добавь в панели вручную"))
     if client_domain:
         rows.append(("CNAME", "%s → %s" % (client_domain, cdn_domain)))
     if result.get("sub_url"):

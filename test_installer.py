@@ -404,7 +404,12 @@ class TestHostAndSquad(unittest.TestCase):
         self.assertEqual(body["address"], "cdn.example.net")
         self.assertEqual(body["sni"], "cdn.example.net")
         self.assertEqual(body["path"], "/uploadfiles/abc/")
-        self.assertEqual(body["configProfileInboundUuid"], "I-1")
+        # 3.4+: привязка только вложенным объектом, плоские поля панель отвергает
+        self.assertEqual(body["inbound"], {"configProfileUuid": "P-1",
+                                           "configProfileInboundUuid": "I-1"})
+        for flat in ("configProfileUuid", "configProfileInboundUuid",
+                     "inboundUuid", "profileUuid"):
+            self.assertNotIn(flat, body)
         # оба написания xhttp-extra: панели 2.7.x и 2.8+
         self.assertEqual(body["xhttpExtraParams"]["mode"], "packet-up")
         self.assertEqual(body["xHttpExtraParams"]["mode"], "packet-up")
@@ -415,6 +420,16 @@ class TestHostAndSquad(unittest.TestCase):
         self.assertIsNone(huuid)
         self.assertEqual(api.calls, [])
         self.assertIn("нет profile_uuid", out)
+
+    def test_host_rejection_is_reported_with_panel_message(self):
+        api = FakeApi({("POST", "hosts"): (
+            {"statusCode": 400, "message": "Validation failed",
+             "errors": [{"path": ["inbound"], "message": "Invalid input"}]}, 400)})
+        huuid, out = quiet(inst.create_remnawave_host, api, "P-1", "T",
+                           "cdn.example.net", "/a", inbound_uuid="I-1")
+        self.assertIsNone(huuid)
+        self.assertIn("Validation failed", out)      # видно, что именно не так
+        self.assertIn("клиенту некуда подключаться", out)
 
     def test_update_host_moves_address_sni_and_host(self):
         api = FakeApi({("PATCH", "hosts"): ({"response": {"uuid": "H-1"}}, 200)})
@@ -516,18 +531,39 @@ class TestCreateUser(unittest.TestCase):
                                                   "uuid": "S-1"}]}}, 200),
             ("POST", "users"): (
                 {"response": {"uuid": "U-1", "shortUuid": "abc123"}}, 201)})
-        url, _ = quiet(inst.create_remnawave_user, api, "user1", "V-1", "d.com")
+        (url, uuid), _ = quiet(inst.create_remnawave_user, api, "user1", "V-1",
+                               "d.com")
         self.assertEqual(url, "https://d.com/api/sub/abc123")
+        self.assertEqual(uuid, "V-1")            # панель своего не выдала
         body = [c for c in api.calls if c[0] == "POST"][0][2]
         self.assertEqual(body["vlessUuid"], "V-1")
         self.assertEqual(body["activeInternalSquads"], ["S-1"])
 
+    def test_success_is_judged_by_short_uuid_not_uuid(self):
+        # 3.x не кладёт uuid в ответ: раньше созданный юзер считался провалом
+        api = FakeApi({("GET", "internal-squads"): ({"response": {}}, 200),
+                       ("POST", "users"): ({"response": {"id": 2,
+                                                         "shortUuid": "sh1",
+                                                         "username": "user1"}}, 201)})
+        (url, _), out = quiet(inst.create_remnawave_user, api, "user1", "V-1", "d.com")
+        self.assertEqual(url, "https://d.com/api/sub/sh1")
+        self.assertIn("Юзер user1 создан", out)
+        self.assertNotIn("▲", out)
+
+    def test_panel_issued_vless_uuid_wins_over_ours(self):
+        api = FakeApi({("GET", "internal-squads"): ({"response": {}}, 200),
+                       ("POST", "users"): ({"response": {"shortUuid": "sh1",
+                                                         "vlessUuid": "PANEL-1"}}, 201)})
+        (_, uuid), out = quiet(inst.create_remnawave_user, api, "user1", "V-1", "d.com")
+        self.assertEqual(uuid, "PANEL-1")        # именно он уйдёт в vless-ссылку
+        self.assertIn("PANEL-1", out)
+
     def test_missing_short_uuid_yields_no_url(self):
         api = FakeApi({("GET", "internal-squads"): ({"response": {}}, 200),
                        ("POST", "users"): ({"message": "exists"}, 400)})
-        url, out = quiet(inst.create_remnawave_user, api, "user1", "V-1", "d.com")
+        (url, _), out = quiet(inst.create_remnawave_user, api, "user1", "V-1", "d.com")
         self.assertEqual(url, "")
-        self.assertIn("Ответ создания юзера", out)
+        self.assertIn("Юзер не создан", out)
 
 
 class TestRwApiSsh(unittest.TestCase):
