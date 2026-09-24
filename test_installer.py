@@ -779,37 +779,53 @@ class TestUiHelpers(unittest.TestCase):
 
 
 class TestCdnInstructions(unittest.TestCase):
+    def _print(self, provider, client="cdn.example.com"):
+        _, out = quiet(inst.print_cdn_instructions, provider,
+                       "origin.example.com", client, "1.2.3.4", "/uploadfiles/abc")
+        return out
+
     def test_every_provider_prints_origin_and_path(self):
         for provider in inst.CDN_NAMES.values():
-            _, out = quiet(inst.print_cdn_instructions, provider,
-                           "origin.example.com", "1.2.3.4", "/uploadfiles/abc")
+            out = self._print(provider)
             self.assertIn("origin.example.com", out, provider)
             self.assertIn("/uploadfiles/abc", out, provider)
             self.assertNotIn("%s", out, provider)
 
     def test_query_string_warning_present_everywhere(self):
         for provider in inst.CDN_NAMES.values():
-            _, out = quiet(inst.print_cdn_instructions, provider,
-                           "origin.example.com", "1.2.3.4", "/a/b")
-            self.assertIn("query", out.lower(), provider)
+            self.assertIn("query", self._print(provider).lower(), provider)
 
     def test_unknown_provider_is_not_fatal(self):
-        _, out = quiet(inst.print_cdn_instructions, "nope", "o.com", "1.2.3.4", "/a")
-        self.assertIn("o.com", out)
+        out = self._print("nope")
+        self.assertIn("origin.example.com", out)
 
     def test_caching_and_compression_are_switched_off_everywhere(self):
         for provider in inst.CDN_NAMES.values():
-            _, out = quiet(inst.print_cdn_instructions, provider,
-                           "origin.example.com", "1.2.3.4", "/a/b")
-            self.assertIn("Кеширование", out, provider)
+            out = self._print(provider)
+            self.assertIn("Кеш", out, provider)
             self.assertIn("Gzip/Brotli", out, provider)
 
     def test_removed_providers_have_no_instructions(self):
         for provider in ("vk", "beeline"):
-            _, out = quiet(inst.print_cdn_instructions, provider,
-                           "origin.example.com", "1.2.3.4", "/a/b")
+            out = self._print(provider)
             for word in ("VK Cloud", "CDNvideo", "trbcdn"):
                 self.assertNotIn(word, out, provider)
+
+    def test_yandex_steps_carry_real_values_not_placeholders(self):
+        """Инструкция должна быть готовой к копированию, без «например»."""
+        out = self._print("yandex", "jsq98fs.example.com")
+        for value in ("jsq98fs-example-com",              # имя сертификата
+                      "_acme-challenge.jsq98fs.example.com",
+                      "origin-origin",                     # имя группы источников
+                      "Доменное имя ресурса:   jsq98fs.example.com",
+                      "Имя SNI-хоста:          origin.example.com",
+                      "CNAME  jsq98fs.example.com"):
+            self.assertIn(value, out)
+
+    def test_timeweb_does_not_demand_a_client_domain(self):
+        out = self._print("timeweb", "")
+        self.assertIn("1.2.3.4", out)
+        self.assertNotIn("Домен для клиентов", out)
 
 
 class TestCdnSelection(unittest.TestCase):

@@ -1524,6 +1524,15 @@ def remnawave_api_token(login_jwt):
     return ""
 
 
+NODE_NAME = "Server-CDN"          # как нода называется в панели
+NODE_COUNTRY = "RU"               # флаг в панели: трафик клиента входит через РФ
+
+
+def profile_name(cdn_name):
+    """Имя профиля в панели: CDN-YANDEX, CDN-TIMEWEB."""
+    return "CDN-%s" % cdn_name.upper()
+
+
 def _slug(prefix):
     return "%s-%s" % (prefix, rand(6, "abcdefghijklmnopqrstuvwxyz0123456789"))
 
@@ -1768,7 +1777,8 @@ def install_remnawave(cfg):
     user_uuid = str(_uuid.uuid4())
     ok("Основной вход: VLESS XHTTP packet-up, 127.0.0.1:%d, путь %s" % (xport, path))
     inbounds, reality = build_node_inbounds(cfg, user_uuid, xport, path)
-    prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
+    prof_uuid, tag2uuid = create_config_profile(api, profile_name(cfg["cdn"]),
+                                                inbounds)
     inbound_uuids = [u for u in (tag2uuid.get(i["tag"]) for i in inbounds) if u]
 
     # ── нода (remnanode на 127.0.0.1:2222 внутри docker gateway) ──
@@ -1779,7 +1789,7 @@ def install_remnawave(cfg):
                 "-f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'")
     gw = gw.strip() or "172.18.0.1"
     say("  Docker gateway: %s" % gw)
-    secret = create_remnawave_node(api, "node-local", gw, prof_uuid, inbound_uuids)
+    secret = create_remnawave_node(api, NODE_NAME, gw, prof_uuid, inbound_uuids)
     # Как и в режиме 2: без secretKey remnanode встаёт с пустым SECRET_KEY,
     # панель его не признаёт, а установка рапортует «ГОТОВО».
     if not secret:
@@ -1853,13 +1863,18 @@ def panel_node_secret(api):
     return ""
 
 
-def create_remnawave_node(api, name, address, prof_uuid, inbound_uuids):
+def create_remnawave_node(api, name, address, prof_uuid, inbound_uuids,
+                          country=NODE_COUNTRY):
     """Зарегистрировать ноду в панели. Возвращает SECRET_KEY для неё или ''.
 
     activeInbounds — uuid инбаундов из ответа профиля, не теги.
+    countryCode — только подпись с флагом в панели: без него нода значится
+    как Unknown. Ставим страну входа клиента (через российский CDN), а не
+    страну, где физически стоит сервер.
     """
     resp, code = api("POST", "nodes", {
         "name": name, "address": address, "port": 2222,
+        "countryCode": country,
         "configProfile": {"activeConfigProfileUuid": prof_uuid,
                           "activeInbounds": [u for u in inbound_uuids if u]}})
     r = api_response(resp)
@@ -2090,6 +2105,13 @@ def create_config_profile(api, name, inbounds, tries=3):
     for label, inbs in variants:
         for attempt in range(tries):
             resp, code = api("POST", "config-profiles", build_xray_profile(name, inbs))
+            # Имя профиля осмысленное (CDN-YANDEX), а на чужой панели такое
+            # может уже существовать: тогда добавляем хвост и пробуем ещё раз
+            if code in (400, 409) and re.search(
+                    r"exist|unique|taken|занят", json.dumps(resp), re.I):
+                name = "%s-%s" % (name, rand(4, "abcdefghijklmnopqrstuvwxyz0123456789"))
+                say("  Профиль с таким именем уже есть — беру «%s»" % name)
+                continue
             if code != 0:
                 break        # ответ получен — повтор его не изменит
             say("  API не ответил (%d/%d), жду 10 сек..." % (attempt + 1, tries))
@@ -2424,60 +2446,96 @@ server {
 #  Инструкции по настройке CDN (ручной шаг у провайдера)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def print_cdn_instructions(provider, origin, my_ip, path):
-    """Печать инструкции по созданию CDN-ресурса. provider: yandex|timeweb."""
+def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
+    """Инструкция провайдеру — с подставленными значениями, а не примерами.
+
+    provider: yandex|timeweb. client_domain — домен, который увидят клиенты;
+    у Yandex он обязателен (на техническом домене нет вашего сертификата), у
+    Timeweb может быть пустым — там технический домен годится как есть.
+    """
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "Настройка CDN у провайдера")
           + _c(C_DIM, " · %s" % provider), flush=True)
     hr()
-    say("  Origin — %s (A -> %s), путь туннеля — %s/\n"
-        % (origin, my_ip, "/" + path.strip("/")))
+    say("  Origin:              %s   (A -> %s)" % (origin, my_ip))
+    if client_domain:
+        say("  Домен для клиентов:  %s" % client_domain)
+    say("  Путь туннеля:        /%s/\n" % path.strip("/"))
+
     if provider == "yandex":
-        say("""
-  На техническом домене Yandex вашего сертификата нет, поэтому клиентам нужен
-  СВОЙ домен перед CDN (например cdn.example.com). Порядок такой:
+        cert = (client_domain or "").replace(".", "-")
+        say("""  ШАГ 1 · Сертификат на клиентский домен
+  console.yandex.cloud -> Certificate Manager -> Создать сертификат
+       - Имя:            %s
+       - Домены:         %s
+       - Тип проверки:   DNS
+  Yandex покажет запись для проверки вида
+       _acme-challenge.%s  ->  <значение>.cm.yandexcloud.net
+  Заведите её у DNS-провайдера как есть (DNS only) и дождитесь статуса
+  "Issued" — это 5-30 минут. После выпуска запись НЕ удалять: по ней идёт
+  автопродление сертификата.
 
-  1. Certificate Manager -> сертификат от Let's Encrypt:
-       - Домены: клиентский домен
-       - Тип проверки: DNS -> заведите у DNS-провайдера ТУ запись, которую
-         покажет Yandex (тип и значение берите из консоли), дождитесь "Issued"
-       - После выпуска запись НЕ удалять: по ней идёт автопродление
+  ШАГ 2 · Группа источников
+  console.yandex.cloud -> Cloud CDN -> Группы источников -> Создать
+       - Название:       origin-%s
+       - Источник:       %s
+       - Приоритет:      Основной
+  Отдельным шагом не просто так: если создавать ресурс копированием чужой
+  конфигурации, сюда подтянется чужой источник, и CDN пойдёт не на ваш сервер.
 
-  2. Cloud CDN -> Группы источников -> создать группу:
-       - Источник: %s, приоритет "Основной"
-       - Отдельным шагом, потому что при копировании чужой конфигурации сюда
-         подтягивается чужой источник, и CDN идёт не на ваш сервер
+  ШАГ 3 · Ресурс
+  console.yandex.cloud -> Cloud CDN -> Создать ресурс
+    Основные настройки:
+       - Запрос контента:        Из группы источников
+       - Группа источников:      origin-%s
+       - Протокол к источникам:  HTTPS
+       - Задать SNI вручную:     ВКЛ
+       - Имя SNI-хоста:          %s
+       - Заголовок Host:         Своё значение
+       - Значение заголовка:     %s
+       - Доменное имя ресурса:   %s
+    Дополнительно:
+       - Тип сертификата:        Сертификат из Certificate Manager
+       - Сертификат:             %s
+       - Переадресация клиентов: с HTTP на HTTPS
+    Кеширование:
+       - Кеш CDN:                ВЫКЛ
+       - Кеш браузера:           ВЫКЛ
+       - Сегментация файлов:     ВЫКЛ
+       - Сжатие (Gzip/Brotli):   ВЫКЛ
+       - Query-параметры:        НЕ игнорировать
+    HTTP-заголовки и методы:
+       - Разрешённые методы:     оставить как есть (GET, HEAD, OPTIONS)
+         POST у Yandex нет вовсе, и это не мешает: туннель настроен на
+         аплинк GET-запросами.
 
-  3. Cloud CDN -> создать ресурс:
-       - Доменное имя ресурса: клиентский домен (НЕ origin)
-       - Источник: группа из шага 2, протокол HTTPS
-       - SNI вручную и заголовок Host: %s
-       - Сертификат: из шага 1
-       - Кеширование CDN и браузера: ВЫКЛ, сегментация больших файлов: ВЫКЛ
-       - Сжатие (Gzip/Brotli): ВЫКЛ
-       - Query string: НЕ игнорировать (в нём едет обвязка сессии)
-       - Методы: у Yandex доступны только GET, HEAD, OPTIONS. Так и надо:
-         туннель настроен на аплинк GET'ами (uplinkHTTPMethod), потому что
-         POST этот CDN не пропускает вовсе
+  ШАГ 4 · DNS
+  На странице ресурса, блок "Настройки DNS", будет значение вида
+  xxxxxxxx.topology.gslb.yccdn.ru. Заведите в Cloudflare:
+       CNAME  %s  ->  <это значение>   (DNS only)
 
-  4. На странице ресурса, блок "Настройки DNS", Yandex покажет значение вида
-     xxxxxxxx.topology.gslb.yccdn.ru — направьте на него клиентский домен
-     CNAME-записью. Установщик спросит оба домена и покажет готовую запись.
-
-  После каждого сохранения ресурс раскатывается по узлам до 15 минут: коды
-  ответа в это время скачут между 000, 502 и 200. Это нормально, повторные
-  правки только перезапускают отсчёт.
-""" % (origin, origin))
+  Ресурс раскатывается по узлам до 15 минут, и всё это время коды ответа
+  скачут между 000, 502 и 200 — так и должно быть. Повторные сохранения
+  только перезапускают отсчёт.
+""" % (cert, client_domain, client_domain,
+       origin.split(".")[0], origin, origin.split(".")[0],
+       origin, origin, client_domain, cert, client_domain))
     elif provider == "timeweb":
-        say("""
-  Timeweb (timeweb.cloud) -> CDN -> Создать ресурс:
-    - Источник: вкладка "IP-адрес", IP: %s (порт 80), HTTPS: НЕ включать
-    - Кеширование CDN/браузер: ВЫКЛ, Всегда онлайн: ВЫКЛ
-    - Игнорировать параметры запроса: ВЫКЛ (sessionID/seq в query!)
-    - HTTP/3: ВЫКЛ, Сжатие (Gzip/Brotli): ВЫКЛ
-  Технический домен xxx.cdn.twcstorage.ru создаётся автоматически. Свой домен
-  для клиентов, если он нужен, направляется на него CNAME-записью — установщик
-  спросит его следом и сам покажет готовую запись.
+        say("""  ШАГ 1 · Ресурс
+  timeweb.cloud -> CDN -> Создать ресурс
+       - Источник:               вкладка "IP-адрес", %s (порт 80)
+       - HTTPS к источнику:      НЕ включать
+       - Кеш CDN и браузера:     ВЫКЛ
+       - Всегда онлайн:          ВЫКЛ
+       - Query-параметры:        НЕ игнорировать
+       - HTTP/3:                 ВЫКЛ
+       - Сжатие (Gzip/Brotli):   ВЫКЛ
+
+  ШАГ 2 · Домен
+  Технический домен xxxxx.cdn.twcstorage.ru создаётся автоматически, его
+  можно отдать клиентам как есть — сертификат на нём уже валидный.
+  Если хотите свой домен, заведите на него CNAME к техническому и выпустите
+  для него сертификат в панели Timeweb, иначе клиент упрётся в ошибку TLS.
 """ % my_ip)
 
 
@@ -2566,12 +2624,15 @@ def install_node_only(cfg):
     # Запасной вход — как в режиме 1: раньше про него здесь спрашивали, а
     # инбаунд всё равно создавался только один, и ответ уходил в никуда.
     inbounds, reality = build_node_inbounds(cfg, user_uuid, xport, path)
-    prof_uuid, tag2uuid = create_config_profile(api, _slug("cdn"), inbounds)
+    prof_uuid, tag2uuid = create_config_profile(api, profile_name(cfg["cdn"]),
+                                                inbounds)
     inbound_uuids = [u for u in (tag2uuid.get(i["tag"]) for i in inbounds) if u]
 
     my_ip = get_ip()
-    secret = create_remnawave_node(api, "cdn-%s" % my_ip, my_ip, prof_uuid,
-                                   inbound_uuids)
+    # К чужой панели нода приезжает не одна: адрес в имени отличает её от
+    # соседних локаций
+    secret = create_remnawave_node(api, "%s-%s" % (NODE_NAME, my_ip), my_ip,
+                                   prof_uuid, inbound_uuids)
     # Без secretKey remnanode поднимется, но панель его не признает: получилась
     # бы установка, которая «прошла», а трафика через ноду нет. Останавливаемся
     # здесь — на этом сервере ещё ничего не запущено, откатывать нечего.
@@ -3162,31 +3223,35 @@ def main():
         result = install_cdn_only(cfg)
 
     # ── CDN-инструкция + ожидание ──
-    print_cdn_instructions(cdn_name, origin, my_ip, path)
+    # Клиентский домен нужен уже в инструкции: у Yandex он указывается и в
+    # сертификате, и в самом ресурсе, поэтому придумываем его заранее, а не
+    # спрашиваем в конце. Постоянный между запусками — как origin и путь.
+    client_domain = (args.client_domain or "").strip()
+    if client_domain and not RE_DOMAIN.match(client_domain):
+        err("Домен клиентов '%s' не похож на домен" % client_domain)
+        sys.exit(1)
+    if not client_domain and cdn_name == "yandex":
+        client_domain = state_value(
+            "client_domain", lambda: "%s.%s" % (rand_label(), domain))
+
+    print_cdn_instructions(cdn_name, origin, client_domain, my_ip, path)
     if not args.skip_cdn_wait:
         try:
             input("\n  " + _c(C_ACC, "❯") + " Enter когда CDN настроен и серт"
                   " выпущен" + _c(C_DIM, "  "))
         except (EOFError, KeyboardInterrupt):
             pass
-    # Домен уходит в хост панели и в vless-ссылку: опечатка здесь даёт
-    # рабочую на вид, но неподключаемую подписку
-    cdn_domain = ask_domain("CDN домен (например xxx.cdn.twcstorage.ru)",
+    # Технический домен уходит в CNAME; опечатка здесь даёт рабочую на вид,
+    # но неподключаемую подписку
+    cdn_domain = ask_domain("Технический домен CDN (из блока «Настройки DNS»)",
                             args.cdn_domain)
-
-    # Свой домен перед CDN: провайдер выдаёт технический, а клиентам обычно
-    # показывают собственный. Он и уезжает в подписку и в ссылку, поэтому
-    # спрашиваем до того, как хост переставят на домен CDN.
-    client_domain = ""
-    if cdn_domain:
+    if not client_domain:
         client_domain = ask_domain(
             "Свой домен для клиентов, CNAME на %s (Enter — пропустить)"
-            % cdn_domain, args.client_domain)
+            % (cdn_domain or "домен CDN"), "")
+    if cdn_domain or client_domain:
         callout("DNS для CDN",
                 cdn_dns_records(origin, my_ip, cdn_domain, client_domain))
-        if client_domain:
-            say("  На свой домен нужен сертификат у CDN-провайдера — без него "
-                "клиент упрётся в ошибку TLS")
     public_domain = client_domain or cdn_domain
 
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
