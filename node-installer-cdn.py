@@ -7,7 +7,7 @@ node-installer-cdn.py — установщик прокси-инфраструк
 -------
 Самодостаточный установщик: разворачивает панель + ноду + CDN-обвязку и
 связывает их между собой. Никуда не «звонит», кроме официальных репозиториев
-(docker, xray, 3x-ui, remnawave, letsencrypt) и ваших серверов по SSH.
+(docker, xray, remnawave, letsencrypt) и ваших серверов по SSH.
 Конфиги (nginx, docker-compose, systemd, sysctl, SQL) вшиты как есть.
 
 ЧТО ДЕЛАЕТ
@@ -16,13 +16,12 @@ node-installer-cdn.py — установщик прокси-инфраструк
   1  Панель + нода на этом сервере
   2  Нода + CDN к уже существующей панели (панель — по SSH)
   3  Только CDN перед уже работающей нодой
-Панель: Remnawave 3.x или 3x-ui. CDN: VK Cloud / Yandex Cloud / Beeline(CDNvideo)
-/ Timeweb.
+Панель: Remnawave 3.x. CDN: Yandex Cloud / Timeweb.
 
 ЗАПУСК
 ------
     sudo python3 node-installer-cdn.py                 # интерактивно
-    sudo python3 node-installer-cdn.py --mode 1 --panel 1 --cdn 1 --domain example.com
+    sudo python3 node-installer-cdn.py --mode 1 --cdn 1 --domain example.com
 
 ТРЕБОВАНИЯ: Ubuntu/Debian, root. Для режима 2 — sshpass (ставится сам).
 
@@ -44,7 +43,6 @@ import shlex
 import getpass
 import hashlib
 import argparse
-import tempfile
 import subprocess
 import urllib.error
 import urllib.parse
@@ -63,12 +61,6 @@ INSTALLER_VERSION = "2.0"             # версия установщика, п�
 XRAY_MIN_VERSION = "26.7.28"          # точная (не минимальная) версия xray-core для ноды
 REMNAWAVE_IMAGE  = "remnawave/backend:3"       # мажорный тег 3.x (офиц. compose)
 REMNANODE_IMAGE  = "ghcr.io/remnawave/node:latest"
-XUI_VERSION      = "v3.6.0"
-# SHA-256 install.sh 3x-ui на теге XUI_VERSION. Скрипт исполняется от root, а
-# запасной путь скачивания идёт через сторонний gh-proxy.com — без сверки
-# хеша прокси мог бы отдать что угодно. При смене XUI_VERSION обновить:
-#   curl -s https://raw.githubusercontent.com/mhsanaei/3x-ui/<тег>/install.sh | sha256sum
-XUI_INSTALL_SHA256 = "7bb41e811f2107a3182da9090f24893d3612b5b6310194a7dd1f9965ff29e0c8"
 POSTGRES_IMAGE   = "postgres:18.4"             # как в офиц. compose Remnawave 3.x
 VALKEY_IMAGE     = "valkey/valkey:9-alpine"    # 3.x: redis через unix-сокет
 
@@ -87,6 +79,8 @@ RE_IPV4   = re.compile(r"^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})
 # ничего не даёт, а предсказуемый порт нужен режиму 3 и ручной диагностике.
 XHTTP_PORT = 4443
 GRPC_PORT  = 2053          # запасной gRPC Reality-вход ноды Remnawave
+
+PANEL_PORT = 3000                     # Remnawave слушает только 127.0.0.1:3000
 
 CDN_CRT = "/etc/nginx/ssl/cdn.crt"
 CDN_KEY = "/etc/nginx/ssl/cdn.key"
@@ -937,7 +931,6 @@ def gen_x25519():
         "docker exec remnanode xray x25519 2>/dev/null",
         "xray x25519 2>/dev/null",
         "/usr/local/bin/xray x25519 2>/dev/null",
-        "/usr/local/x-ui/bin/xray x25519 2>/dev/null",
         "docker run --rm %s xray x25519 2>/dev/null" % REMNANODE_IMAGE,
     ]
     for cmd in variants:
@@ -972,7 +965,7 @@ def build_xhttp_inbound(port, path, tag, uuid=None):
 
     path у xray со слешем на конце: nginx проксирует всё, что под путём, а сам
     путь без слеша отдаёт 404. clients пустой — пользователей в конфиг ноды
-    подставляет панель; для 3x-ui клиент прописывается отдельно в xui_cdn_inbound.
+    подставляет панель.
     """
     return {
         "tag": tag,
@@ -1732,7 +1725,7 @@ def install_remnawave(cfg):
 
     # Веб-слой: без него панель остаётся на 127.0.0.1:3000, а CDN-origin
     # не существует — провайдеру нечего забирать.
-    setup_panel_web(cfg, xport, path, panel_port=3000)
+    setup_panel_web(cfg, xport, path)
 
     # ── профиль + инбаунды (CDN xhttp + опц. gRPC) ──
     step("Создание профиля, ноды, хоста и юзера через API")
@@ -2127,15 +2120,35 @@ def update_host_address(api, host_uuid, cdn_domain):
 
 
 def find_default_squad(api):
-    """UUID сквада Default-Squad, иначе первый попавшийся."""
+    """Сквад Default-Squad целиком (иначе первый попавшийся) или None.
+
+    Возвращается весь объект, а не только uuid: обновление сквада требует
+    полного списка его инбаундов, иначе чужие потерялись бы.
+    """
     resp, _ = api("GET", "internal-squads")
-    squads = api_response(resp).get("internalSquads") or []
+    squads = [s for s in (api_response(resp).get("internalSquads") or [])
+              if isinstance(s, dict) and s.get("uuid")]
     if not squads:
         return None
     for s in squads:
         if s.get("name") == "Default-Squad":
-            return s.get("uuid")
-    return squads[0].get("uuid")
+            return s
+    return squads[0]
+
+
+def squad_inbound_uuids(squad):
+    """uuid инбаундов, уже привязанных к скваду (в разных ревизиях — разный вид).
+
+    3.x отдаёт inbounds списком объектов {uuid, tag, ...}, но встречается и
+    голый список uuid — берём оба вида и молча пропускаем остальное.
+    """
+    uuids = []
+    for item in (squad.get("inbounds") or []):
+        if isinstance(item, dict):
+            item = item.get("uuid")
+        if isinstance(item, str) and item:
+            uuids.append(item)
+    return uuids
 
 
 def add_inbounds_to_squad(api, inbound_uuids):
@@ -2144,17 +2157,28 @@ def add_inbounds_to_squad(api, inbound_uuids):
     Обновление принимается только на корне коллекции: uuid сквада едет в теле,
     инбаунды — своими uuid. PATCH/POST/PUT по пути /internal-squads/<uuid>
     отвечают 404 (проверено на 3.2.3).
+
+    В теле уходит ПОЛНЫЙ список инбаундов сквада, поэтому свои uuid
+    объединяются с теми, что там уже есть. Раньше отправлялись только свои —
+    на существующей панели (режим 2) это выбрасывало из Default-Squad инбаунды
+    чужих нод, и их пользователи теряли подключения.
     """
     squad = find_default_squad(api)
     if not squad:
         warn("Default-Squad не найден"); return
-    uuids = [u for u in (inbound_uuids or []) if u]
-    if not uuids:
+    mine = [u for u in (inbound_uuids or []) if u]
+    if not mine:
         warn("нет uuid инбаундов — сквад не обновлён"); return
+    existing = squad_inbound_uuids(squad)
+    merged = existing + [u for u in mine if u not in existing]
+    if len(merged) == len(existing):
+        ok("Инбаунды уже в Default-Squad")
+        return
     resp, code = api("PATCH", "internal-squads",
-                     {"uuid": squad, "inbounds": uuids})
+                     {"uuid": squad["uuid"], "inbounds": merged})
     if code in (200, 201):
-        ok("%d инбаунд(ов) добавлено в Default-Squad" % len(uuids))
+        ok("%d инбаунд(ов) добавлено в Default-Squad (всего %d)"
+           % (len(merged) - len(existing), len(merged)))
     else:
         warn("Не удалось добавить инбаунды в сквад: %s" % json.dumps(resp)[:160])
 
@@ -2167,7 +2191,7 @@ def create_remnawave_user(api, username, vless_uuid, domain):
         "vlessUuid": vless_uuid,
         "trafficLimitBytes": 0,
         "expireAt": "2099-12-31T23:59:59.000Z",
-        "activeInternalSquads": [squad] if squad else [],
+        "activeInternalSquads": [squad["uuid"]] if squad else [],
     }
     resp, _ = api("POST", "users", body)
     r = api_response(resp)
@@ -2230,15 +2254,15 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY):
     return False
 
 
-def setup_panel_web(cfg, xport, path, panel_port):
+def setup_panel_web(cfg, xport, path):
     """nginx (или caddy) перед панелью и CDN-origin: режим 1, всё на одном сервере.
 
     Схема снята с работающего сервера: panel.conf на server_name <домен>
-    проксирует в 127.0.0.1:<panel_port>, а default_server отдаёт CDN-origin на
+    проксирует в 127.0.0.1:3000, а default_server отдаёт CDN-origin на
     origin.<домен> и заглушку на всё остальное. Панель светит сертификат
     браузеру, поэтому её vhost смотрит прямо в /etc/letsencrypt/live —
     продление подхватывается само. Origin остаётся на cdn.crt: его CDN всё
-    равно не проверяет. Общая часть для Remnawave и 3x-ui.
+    равно не проверяет.
     """
     domain = cfg["domain"]
     origin = cfg.get("origin_domain", domain)
@@ -2248,17 +2272,17 @@ def setup_panel_web(cfg, xport, path, panel_port):
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE
     write_decoy(origin)
     if apply_origin_front(cfg, xport, path,
-                          panel_domain=domain, panel_port=panel_port) == "caddy":
+                          panel_domain=domain, panel_port=PANEL_PORT) == "caddy":
         ok("caddy: CDN :443 -> 127.0.0.1:%d + панель %s (авто-TLS)" % (xport, domain))
         return
-    nginx_write_conf("panel.conf", nginx_panel_proxy(domain, panel_port))
+    nginx_write_conf("panel.conf", nginx_panel_proxy(domain, PANEL_PORT))
     ok("nginx: CDN :443 -> 127.0.0.1:%d, панель %s -> 127.0.0.1:%d"
-       % (xport, domain, panel_port))
+       % (xport, domain, PANEL_PORT))
     # LE для домена панели: без копирования, vhost переписываем на live-пути
     if issue_le_cert(domain, crt=None, key=None):
         live = "/etc/letsencrypt/live/%s" % domain
         nginx_write_conf("panel.conf", nginx_panel_proxy(
-            domain, panel_port, live + "/fullchain.pem", live + "/privkey.pem"))
+            domain, PANEL_PORT, live + "/fullchain.pem", live + "/privkey.pem"))
         ok("Панель на сертификате Let's Encrypt")
     else:
         warn("Панель осталась на self-signed — браузер будет ругаться")
@@ -2315,221 +2339,6 @@ server {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  3x-ui (панель со встроенным xray)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _remove_quietly(path):
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
-def download_verified(urls, sha256):
-    """Скачать файл с первого сработавшего URL, у которого совпал SHA-256.
-
-    Возвращает путь к временному файлу (удаляет вызывающий) или ''. Файл — из
-    mkstemp: root не должен писать по заранее известному пути в общем /tmp.
-    """
-    fd, path = tempfile.mkstemp(prefix="dl-")
-    os.close(fd)
-    for url in urls:
-        _, rc = run("curl -fsSL --max-time 60 -o %s %s" % (shq(path), shq(url)),
-                    timeout=120)
-        if rc != 0:
-            continue
-        with open(path, "rb") as f:
-            got = hashlib.sha256(f.read()).hexdigest()
-        if got == sha256:
-            return path
-        warn("Хеш %s не совпал (%s…) — файл отброшен" % (url, got[:12]))
-    _remove_quietly(path)
-    return ""
-
-
-def install_3xui_panel(admin_pw, port, base_path):
-    """Скачать и поставить 3x-ui неинтерактивно, задать admin/port/path."""
-    _, rc = run("test -f /usr/local/x-ui/x-ui && test -f /etc/x-ui/x-ui.db && echo ok")
-    if rc == 0:
-        ok("3x-ui уже установлен и работает — пропускаю переустановку")
-    else:
-        say("  Скачивание установщика 3x-ui %s..." % XUI_VERSION)
-        # Скрипт с тега, а не с master: master меняется без предупреждения, и
-        # с ним установка переставала бы совпадать с XUI_VERSION и с хешем
-        script = download_verified(
-            ["https://raw.githubusercontent.com/mhsanaei/3x-ui/%s/install.sh"
-             % XUI_VERSION,
-             "https://gh-proxy.com/https://raw.githubusercontent.com/mhsanaei/"
-             "3x-ui/%s/install.sh" % XUI_VERSION],
-            XUI_INSTALL_SHA256)
-        if not script:
-            err("Не удалось скачать установщик 3x-ui с верным хешем! Проверь интернет.")
-            sys.exit(1)
-        say("  Запуск установщика 3x-ui (может занять несколько минут)...")
-        # Порт скрипт читает из XUI_PANEL_PORT; прежний XUI_PORT он не знает,
-        # порт ставился только следующим `x-ui setting`
-        run("XUI_NONINTERACTIVE=1 XUI_DB_TYPE=sqlite XUI_USERNAME=admin "
-            "XUI_PASSWORD=%s XUI_PANEL_PORT=%d XUI_WEB_BASE_PATH=%s bash %s %s"
-            % (shq(admin_pw), port, shq(base_path), shq(script), XUI_VERSION),
-            timeout=900)
-        _remove_quietly(script)
-    _, rc = run("test -f /etc/x-ui/x-ui.db && echo OK")
-    if rc != 0:
-        err("3x-ui не установился корректно — нет /etc/x-ui/x-ui.db")
-        say("  Обычно это таймаут скачивания. Просто ЗАПУСТИ СКРИПТ СНОВА.")
-        sys.exit(1)
-    run("/usr/local/x-ui/x-ui setting -username admin -password %s -port %d "
-        "-webBasePath %s" % (shq(admin_pw), port, shq(base_path)))
-    run("systemctl restart x-ui")
-    ok("3x-ui установлен: порт=%d, путь=/%s" % (port, base_path.strip("/")))
-
-
-def xui_sql(sql):
-    """Выполнить SQL в /etc/x-ui/x-ui.db через sqlite3. True — применилось целиком.
-
-    Скрипт едет одной транзакцией под -bail: без них sqlite3 на ошибке в
-    середине не останавливается, а идёт дальше и оставляет базу наполовину
-    обновлённой — при этом возвращает 1, так что вызывающий видит «не вышло»,
-    а строки уже вписаны. -bail роняет sqlite3 на первом же отказе, COMMIT до
-    него не доходит, и транзакция откатывается сама при закрытии соединения.
-    """
-    if run("which sqlite3")[1] != 0:
-        pkg_install("sqlite3")
-    # mkstemp, а не фиксированный /tmp/_xui.sql: root не должен писать по
-    # заранее известному пути в общем /tmp (подложенный symlink)
-    fd, tmp = tempfile.mkstemp(prefix="xui-", suffix=".sql")
-    os.close(fd)
-    try:
-        write_file(tmp, "BEGIN;\n" + sql + "COMMIT;\n",
-                   mode=0o600)                      # в SQL едут uuid и пароли
-        out, rc = run("sqlite3 -bail /etc/x-ui/x-ui.db < %s 2>&1" % shq(tmp))
-    finally:
-        _remove_quietly(tmp)
-    if rc != 0:
-        warn("SQL ошибка: %s" % out[:160])
-    return rc == 0
-
-
-XUI_CDN_EMAIL  = "user1"
-XUI_GRPC_EMAIL = "user1-grpc"
-
-
-def _sql_json(obj):
-    """JSON-литерал для SQLite: одинарные кавычки удваиваются."""
-    return "'%s'" % json.dumps(obj).replace("'", "''")
-
-
-def xui_inbound_sql(tag, remark, listen, port, email, settings, stream, sniff):
-    """SQL пересоздания инбаунда 3x-ui вместе с его строкой client_traffics."""
-    return (
-        "DELETE FROM client_traffics WHERE email='%s';\n"
-        "DELETE FROM inbounds WHERE tag='%s';\n"
-        "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, "
-        "listen, port, protocol, settings, stream_settings, tag, sniffing) "
-        "VALUES (1,0,0,0,'%s',1,0,'%s',%d,'vless',%s,%s,'%s',%s);\n"
-        "INSERT INTO client_traffics (inbound_id, enable, email, up, down, "
-        "expiry_time, total, reset) VALUES ((SELECT id FROM inbounds WHERE tag='%s'),"
-        "1,'%s',0,0,0,0,0);\n"
-        % (email, tag, remark, listen, port, _sql_json(settings), _sql_json(stream),
-           tag, _sql_json(sniff), tag, email)
-    )
-
-
-def xui_cdn_inbound(tag, port, path, uuid, sub_id):
-    """Создать CDN xhttp inbound в 3x-ui напрямую в SQLite.
-
-    Клиент живёт не отдельной таблицей, а внутри JSON в inbounds.settings —
-    так устроена схема 3x-ui (inbounds / client_traffics / settings / users,
-    таблиц clients и client_inbounds в ней нет). client_traffics нужен только
-    под счётчики, и email в нём UNIQUE на всю базу: у gRPC-инбаунда поэтому
-    свой email, иначе второй INSERT ронял бы всю транзакцию.
-    """
-    email = XUI_CDN_EMAIL
-    stream = build_xhttp_inbound(port, path, tag, uuid)["streamSettings"]
-    settings = {"clients": [{"id": uuid, "email": email, "flow": "",
-                             "subId": sub_id}], "decryption": "none", "fallbacks": []}
-    sniff = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
-    sql = xui_inbound_sql(tag, "%s-CDN" % tag, "127.0.0.1", port, email,
-                          settings, stream, sniff)
-    if xui_sql(sql):
-        run("systemctl restart x-ui")
-        ok("Inbound создан через SQLite: %s-CDN" % tag)
-        return True
-    err("Inbound %s-CDN в 3x-ui не создан — основной вход через CDN не работает"
-        % tag)
-    return False
-
-
-def install_3xui(cfg):
-    """Install 3x-ui + CDN inbound (mode 1, panel=2). Single server."""
-    step("Установка 3x-ui")
-    domain = cfg["domain"]
-    path = cfg["path"]
-    admin_pw = cfg["admin_pass"]
-    xport = cfg["xport"]
-    # 20000..29999: не пересекается с портом gRPC-инбаунда (30000..40000),
-    # иначе изредка оба сервиса выбирали один порт и gRPC не поднимался
-    panel_port = _rng.randint(20000, 29999)
-    panel_path = rand(10, "abcdefghijklmnopqrstuvwxyz0123456789")
-
-    tune_os()
-    install_3xui_panel(admin_pw, panel_port, panel_path)
-
-    # Тот же веб-слой, что и у Remnawave: default_server отдаёт CDN-origin и
-    # заглушку, panel.conf — саму панель. Без origin-конфига xhttp-инбаунд
-    # 3x-ui слушал бы 127.0.0.1 в пустоту: снаружи в него никто не попадает.
-    setup_panel_web(cfg, xport, path, panel_port)
-
-    # CDN xhttp inbound
-    step("Создание %s CDN inbound" % cfg["cdn"])
-    uuid = str(_uuid.uuid4())
-    sub_id = rand(16)
-    # Это и есть весь смысл установки: без инбаунда фронт проксирует в пустоту,
-    # поэтому провал здесь — отказ, а не строчка в логе.
-    if not xui_cdn_inbound(cfg["cdn"], xport, path, uuid, sub_id):
-        say("  Проверь схему базы: sqlite3 /etc/x-ui/x-ui.db '.tables'")
-        sys.exit(1)
-
-    reality = None
-    if not cfg.get("no_grpc"):
-        reality = xui_grpc_inbound(uuid)
-
-    # Порт gRPC у 3x-ui случайный, а не 2053, как в профиле Remnawave: открывать
-    # надо именно тот, который занял инбаунд, иначе запасной вход остаётся за
-    # политикой deny incoming и не работает ровно тогда, когда он нужен.
-    firewall_setup(extra_tcp=([reality["port"]] if reality else []))
-
-    # Путь панели случайный — без него в адресной строке 3x-ui отдаёт 404,
-    # и войти в только что поставленную панель нельзя.
-    return {"user_uuid": uuid, "reality": reality,
-            "panel_url": "https://%s/%s/" % (domain, panel_path)}
-
-
-def xui_grpc_inbound(uuid):
-    """VLESS Reality gRPC inbound в 3x-ui (SQLite). Возвращает {pbk,sid,service} или None."""
-    priv, pub = gen_x25519()
-    if not priv:
-        say("  ПРОПУСК: не удалось сгенерировать x25519 ключи")
-        return None
-    step("Установка VLESS Reality gRPC")
-    port = _rng.randint(30000, 40000)
-    sid = rand(8, "0123456789abcdef")
-    service = _slug("grpc")
-    stream = build_grpc_inbound(port, uuid, priv, sid, service)["streamSettings"]
-    email = XUI_GRPC_EMAIL
-    settings = {"clients": [{"id": uuid, "email": email, "flow": ""}],
-                "decryption": "none"}
-    sniff = {"enabled": True, "destOverride": ["http", "tls"]}
-    sql = xui_inbound_sql("grpc-reality", "gRPC Reality", "", port, email,
-                          settings, stream, sniff)
-    if xui_sql(sql):
-        run("systemctl restart x-ui")
-        ok("gRPC Reality inbound создан на TCP порту %d" % port)
-        return {"pbk": pub, "sid": sid, "service": service, "port": port}
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  Инструкции по настройке CDN (ручной шаг у провайдера)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2541,51 +2350,59 @@ def print_cdn_instructions(provider, origin, my_ip, path):
     hr()
     say("  Origin — %s (A -> %s), путь туннеля — %s/\n"
         % (origin, my_ip, "/" + path.strip("/")))
-    if provider == "vk":
+    if provider == "yandex":
         say("""
-  VK Cloud CDN:
-    - Протокол к источнику: HTTP (порт 80)
-    - Источник: %s
-    - Заголовок Host: Пересылать
-    - SSL: Let's Encrypt
-    - Кеширование: ВЫКЛ (все 4 переключателя)
-    - Параметры запроса: НЕ игнорировать (sessionID и seq идут в query!)
-    - HTTP методы: GET, HEAD, OPTIONS
-    - Gzip: ВЫКЛ
-  CDN-домен выдаст сам VK Cloud.
-""" % origin)
-    elif provider == "yandex":
-        say("""
-  Yandex Certificate Manager -> создать сертификат (тип проверки DNS),
-  создать CNAME _acme-challenge.%s, дождаться статуса "Issued".
+  Yandex Certificate Manager -> создать сертификат на домен, которым будут
+  пользоваться клиенты (тип проверки DNS), создать CNAME _acme-challenge.<домен>,
+  дождаться статуса "Issued".
 
   Yandex Cloud CDN -> создать ресурс:
     - Источник: %s (HTTPS, SNI вручную = %s, Host = своё значение = %s)
-    - Кеширование: ВЫКЛ, Сжатие: ВЫКЛ
+    - Кеширование: ВЫКЛ, Сжатие (Gzip/Brotli): ВЫКЛ
     - Query string: НЕ игнорировать (sessionID и seq идут в query!)
     - Проверка сертификата источника: ВЫКЛ
-""" % (origin, origin, origin, origin))
-    elif provider == "beeline":
-        say("""
-  CDNvideo (panel.cdnvideo.ru):
-    - Адрес (Origin): %s:443
-    - HTTPS к источнику: ВКЛ, SNI-хост: %s, Host: передавать исходный
-    - Кеширование 2xx/3xx/4xx/5xx/browser: НЕ кешировать
-    - Кешировать с учётом query string: ВКЛ + "Учитывать все параметры"
-      !!! sessionID и seq идут в query — иначе туннель не поднимется
-    - Rewrite не нужен: nginx на origin уже слушает %s/ как каталог
-    - HTTP2 ВКЛ, HTTP3 ВЫКЛ, Brotli/Gzip ВЫКЛ
-  CDN-домен (xxx.a.trbcdn.net) выдаст сам CDNvideo.
-""" % (origin, origin, "/" + path.strip("/")))
+  Ресурс получит технический домен вида xxx.edgecdn.ru.
+""" % (origin, origin, origin))
     elif provider == "timeweb":
         say("""
   Timeweb (timeweb.cloud) -> CDN -> Создать ресурс:
-    - Источник: вкладка "IP-адрес", IP: %s, HTTPS: НЕ включать
+    - Источник: вкладка "IP-адрес", IP: %s (порт 80), HTTPS: НЕ включать
     - Кеширование CDN/браузер: ВЫКЛ, Всегда онлайн: ВЫКЛ
     - Игнорировать параметры запроса: ВЫКЛ (sessionID/seq в query!)
-    - HTTP/3: ВЫКЛ, Gzip: ВЫКЛ
-  Технический домен xxx.cdn.twcstorage.ru создаётся автоматически.
+    - HTTP/3: ВЫКЛ, Сжатие (Gzip/Brotli): ВЫКЛ
+  Технический домен xxx.cdn.twcstorage.ru создаётся автоматически. Свой домен
+  для клиентов, если он нужен, направляется на него CNAME-записью — установщик
+  спросит его следом и сам покажет готовую запись.
 """ % my_ip)
+
+
+def cdn_dns_records(origin, my_ip, cdn_domain, client_domain=""):
+    """Строки DNS-записей под CDN: A на origin и CNAME своего домена.
+
+    Домен CDN провайдер выдаёт технический (xxx.cdn.twcstorage.ru,
+    xxx.edgecdn.ru). Если клиентам показывают свой — он направляется на
+    технический именно CNAME-записью, A тут не годится: адреса edge-узлов
+    провайдер меняет без предупреждения.
+    """
+    rows = ["A      %s  ->  %s   (источник CDN, DNS only)" % (origin, my_ip)]
+    if client_domain and cdn_domain:
+        rows.append("CNAME  %s  ->  %s   (домен для клиентов)"
+                    % (client_domain, cdn_domain))
+    return rows
+
+
+def ask_domain(prompt, preset=""):
+    """Спросить домен, не принимая мусор. '' — пропущено или читать нечего."""
+    while True:
+        value = (preset or ask(prompt) or "").strip()
+        if not value or RE_DOMAIN.match(value):
+            return value
+        warn("'%s' не похож на домен" % value)
+        hint = homoglyph_hint(value)
+        if hint:
+            say("  " + hint)
+        if preset or not sys.stdin.isatty():
+            return ""
 
 
 def dns_wait(lines, skip=False):
@@ -2725,8 +2542,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="CDN Installer v%s" % INSTALLER_VERSION)
     p.add_argument("--mode", help="1=Panel+node here, "
                    "2=Node+CDN to existing panel, 3=CDN origin only")
-    p.add_argument("--panel", help="1=Remnawave, 2=3x-ui (mode 1)")
-    p.add_argument("--cdn", help="CDN provider: 1=VK 2=Yandex 3=Beeline 4=Timeweb")
+    # Панель только Remnawave: флаг остался ради старых команд (--panel 1)
+    p.add_argument("--panel", help=argparse.SUPPRESS)
+    p.add_argument("--cdn", help="CDN provider: yandex | timeweb "
+                   "(или номером: 1=Yandex, 2=Timeweb)")
     p.add_argument("--front", choices=["nginx", "caddy"], default="nginx",
                    help="Origin-фронт: nginx (по умолчанию) или caddy "
                         "(в режиме с панелью caddy обслуживает и панель "
@@ -2760,6 +2579,10 @@ def parse_args():
                    help="Не трогать прошлую установку (ставить поверх)")
     p.add_argument("--fresh", action="store_true",
                    help="Забыть сохранённый прогресс и начать с нуля")
+    p.add_argument("--cdn-domain", help="Технический домен ресурса CDN "
+                   "(например xxx.cdn.twcstorage.ru) — иначе спросим в конце")
+    p.add_argument("--client-domain", help="Свой домен для клиентов: CNAME на "
+                   "технический домен CDN. Без него клиенты идут на технический")
     p.add_argument("--skip-dns-wait", action="store_true")
     p.add_argument("--skip-cdn-wait", action="store_true")
     return p.parse_args()
@@ -2965,9 +2788,34 @@ def choose(prompt, options):
             no_input("нужен ответ на «%s»" % prompt)
 
 
-CDN_NAMES = {1: "vk", 2: "yandex", 3: "beeline", 4: "timeweb"}
-CDN_LABELS = {1: "VK Cloud", 2: "Yandex Cloud", 3: "Beeline (CDNvideo)",
-              4: "Timeweb"}
+CDN_NAMES = {1: "yandex", 2: "timeweb"}
+CDN_LABELS = {1: "Yandex Cloud", 2: "Timeweb"}
+
+
+def resolve_cdn(value):
+    """Провайдер из --cdn: имя ('yandex') или номер. '' — значение негодное.
+
+    VK Cloud и Beeline (CDNvideo) убраны, номера сдвинулись: раньше 2 был
+    Yandex, а 4 — Timeweb. Старый номер молча означал бы другого провайдера,
+    поэтому про смену нумерации говорим вслух. Установку это не рушит: выбор
+    провайдера влияет только на печатаемую инструкцию и имя тега инбаунда,
+    поэтому спрашивать подтверждение (как у --mode) здесь незачем.
+    """
+    value = (value or "").strip().lower()
+    if value in CDN_NAMES.values():
+        return value
+    if not value.isdigit():
+        return ""
+    num = int(value)
+    if num not in CDN_NAMES:
+        err("CDN '%s' не существует: VK Cloud и Beeline убраны, осталось %s"
+            % (value, ", ".join("%d=%s" % (i, CDN_LABELS[i])
+                                for i in sorted(CDN_LABELS))))
+        return ""
+    warn("Нумерация CDN изменилась (VK и Beeline убраны): %s — ставлю %s"
+         % (", ".join("%d=%s" % (i, CDN_LABELS[i]) for i in sorted(CDN_LABELS)),
+            CDN_LABELS[num]))
+    return CDN_NAMES[num]
 
 
 def final_selfcheck(cfg, xport, path):
@@ -3060,27 +2908,22 @@ def main():
     if mode not in ("1", "2", "3"):
         err("Режим '%s' не существует — есть 1, 2 и 3" % mode); sys.exit(1)
 
-    # ── панель: выбор есть только в режиме 1 ──
-    if mode == "1":
-        panel = args.panel or str(choose("Панель (Panel)?", ["Remnawave 3.x",
-                                  "3x-ui"]))
-        if panel not in ("1", "2"):
-            err("Панель '%s' не существует — 1=Remnawave, 2=3x-ui" % panel)
-            sys.exit(1)
-    else:
-        panel = "1"
+    # ── панель ──
+    # Выбора больше нет: 3x-ui убран, ставится Remnawave. Флаг --panel 1
+    # принимается молча, чтобы не ломать старые команды.
+    if args.panel and args.panel != "1":
+        err("Панель '%s' не поддерживается: 3x-ui убран, ставится Remnawave"
+            % args.panel)
+        sys.exit(1)
 
     # ── CDN: нужен во всех режимах ──
     if args.cdn:
-        cdn_n = int(args.cdn) if args.cdn.isdigit() else 0
+        cdn_name = resolve_cdn(args.cdn)
     else:
-        cdn_n = choose("CDN провайдер?",
-                       [CDN_LABELS[i] for i in sorted(CDN_LABELS)])
-    if cdn_n not in CDN_NAMES:
-        err("CDN '%s' не существует — %s" % (args.cdn, ", ".join(
-            "%d=%s" % (i, CDN_LABELS[i]) for i in sorted(CDN_LABELS))))
+        cdn_name = CDN_NAMES[choose("CDN провайдер?",
+                                    [CDN_LABELS[i] for i in sorted(CDN_LABELS)])]
+    if not cdn_name:
         sys.exit(1)
-    cdn_name = CDN_NAMES[cdn_n]
 
     domain = (args.domain or ask("Домен без http:// (Domain)") or "").strip()
     if not domain:
@@ -3129,7 +2972,7 @@ def main():
             "Да, gRPC Reality — прямой вход, работает при отказе CDN",
             "Нет, только XHTTP через CDN — минимум открытых портов наружу"]) == 1
 
-    cfg = {"mode": mode, "panel": panel, "cdn": cdn_name, "domain": domain,
+    cfg = {"mode": mode, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
            "no_grpc": not want_grpc, "xport": xport,
            "no_origin_le": args.no_origin_le, "front": args.front}
@@ -3154,10 +2997,8 @@ def main():
 
     # ── установка ──
     result = {}
-    if mode == "1" and panel == "1":
+    if mode == "1":
         result = install_remnawave(cfg)
-    elif mode == "1" and panel == "2":
-        result = install_3xui(cfg)
     elif mode == "2":
         cfg["panel_url"] = ssh_host(args.panel_url or ask_required(
             "IP/URL панели Remnawave", "без адреса панели подключиться некуда"))
@@ -3191,21 +3032,27 @@ def main():
             pass
     # Домен уходит в хост панели и в vless-ссылку: опечатка здесь даёт
     # рабочую на вид, но неподключаемую подписку
-    while True:
-        cdn_domain = ask("CDN домен (например xxx.cdn.twcstorage.ru)")
-        if not cdn_domain or RE_DOMAIN.match(cdn_domain):
-            break
-        warn("'%s' не похож на домен" % cdn_domain)
-        hint = homoglyph_hint(cdn_domain)
-        if hint:
-            say("  " + hint)
-        if not sys.stdin.isatty():
-            cdn_domain = ""
-            break
+    cdn_domain = ask_domain("CDN домен (например xxx.cdn.twcstorage.ru)",
+                            args.cdn_domain)
+
+    # Свой домен перед CDN: провайдер выдаёт технический, а клиентам обычно
+    # показывают собственный. Он и уезжает в подписку и в ссылку, поэтому
+    # спрашиваем до того, как хост переставят на домен CDN.
+    client_domain = ""
+    if cdn_domain:
+        client_domain = ask_domain(
+            "Свой домен для клиентов, CNAME на %s (Enter — пропустить)"
+            % cdn_domain, args.client_domain)
+        callout("DNS для CDN",
+                cdn_dns_records(origin, my_ip, cdn_domain, client_domain))
+        if client_domain:
+            say("  На свой домен нужен сертификат у CDN-провайдера — без него "
+                "клиент упрётся в ошибку TLS")
+    public_domain = client_domain or cdn_domain
 
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
-    if cdn_domain and result.get("host_uuid"):
-        update_host_address(result["api"], result["host_uuid"], cdn_domain)
+    if public_domain and result.get("host_uuid"):
+        update_host_address(result["api"], result["host_uuid"], public_domain)
 
     # ── проверка служб/портов/конфига ──
     try:
@@ -3214,7 +3061,7 @@ def main():
         warn("Само-проверка не завершилась: %s" % e)
 
     # ── финальный отчёт ──
-    cdn_val = cdn_domain or "— укажи после настройки провайдера"
+    cdn_val = public_domain or "— укажи после настройки провайдера"
     if mode == "3":
         rows = [("Режим", "только CDN"),
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
@@ -3226,27 +3073,29 @@ def main():
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
                 ("CDN", cdn_val)]
     else:
-        rows = [("Панель", result.get("panel_url") or "https://%s/" % domain),
+        rows = [("Панель", "https://%s/" % domain),
                 ("Логин", "admin"),
                 ("Пароль", admin_pw),
                 ("Origin", "%s  (A → %s)" % (origin, my_ip)),
                 ("CDN", cdn_val)]
+    if client_domain:
+        rows.append(("CNAME", "%s → %s" % (client_domain, cdn_domain)))
     if result.get("sub_url"):
         rows.append(("Подписка", result["sub_url"]))
     card("ГОТОВО · УСТАНОВКА ЗАВЕРШЕНА", rows, color=C_OK)
     state_clear()      # дошли до конца — продолжать нечего
 
-    if cdn_domain and result.get("user_uuid"):
+    if public_domain and result.get("user_uuid"):
         xpath = urllib.parse.quote("/" + path.strip("/") + "/", safe="")
         link = ("vless://%s@%s:443?type=xhttp&security=tls&sni=%s&fp=random"
                 "&alpn=%s&path=%s&host=%s&mode=packet-up&encryption=none#user1-%s"
-                % (result["user_uuid"], cdn_domain, cdn_domain,
+                % (result["user_uuid"], public_domain, public_domain,
                    urllib.parse.quote("h3,h2,http/1.1", safe=""),
-                   xpath, cdn_domain, cdn_name))
+                   xpath, public_domain, cdn_name))
         callout("VLESS CDN ссылка", [link], color=C_TITLE)
     if result.get("reality"):
-        # Всё, что нужно клиенту для запасного входа: без serviceName и порта
-        # (у 3x-ui он случайный) подключиться по этим PBK/SID нельзя.
+        # Всё, что нужно клиенту для запасного входа: без serviceName
+        # подключиться по этим PBK/SID нельзя.
         r = result["reality"]
         callout("Запасной вход · gRPC Reality", [
             "Адрес:      %s:%s" % (my_ip, r.get("port")),

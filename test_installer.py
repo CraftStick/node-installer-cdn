@@ -17,7 +17,6 @@ import hmac
 import hashlib
 import os
 import re
-import shlex
 import sys
 import contextlib
 import importlib.util
@@ -37,22 +36,6 @@ def quiet(fn, *a, **kw):
     with contextlib.redirect_stdout(buf):
         result = fn(*a, **kw)
     return result, buf.getvalue()
-
-
-@contextlib.contextmanager
-def capture_sql(store):
-    """Подменить xui_sql (и restart через run) на запись SQL в store['sql']."""
-    orig_sql, orig_run = inst.xui_sql, inst.run
-
-    def fake_sql(sql):
-        store["sql"] = sql
-        return True                      # «SQL применился» — иначе вызывающий бросит
-
-    inst.xui_sql, inst.run = fake_sql, lambda cmd, **kw: ("", 0)
-    try:
-        yield store
-    finally:
-        inst.xui_sql, inst.run = orig_sql, orig_run
 
 
 class TestValidation(unittest.TestCase):
@@ -448,12 +431,12 @@ class TestHostAndSquad(unittest.TestCase):
             {"response": {"internalSquads": [{"name": "Other", "uuid": "S-9"},
                                              {"name": "Default-Squad",
                                               "uuid": "S-1"}]}}, 200)})
-        self.assertEqual(inst.find_default_squad(api), "S-1")
+        self.assertEqual(inst.find_default_squad(api)["uuid"], "S-1")
 
     def test_first_squad_used_when_no_default(self):
         api = FakeApi({("GET", "internal-squads"): (
             {"response": {"internalSquads": [{"name": "Other", "uuid": "S-9"}]}}, 200)})
-        self.assertEqual(inst.find_default_squad(api), "S-9")
+        self.assertEqual(inst.find_default_squad(api)["uuid"], "S-9")
 
     def test_no_squads_returns_none(self):
         api = FakeApi({("GET", "internal-squads"): ({"response": {}}, 200)})
@@ -470,6 +453,40 @@ class TestHostAndSquad(unittest.TestCase):
         self.assertEqual(patch[1], "internal-squads")        # не /internal-squads/<uuid>
         self.assertEqual(patch[2], {"uuid": "S-1", "inbounds": ["I-1", "I-2"]})
         self.assertIn("2 инбаунд", out)
+
+    def test_existing_inbounds_of_other_nodes_are_kept(self):
+        """Режим 2 идёт на живую панель: чужие инбаунды обязаны уцелеть."""
+        api = FakeApi({
+            ("GET", "internal-squads"): (
+                {"response": {"internalSquads": [
+                    {"name": "Default-Squad", "uuid": "S-1",
+                     "inbounds": [{"uuid": "OLD-1", "tag": "NODE_A"},
+                                  {"uuid": "OLD-2", "tag": "NODE_B"}]}]}}, 200),
+            ("PATCH", "internal-squads"): ({"response": {}}, 200)})
+        _, out = quiet(inst.add_inbounds_to_squad, api, ["I-1"])
+        self.assertEqual(api.calls[-1][2],
+                         {"uuid": "S-1", "inbounds": ["OLD-1", "OLD-2", "I-1"]})
+        self.assertIn("всего 3", out)
+
+    def test_inbounds_given_as_bare_uuids_are_kept_too(self):
+        api = FakeApi({
+            ("GET", "internal-squads"): (
+                {"response": {"internalSquads": [
+                    {"name": "Default-Squad", "uuid": "S-1",
+                     "inbounds": ["OLD-1"]}]}}, 200),
+            ("PATCH", "internal-squads"): ({"response": {}}, 200)})
+        quiet(inst.add_inbounds_to_squad, api, ["I-1"])
+        self.assertEqual(api.calls[-1][2]["inbounds"], ["OLD-1", "I-1"])
+
+    def test_rerun_does_not_patch_when_nothing_new(self):
+        api = FakeApi({
+            ("GET", "internal-squads"): (
+                {"response": {"internalSquads": [
+                    {"name": "Default-Squad", "uuid": "S-1",
+                     "inbounds": [{"uuid": "I-1"}]}]}}, 200)})
+        _, out = quiet(inst.add_inbounds_to_squad, api, ["I-1"])
+        self.assertNotIn("PATCH", [c[0] for c in api.calls])
+        self.assertIn("уже в Default-Squad", out)
 
     def test_squad_not_touched_when_no_inbound_uuids(self):
         api = FakeApi({("GET", "internal-squads"): (
@@ -643,183 +660,6 @@ class TestWriteFile(unittest.TestCase):
             os.chdir(cwd)
 
 
-class TestXuiSqlEscaping(unittest.TestCase):
-    def test_json_single_quotes_are_doubled_for_sqlite(self):
-        captured = {}
-        with capture_sql(captured):
-            ok_flag, _ = quiet(inst.xui_cdn_inbound, "vk", 4443, "/upload/a",
-                               "u-1", "sub-1")
-        self.assertTrue(ok_flag)
-        sql = captured["sql"]
-        # uuid и subId живут внутри JSON в inbounds.settings: отдельной таблицы
-        # под клиентов в схеме 3x-ui нет
-        self.assertIn('"id": "u-1"', sql)
-        self.assertIn('"subId": "sub-1"', sql)
-        # значения-JSON вставлены как литералы, кавычки внутри удвоены
-        for chunk in re.findall(r"'(\{.*?\})'(?=[,)])", sql):
-            self.assertNotIn("''", chunk.replace("''''", ""))
-
-    def test_inbound_listens_on_loopback(self):
-        captured = {}
-        with capture_sql(captured):
-            quiet(inst.xui_cdn_inbound, "vk", 4443, "/upload/a", "u-1", "sub-1")
-        self.assertIn("'127.0.0.1',4443", captured["sql"])
-
-    def test_only_tables_that_exist_in_3xui_are_touched(self):
-        """В схеме 3x-ui есть inbounds и client_traffics; clients — нет."""
-        captured = {}
-        with capture_sql(captured):
-            quiet(inst.xui_cdn_inbound, "vk", 4443, "/upload/a", "u-1", "sub-1")
-        tables = set(re.findall(r"(?:INSERT INTO|DELETE FROM)\s+(\w+)",
-                                captured["sql"]))
-        self.assertEqual(tables, {"inbounds", "client_traffics"})
-
-    def test_xhttp_path_reaches_the_stream_settings(self):
-        captured = {}
-        with capture_sql(captured):
-            quiet(inst.xui_cdn_inbound, "vk", 4443, "/upload/a", "u-1", "sub-1")
-        self.assertIn('\\"path\\": \\"/upload/a/\\"'.replace("\\", ""),
-                      captured["sql"])
-
-
-class TestXuiGrpcInbound(unittest.TestCase):
-    """Порт gRPC у 3x-ui случайный — его надо и вернуть, и вписать в SQL,
-    иначе файрвол откроет не тот порт (см. install_3xui)."""
-
-    def _run(self):
-        captured = {}
-        orig_keys = inst.gen_x25519
-        inst.gen_x25519 = lambda: ("PRIV", "PUB")
-        try:
-            with capture_sql(captured):
-                reality, _ = quiet(inst.xui_grpc_inbound, "U-1")
-        finally:
-            inst.gen_x25519 = orig_keys
-        self.assertIsNotNone(reality)
-        return reality, captured["sql"]
-
-    def test_returns_everything_the_client_needs(self):
-        reality, _ = self._run()
-        self.assertEqual(reality["pbk"], "PUB")
-        self.assertEqual(set(reality), {"pbk", "sid", "service", "port"})
-        self.assertTrue(0 < reality["port"] < 65536)
-
-    def test_returned_port_is_the_one_written_to_the_database(self):
-        reality, sql = self._run()
-        self.assertIn(",%d,'vless'" % reality["port"], sql)
-
-    def test_private_key_never_leaves_the_server(self):
-        reality, _ = self._run()
-        self.assertNotIn("PRIV", json.dumps(reality))
-
-    def test_email_differs_from_cdn_inbound(self):
-        """client_traffics.email в 3x-ui UNIQUE — одинаковый email уронил бы INSERT."""
-        _, sql = self._run()
-        self.assertNotEqual(inst.XUI_CDN_EMAIL, inst.XUI_GRPC_EMAIL)
-        self.assertIn("'%s'" % inst.XUI_GRPC_EMAIL, sql)
-        self.assertNotIn("'%s'" % inst.XUI_CDN_EMAIL, sql)
-
-    def test_no_keys_means_no_inbound(self):
-        orig = inst.gen_x25519
-        inst.gen_x25519 = lambda: (None, None)
-        try:
-            self.assertIsNone(quiet(inst.xui_grpc_inbound, "U-1")[0])
-        finally:
-            inst.gen_x25519 = orig
-
-
-class TestXuiSqlAgainstSchema(unittest.TestCase):
-    """Сгенерированный SQL прогоняется по схеме 3x-ui.
-
-    Ровно это и не ловилось раньше: скрипт писал в clients/client_inbounds,
-    которых в базе нет, sqlite3 возвращал 1, и `systemctl restart x-ui` не
-    выполнялся — инбаунд в панели не появлялся.
-    """
-
-    SCHEMA = """
-    CREATE TABLE inbounds (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, up INTEGER,
-      down INTEGER, total INTEGER, remark TEXT, enable NUMERIC,
-      expiry_time INTEGER, listen TEXT, port INTEGER, protocol TEXT,
-      settings TEXT, stream_settings TEXT, tag TEXT UNIQUE, sniffing TEXT,
-      allocate TEXT);
-    CREATE TABLE client_traffics (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, inbound_id INTEGER, enable NUMERIC,
-      email TEXT UNIQUE, up INTEGER, down INTEGER, expiry_time INTEGER,
-      total INTEGER, reset INTEGER);
-    """
-
-    def _sql_of(self, fn, *a):
-        captured = {}
-        with capture_sql(captured):
-            quiet(fn, *a)
-        return captured["sql"]
-
-    def test_cdn_then_grpc_both_apply_to_a_real_schema(self):
-        import sqlite3
-        cdn = self._sql_of(inst.xui_cdn_inbound, "vk", 4443, "/upload/a",
-                           "u-1", "sub-1")
-        orig = inst.gen_x25519
-        inst.gen_x25519 = lambda: ("PRIV", "PUB")
-        try:
-            grpc = self._sql_of(inst.xui_grpc_inbound, "u-1")
-        finally:
-            inst.gen_x25519 = orig
-
-        conn = sqlite3.connect(":memory:")
-        try:
-            conn.executescript(self.SCHEMA)
-            conn.executescript(cdn)
-            conn.executescript(grpc)     # UNIQUE(email) не должен сработать
-            tags = [r[0] for r in
-                    conn.execute("SELECT tag FROM inbounds ORDER BY tag")]
-            self.assertEqual(tags, ["grpc-reality", "vk"])
-            emails = [r[0] for r in
-                      conn.execute("SELECT email FROM client_traffics ORDER BY email")]
-            self.assertEqual(emails, sorted([inst.XUI_CDN_EMAIL,
-                                             inst.XUI_GRPC_EMAIL]))
-            # client_traffics привязан к своему инбаунду, а не к NULL
-            joined = conn.execute(
-                "SELECT count(*) FROM client_traffics t "
-                "JOIN inbounds i ON i.id = t.inbound_id").fetchone()[0]
-            self.assertEqual(joined, 2)
-        finally:
-            conn.close()
-
-    def test_rerun_is_idempotent(self):
-        """Повторный запуск установщика не должен падать на UNIQUE."""
-        import sqlite3
-        cdn = self._sql_of(inst.xui_cdn_inbound, "vk", 4443, "/upload/a",
-                           "u-1", "sub-1")
-        conn = sqlite3.connect(":memory:")
-        try:
-            conn.executescript(self.SCHEMA)
-            conn.executescript(cdn)
-            conn.executescript(cdn)
-            self.assertEqual(
-                conn.execute("SELECT count(*) FROM inbounds").fetchone()[0], 1)
-            self.assertEqual(
-                conn.execute("SELECT count(*) FROM client_traffics").fetchone()[0], 1)
-        finally:
-            conn.close()
-
-
-class TestXuiSqlTransaction(unittest.TestCase):
-    def test_script_runs_as_one_transaction_under_bail(self):
-        seen = {"cmds": []}
-        orig_run, orig_write = inst.run, inst.write_file
-        inst.write_file = lambda path, content, mode=None: seen.__setitem__("sql", content)
-        inst.run = lambda cmd, **kw: (seen["cmds"].append(cmd), ("", 0))[1]
-        try:
-            self.assertTrue(inst.xui_sql("DELETE FROM inbounds;\n"))
-        finally:
-            inst.run, inst.write_file = orig_run, orig_write
-        self.assertTrue(seen["sql"].startswith("BEGIN;"))
-        self.assertTrue(seen["sql"].rstrip().endswith("COMMIT;"))
-        self.assertTrue(any("-bail" in c for c in seen["cmds"]),
-                        "без -bail sqlite3 не останавливается на первой ошибке")
-
-
 class TestUiHelpers(unittest.TestCase):
     def test_pad_truncates_and_fills_to_width(self):
         self.assertEqual(inst._pad("abc", 5), "abc  ")
@@ -858,6 +698,69 @@ class TestCdnInstructions(unittest.TestCase):
     def test_unknown_provider_is_not_fatal(self):
         _, out = quiet(inst.print_cdn_instructions, "nope", "o.com", "1.2.3.4", "/a")
         self.assertIn("o.com", out)
+
+    def test_caching_and_compression_are_switched_off_everywhere(self):
+        for provider in inst.CDN_NAMES.values():
+            _, out = quiet(inst.print_cdn_instructions, provider,
+                           "origin.example.com", "1.2.3.4", "/a/b")
+            self.assertIn("Кеширование", out, provider)
+            self.assertIn("Gzip/Brotli", out, provider)
+
+    def test_removed_providers_have_no_instructions(self):
+        for provider in ("vk", "beeline"):
+            _, out = quiet(inst.print_cdn_instructions, provider,
+                           "origin.example.com", "1.2.3.4", "/a/b")
+            for word in ("VK Cloud", "CDNvideo", "trbcdn"):
+                self.assertNotIn(word, out, provider)
+
+
+class TestCdnSelection(unittest.TestCase):
+    def test_only_yandex_and_timeweb_remain(self):
+        self.assertEqual(sorted(inst.CDN_NAMES.values()), ["timeweb", "yandex"])
+
+    def test_provider_accepted_by_name(self):
+        for name in ("yandex", "Timeweb", " timeweb "):
+            self.assertEqual(quiet(inst.resolve_cdn, name)[0], name.strip().lower())
+
+    def test_digits_follow_new_numbering_with_a_notice(self):
+        value, out = quiet(inst.resolve_cdn, "2")
+        self.assertEqual(value, "timeweb")           # раньше 2 был Yandex
+        self.assertIn("Нумерация CDN изменилась", out)
+
+    def test_removed_provider_numbers_are_refused(self):
+        for old in ("3", "4", "9"):
+            value, out = quiet(inst.resolve_cdn, old)
+            self.assertEqual(value, "")
+            self.assertIn("не существует", out)
+
+    def test_garbage_is_refused_without_traceback(self):
+        self.assertEqual(quiet(inst.resolve_cdn, "vk")[0], "")
+        self.assertEqual(quiet(inst.resolve_cdn, "")[0], "")
+
+
+class TestCdnDomains(unittest.TestCase):
+    def test_a_record_always_present_cname_only_with_client_domain(self):
+        rows = inst.cdn_dns_records("origin.e.com", "1.2.3.4", "x.cdn.tw.ru")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("A ", rows[0])
+        self.assertIn("origin.e.com", rows[0])
+        self.assertIn("1.2.3.4", rows[0])
+        rows = inst.cdn_dns_records("origin.e.com", "1.2.3.4", "x.cdn.tw.ru",
+                                    "cdn.e.com")
+        self.assertIn("CNAME", rows[1])
+        self.assertIn("cdn.e.com", rows[1])
+        self.assertIn("x.cdn.tw.ru", rows[1])
+
+    def test_cname_is_skipped_when_cdn_domain_unknown(self):
+        self.assertEqual(len(inst.cdn_dns_records("o.e.com", "1.2.3.4", "",
+                                                  "cdn.e.com")), 1)
+
+    def test_preset_domain_is_validated_not_trusted(self):
+        good, _ = quiet(inst.ask_domain, "?", "xxx.cdn.twcstorage.ru")
+        self.assertEqual(good, "xxx.cdn.twcstorage.ru")
+        bad, out = quiet(inst.ask_domain, "?", "not a domain")
+        self.assertEqual(bad, "")                    # не уедет в vless-ссылку
+        self.assertIn("не похож на домен", out)
 
 
 class TestConstants(unittest.TestCase):
@@ -970,81 +873,8 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertEqual(secret, "")
         self.assertIn("A112", out)
 
-    def test_xui_sql_uses_private_tempfile(self):
-        seen = {}
-        orig_write = inst.write_file
-        inst.write_file = lambda path, content, mode=None: seen.__setitem__("path", path)
-        try:
-            with fake_run() as cmds:
-                quiet(inst.xui_sql, "SELECT 1;\n")
-        finally:
-            inst.write_file = orig_write
-        self.assertNotEqual(seen["path"], "/tmp/_xui.sql")
-        self.assertFalse(os.path.exists(seen["path"]))
 
-
-class TestSupplyChainAndApt(unittest.TestCase):
-    def test_xui_install_hash_is_sha256_hex(self):
-        self.assertRegex(inst.XUI_INSTALL_SHA256, r"^[0-9a-f]{64}$")
-
-    def _download(self, files, sha):
-        """download_verified, где curl «скачивает» содержимое из files[url]."""
-        def fake(cmd, **kw):
-            *_, dest, url = shlex.split(cmd)      # curl ... -o <dest> <url>
-            if url not in files:
-                return "", 22
-            with open(dest, "w") as f:
-                f.write(files[url])
-            return "", 0
-
-        orig = inst.run
-        inst.run = fake
-        try:
-            return quiet(inst.download_verified, list(files) + ["http://down"], sha)
-        finally:
-            inst.run = orig
-
-    def test_download_verified_rejects_tampered_mirror(self):
-        good = hashlib.sha256(b"echo ok\n").hexdigest()
-        path, out = self._download({"http://proxy": "rm -rf /\n"}, good)
-        self.assertEqual(path, "")
-        self.assertIn("не совпал", out)
-
-    def test_download_verified_falls_back_to_matching_source(self):
-        good = hashlib.sha256(b"echo ok\n").hexdigest()
-        path, _ = self._download({"http://evil": "evil\n", "http://mirror": "echo ok\n"},
-                                 good)
-        try:
-            with open(path) as f:
-                self.assertEqual(f.read(), "echo ok\n")
-            self.assertFalse(path.startswith("/tmp/3xui"))
-        finally:
-            os.remove(path)
-
-    def test_xui_installer_is_pinned_and_gets_panel_port(self):
-        orig = (inst.download_verified, inst.run)
-        seen = {"cmds": []}
-
-        def fake_dl(urls, sha):
-            seen["urls"], seen["sha"] = urls, sha
-            return "/nonexistent/dl-x"
-
-        def fake_run(cmd, **kw):
-            seen["cmds"].append(cmd)
-            # «x-ui ещё не стоит», дальше всё успешно
-            return ("", 1) if cmd.startswith("test -f /usr/local/x-ui") else ("", 0)
-
-        inst.download_verified, inst.run = fake_dl, fake_run
-        try:
-            quiet(inst.install_3xui_panel, "Pw1", 23456, "base")
-        finally:
-            inst.download_verified, inst.run = orig
-        self.assertTrue(all("/%s/install.sh" % inst.XUI_VERSION in u for u in seen["urls"]))
-        self.assertFalse(any("/master/" in u for u in seen["urls"]))
-        self.assertEqual(seen["sha"], inst.XUI_INSTALL_SHA256)
-        runner = next(c for c in seen["cmds"] if "XUI_NONINTERACTIVE" in c)
-        self.assertIn("XUI_PANEL_PORT=23456", runner)
-
+class TestAptLocking(unittest.TestCase):
     def test_pkg_install_waits_for_lock_instead_of_killing(self):
         orig = (inst.fix_dns, inst.ensure_apt_mirror)
         inst.fix_dns = inst.ensure_apt_mirror = lambda cred=None: None
