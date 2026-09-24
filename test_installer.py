@@ -167,6 +167,29 @@ class TestSshHost(unittest.TestCase):
             self.assertEqual(inst.ssh_host(raw), want, raw)
 
 
+class TestXhttpSettings(unittest.TestCase):
+    """Набор снят с рабочей боевой конфигурации, менять его наугад нельзя."""
+
+    def test_matches_the_known_working_configuration(self):
+        self.assertEqual(inst.xhttp_settings("/api/v1/30030/sync"), {
+            "mode": "packet-up",
+            "path": "/api/v1/30030/sync/",
+            "xPaddingKey": "_dc",
+            "xPaddingHeader": "X-Cache",
+            "xPaddingMethod": "tokenish",
+            "uplinkHTTPMethod": "GET",
+            "xPaddingObfsMode": True,
+            "xPaddingPlacement": "queryInHeader",
+            "scMaxEachPostBytes": 524288,
+            "scMaxConcurrentPosts": 1,
+            "scMinPostsIntervalMs": 150,
+        })
+
+    def test_path_is_normalised_to_directory(self):
+        for raw in ("/a/b", "a/b", "/a/b/", "a/b/"):
+            self.assertEqual(inst.xhttp_settings(raw)["path"], "/a/b/")
+
+
 class TestXrayInbounds(unittest.TestCase):
     def test_xhttp_inbound_shape(self):
         ib = inst.build_xhttp_inbound(4443, "/uploadfiles/abc", "VK_CDN")
@@ -177,9 +200,9 @@ class TestXrayInbounds(unittest.TestCase):
         xs = ib["streamSettings"]["xhttpSettings"]
         self.assertEqual(ib["streamSettings"]["security"], "none")
         self.assertEqual(xs["mode"], "packet-up")
-        # только mode и path: любые лишние ключи сервер ждёт и от клиента,
-        # а клиент их не знает — живая установка отвечала 400 на всё
-        self.assertEqual(set(xs), {"mode", "path"})
+        # аплинк ровно GET заглавными: CDN, который не пропускает POST,
+        # отбивает его кодом 405, и туннель работает только в одну сторону
+        self.assertEqual(xs["uplinkHTTPMethod"], "GET")
 
     def test_xhttp_path_is_normalised_to_directory(self):
         for raw in ("/abc", "abc", "/abc/", "abc/"):
@@ -397,12 +420,17 @@ class TestConfigProfile(unittest.TestCase):
 
 
 class TestHostAndSquad(unittest.TestCase):
-    def test_host_alpn_has_no_h3(self):
+    def test_host_carries_the_same_xhttp_settings_as_the_inbound(self):
+        """Клиент собирается из хоста, и xray требует совпадения обеих сторон."""
         api = FakeApi({("POST", "hosts"): ({"response": {"uuid": "H-1"}}, 201)})
-        quiet(inst.create_remnawave_host, api, "P-1", "T", "c.net", "/a",
-              inbound_uuid="I-1")
-        # HTTP/3 у CDN выключен по инструкции: клиент не должен его пробовать
-        self.assertEqual(api.calls[0][2]["alpn"], "h2,http/1.1")
+        quiet(inst.create_remnawave_host, api, "P-1", "T", "c.net",
+              "/uploadfiles/abc", inbound_uuid="I-1")
+        body = api.calls[0][2]
+        inbound = inst.build_xhttp_inbound(4443, "/uploadfiles/abc", "T")
+        want = inbound["streamSettings"]["xhttpSettings"]
+        self.assertEqual(body["xhttpExtraParams"], want)
+        self.assertEqual(body["xHttpExtraParams"], want)
+        self.assertEqual(body["alpn"], "h3,h2,http/1.1")
 
     def test_host_body_points_at_cdn_and_binds_inbound_uuid(self):
         api = FakeApi({("POST", "hosts"): ({"response": {"uuid": "H-1"}}, 201)})

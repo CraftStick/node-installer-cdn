@@ -971,21 +971,42 @@ def gen_x25519():
     return None, None
 
 
+def xhttp_settings(path):
+    """xhttpSettings туннеля — ОДИН набор и для инбаунда ноды, и для хоста.
+
+    Клиент собирается панелью из хоста, и xray требует, чтобы обе стороны
+    имели одинаковые значения. Пока установщик клал полный набор в инбаунд, а
+    в хост — только {"mode": "packet-up"}, клиент слал аплинк POST'ами и
+    обычный ?x_padding=: Yandex CDN отбивал POST кодом 405 (в списке
+    разрешённых методов у него только GET, HEAD, OPTIONS), а xray отвечал 400
+    на запросы с чужим паддингом. Поэтому набор один и берётся отсюда оба раза.
+
+    uplinkHTTPMethod ровно "GET" заглавными — так в xray-core (POST/PUT/PATCH/
+    GET) и так в рабочей конфигурации, с которой это снято. Аплинк GET'ами —
+    единственный способ пройти CDN, который не пропускает POST.
+
+    path у xray со слешем на конце: nginx проксирует всё, что под путём, а сам
+    путь без слеша отдаёт 404.
+    """
+    return {
+        "mode": "packet-up",
+        "path": "/" + path.strip("/") + "/",
+        "xPaddingKey": "_dc",
+        "xPaddingHeader": "X-Cache",
+        "xPaddingMethod": "tokenish",
+        "uplinkHTTPMethod": "GET",
+        "xPaddingObfsMode": True,
+        "xPaddingPlacement": "queryInHeader",
+        "scMaxEachPostBytes": 524288,
+        "scMaxConcurrentPosts": 1,
+        "scMinPostsIntervalMs": 150,
+    }
+
+
 def build_xhttp_inbound(port, path, tag, uuid=None):
     """XHTTP packet-up inbound: слушает 127.0.0.1:port, TLS снимает nginx.
 
-    xhttpSettings намеренно минимальны: только mode и path. Раньше сюда писался
-    набор обфускации паддинга (xPaddingKey "_dc", xPaddingHeader "X-Cache",
-    xPaddingMethod, xPaddingObfsMode, xPaddingPlacement, uplinkHTTPMethod) —
-    сервер ждал паддинг в своём виде, а клиент, собранный панелью из хоста,
-    этих параметров не знает и шлёт обычный ?x_padding=. На живой установке
-    это давало 400 на КАЖДЫЙ запрос туннеля: 931 GET и 51 POST подряд, при
-    полностью исправных CDN, nginx и ноде. Обфускация имеет смысл, только если
-    те же параметры уезжают клиенту — а мы их в хост не кладём.
-
-    path у xray со слешем на конце: nginx проксирует всё, что под путём, а сам
-    путь без слеша отдаёт 404. clients пустой — пользователей в конфиг ноды
-    подставляет панель.
+    clients пустой — пользователей в конфиг ноды подставляет панель.
     """
     return {
         "tag": tag,
@@ -1001,10 +1022,7 @@ def build_xhttp_inbound(port, path, tag, uuid=None):
         "streamSettings": {
             "network": "xhttp",
             "security": "none",
-            "xhttpSettings": {
-                "mode": "packet-up",
-                "path": "/" + path.strip("/") + "/",
-            },
+            "xhttpSettings": xhttp_settings(path),
         },
     }
 
@@ -2121,10 +2139,12 @@ def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
         "sni": cdn_domain,
         "host": cdn_domain,
         "path": "/" + path.strip("/") + "/",
-        "alpn": "h2,http/1.1",
+        "alpn": "h3,h2,http/1.1",
         "fingerprint": "random",
-        "xhttpExtraParams": {"mode": "packet-up"},
-        "xHttpExtraParams": {"mode": "packet-up"},
+        # Клиенту — тот же набор, что и ноде: иначе он шлёт POST и обычный
+        # паддинг, а CDN и xray это отбивают (405 и 400 соответственно)
+        "xhttpExtraParams": xhttp_settings(path),
+        "xHttpExtraParams": xhttp_settings(path),
         "securityLayer": "TLS",
     }
     resp, _ = api("POST", "hosts", host)
@@ -3181,7 +3201,7 @@ def main():
         link = ("vless://%s@%s:443?type=xhttp&security=tls&sni=%s&fp=random"
                 "&alpn=%s&path=%s&host=%s&mode=packet-up&encryption=none#user1-%s"
                 % (result["user_uuid"], public_domain, public_domain,
-                   urllib.parse.quote("h2,http/1.1", safe=""),
+                   urllib.parse.quote("h3,h2,http/1.1", safe=""),
                    xpath, public_domain, cdn_name))
         callout("VLESS CDN ссылка", [link], color=C_TITLE)
     if result.get("reality"):
