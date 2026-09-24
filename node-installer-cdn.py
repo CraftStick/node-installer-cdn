@@ -745,6 +745,7 @@ exit 0
 
 def pkg_install(packages):
     """Установить пакеты apt: чинит DNS, зеркало, ждёт блокировку, повторяет."""
+    say("  Ставлю пакеты: %s" % packages)
     fix_dns()
     ensure_apt_mirror()
     # Автообновление держит блокировку dpkg. Раньше его убивали kill -9 и
@@ -811,6 +812,7 @@ def install_docker():
 
     if has_docker():
         return True
+    say("  Ставлю Docker (get.docker.com), это пара минут...")
     attempts = [
         (None, "curl -fsSL https://get.docker.com | sh 2>&1 | tail -5"),
         ("get.docker.com не сработал, чиню apt-зеркало и ставлю docker.io...",
@@ -851,7 +853,7 @@ def ensure_compose():
     _, rc = run("docker compose version 2>/dev/null")
     if rc == 0:
         return True
-    say("  docker compose plugin не найден, устанавливаю...")
+    say("  Ставлю docker compose plugin...")
     run(APT_GET + ' install -y -qq docker-compose-plugin 2>/dev/null || '
          + APT_GET + ' install -y -qq docker-compose-v2 2>/dev/null || '
            '(mkdir -p /usr/local/lib/docker/cli-plugins && '
@@ -1610,6 +1612,7 @@ def remnawave_bringup(cfg):
     admin_pw = cfg["admin_pass"]
 
     step("Установка панели Remnawave 3.x")
+    say("  Порядок: Docker → образы панели → контейнеры → админ и API-токен")
     check_disk(5)
     if not install_docker() or not ensure_compose():
         err("Docker не установился! Попробуй вручную: curl -fsSL https://get.docker.com | sh")
@@ -1644,7 +1647,9 @@ def remnawave_bringup(cfg):
     )
     write_file("/opt/remnawave/.env", env, mode=0o600)          # пароль БД, JWT
 
-    say("  Запуск контейнеров Remnawave...")
+    say("  Качаю образы панели — дольше всего тут:")
+    for image in (REMNAWAVE_IMAGE, POSTGRES_IMAGE, VALKEY_IMAGE):
+        say("    · %s" % image)
     run("cd /opt/remnawave && docker compose down 2>/dev/null")
     out, rc = run("cd /opt/remnawave && docker compose pull 2>&1", timeout=900)
     if rc != 0:
@@ -1654,6 +1659,7 @@ def remnawave_bringup(cfg):
             say(run("df -h /")[0])
             say("  Освободи место (docker system prune -af) или возьми диск побольше")
         sys.exit(1)
+    say("  Образы скачаны, запускаю контейнеры...")
     out, rc = run("cd /opt/remnawave && docker compose up -d 2>&1", timeout=600)
     if rc != 0:
         err("docker compose up ошибка:\n" + out)
@@ -1752,6 +1758,8 @@ def install_remnawave(cfg):
 
     # ── нода (remnanode на 127.0.0.1:2222 внутри docker gateway) ──
     step("Настройка ноды Remnawave")
+    say("  Порядок: регистрация в панели → бинарник xray → образ ноды → "
+        "файрвол → ожидание старта")
     gw, _ = run("docker network inspect remnawave-network "
                 "-f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'")
     gw = gw.strip() or "172.18.0.1"
@@ -1809,8 +1817,29 @@ def build_node_inbounds(cfg, user_uuid, xport, path):
     return inbounds, {"pbk": pub, "sid": sid, "service": service, "port": GRPC_PORT}
 
 
+def panel_node_secret(api):
+    """SECRET_KEY для remnanode. В 3.x это ОДИН ключ на всю панель.
+
+    Раньше ключ искали в ответе POST /api/nodes — в 3.x его там нет, нода
+    создаётся (HTTP 201), а установка обрывалась «панель не создала ноду».
+    Ключ отдаёт GET /api/keygen: в 3.x полем secretKey, в 2.x тем же
+    эндпоинтом, но полем pubKey (там он ехал в ноду как SSL_CERT).
+    """
+    resp, code = api("GET", "keygen")
+    r = api_response(resp)
+    for field in ("secretKey", "pubKey", "certificate"):
+        value = r.get(field)
+        if isinstance(value, str) and value.strip():
+            if field != "secretKey":
+                warn("keygen отдал %s вместо secretKey — панель старее 3.x" % field)
+            return value.strip()
+    err("Панель не отдала ключ ноды (GET keygen, HTTP %s): %s"
+        % (code, json.dumps(resp, ensure_ascii=False)[:200]))
+    return ""
+
+
 def create_remnawave_node(api, name, address, prof_uuid, inbound_uuids):
-    """Зарегистрировать ноду в панели. Возвращает её secretKey или ''.
+    """Зарегистрировать ноду в панели. Возвращает SECRET_KEY для неё или ''.
 
     activeInbounds — uuid инбаундов из ответа профиля, не теги.
     """
@@ -1819,13 +1848,13 @@ def create_remnawave_node(api, name, address, prof_uuid, inbound_uuids):
         "configProfile": {"activeConfigProfileUuid": prof_uuid,
                           "activeInbounds": [u for u in inbound_uuids if u]}})
     r = api_response(resp)
-    if r.get("uuid"):
-        say("  Node UUID: %s" % r["uuid"])
-    secret = r.get("secretKey") or ""
-    if not secret:
+    if not r.get("uuid"):
         err("Панель не создала ноду %s (HTTP %s): %s"
-            % (name, code, json.dumps(resp, ensure_ascii=False)[:160]))
-    return secret
+            % (name, code, json.dumps(resp, ensure_ascii=False)[:200]))
+        return ""
+    say("  Node UUID: %s" % r["uuid"])
+    # 2.x отдавал ключ прямо здесь, 3.x — только через keygen
+    return r.get("secretKey") or panel_node_secret(api)
 
 
 def deploy_remnanode_files(secret):
@@ -1839,7 +1868,9 @@ def deploy_remnanode_files(secret):
 
 def start_remnanode():
     """docker compose pull + up для remnanode."""
+    say("  Качаю образ ноды %s..." % REMNANODE_IMAGE)
     run("cd /opt/remnanode && docker compose pull", timeout=600)
+    say("  Запускаю контейнер remnanode...")
     out, rc = run("cd /opt/remnanode && docker compose up -d 2>&1")
     if rc != 0:
         warn("remnanode не запустился: %s" % out.strip()[-200:])
@@ -2241,6 +2272,8 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY):
         say("  жду DNS %s -> %s ..." % (domain, myip))
         time.sleep(10)
     for attempt in range(3):
+        say("  certbot: запрашиваю сертификат для %s (попытка %d из 3)..."
+            % (domain, attempt + 1))
         run("certbot certonly --webroot -w /var/www/certbot -d %s "
                "--non-interactive --agree-tos "
                "--register-unsafely-without-email" % domain, timeout=180)
@@ -2282,6 +2315,8 @@ def setup_panel_web(cfg, xport, path):
     domain = cfg["domain"]
     origin = cfg.get("origin_domain", domain)
     step("nginx: панель и CDN")
+    say("  Порядок: пакеты → самоподписанный сертификат → конфиги → "
+        "Let's Encrypt для панели и origin")
     pkg_install("nginx openssl curl ca-certificates certbot")
     ensure_nginx_base()
     self_signed_cert(origin)      # чтобы nginx поднялся до выпуска LE

@@ -885,6 +885,50 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertIn("A112", out)
 
 
+class TestNodeSecret(unittest.TestCase):
+    """3.x не кладёт secretKey в ответ POST /nodes — ключ берётся из keygen."""
+
+    NODE_CREATED = {"response": {"uuid": "N-1", "name": "node-local",
+                                 "address": "172.18.0.1", "port": 2222}}
+
+    def test_secret_comes_from_keygen_when_node_response_has_none(self):
+        api = FakeApi({("POST", "nodes"): (self.NODE_CREATED, 201),
+                       ("GET", "keygen"): ({"response": {"secretKey": "K-1"}}, 200)})
+        secret, out = quiet(inst.create_remnawave_node, api, "node-local",
+                            "172.18.0.1", "P-1", ["I-1"])
+        self.assertEqual(secret, "K-1")
+        self.assertIn("Node UUID: N-1", out)
+        self.assertIn(("GET", "keygen", None), api.calls)
+
+    def test_old_panels_keep_working_without_keygen_call(self):
+        created = {"response": dict(self.NODE_CREATED["response"], secretKey="OLD")}
+        api = FakeApi({("POST", "nodes"): (created, 201)})
+        secret, _ = quiet(inst.create_remnawave_node, api, "n", "1.2.3.4", "P", ["I"])
+        self.assertEqual(secret, "OLD")
+        self.assertNotIn("keygen", [c[1] for c in api.calls])
+
+    def test_pubkey_is_accepted_with_a_warning(self):
+        api = FakeApi({("GET", "keygen"): ({"response": {"pubKey": "CERT"}}, 200)})
+        secret, out = quiet(inst.panel_node_secret, api)
+        self.assertEqual(secret, "CERT")
+        self.assertIn("старее 3.x", out)
+
+    def test_empty_keygen_is_reported_not_silently_used(self):
+        for reply in (({"response": {}}, 200), ({"response": {"secretKey": " "}}, 200),
+                      ({"message": "forbidden"}, 403)):
+            api = FakeApi({("GET", "keygen"): reply})
+            secret, out = quiet(inst.panel_node_secret, api)
+            self.assertEqual(secret, "")
+            self.assertIn("не отдала ключ", out)
+
+    def test_node_creation_failure_still_stops_before_keygen(self):
+        api = FakeApi({("POST", "nodes"): ({"message": "A112"}, 400)})
+        secret, out = quiet(inst.create_remnawave_node, api, "n", "1.2.3.4", "P", ["I"])
+        self.assertEqual(secret, "")
+        self.assertNotIn("keygen", [c[1] for c in api.calls])
+        self.assertIn("не создала ноду", out)
+
+
 class TestAptLocking(unittest.TestCase):
     def test_pkg_install_waits_for_lock_instead_of_killing(self):
         orig = (inst.fix_dns, inst.ensure_apt_mirror)
