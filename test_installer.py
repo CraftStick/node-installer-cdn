@@ -465,6 +465,16 @@ class TestHostAndSquad(unittest.TestCase):
         self.assertEqual(body["xhttpExtraParams"]["mode"], "packet-up")
         self.assertEqual(body["xHttpExtraParams"]["mode"], "packet-up")
 
+    def test_host_remark_names_the_provider(self):
+        api = FakeApi({("POST", "hosts"): ({"response": {"uuid": "H-1"}}, 201),
+                       ("PATCH", "hosts"): ({"response": {"uuid": "H-1"}}, 200)})
+        quiet(inst.create_remnawave_host, api, "P-1", "T", "c.net", "/a",
+              inbound_uuid="I-1", remark=inst.host_remark("yandex"))
+        self.assertEqual(api.calls[0][2]["remark"], "Yandex bypass")
+        quiet(inst.update_host_address, api, "H-1", "c.net",
+              remark=inst.host_remark("timeweb"))
+        self.assertEqual(api.calls[-1][2]["remark"], "Timeweb bypass")
+
     def test_host_is_skipped_without_profile(self):
         api = FakeApi({})
         huuid, out = quiet(inst.create_remnawave_host, api, None, "T", "c", "/a")

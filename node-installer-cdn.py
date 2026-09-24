@@ -1533,6 +1533,11 @@ def profile_name(cdn_name):
     return "CDN-%s" % cdn_name.upper()
 
 
+def host_remark(cdn_name):
+    """Подпись хоста в панели и в клиенте: «Yandex bypass», «Timeweb bypass»."""
+    return "%s bypass" % cdn_name.capitalize()
+
+
 def _slug(prefix):
     return "%s-%s" % (prefix, rand(6, "abcdefghijklmnopqrstuvwxyz0123456789"))
 
@@ -1812,7 +1817,8 @@ def install_remnawave(cfg):
     # его позже. main() переставит хост на него через update_host_address().
     host_uuid = create_remnawave_host(api, prof_uuid, inbounds[0]["tag"], origin,
                                       path,
-                                      inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
+                                      inbound_uuid=tag2uuid.get(inbounds[0]["tag"]),
+                                      remark=host_remark(cfg["cdn"]))
     add_inbounds_to_squad(api, inbound_uuids)
     sub_url, user_uuid = create_remnawave_user(api, "user1", user_uuid, domain)
 
@@ -2135,7 +2141,7 @@ def create_config_profile(api, name, inbounds, tries=3):
 
 
 def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
-                          inbound_uuid=None):
+                          inbound_uuid=None, remark=None):
     """Создать CDN-хост и привязать к профилю/инбаунду.
 
     Привязка едет ВЛОЖЕННЫМ объектом inbound — так с 3.4: плоские
@@ -2152,7 +2158,7 @@ def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
     host = {
         "inbound": {"configProfileUuid": prof_uuid,
                     "configProfileInboundUuid": inbound_uuid},
-        "remark": "CDN %s" % cdn_domain,
+        "remark": remark or "CDN %s" % cdn_domain,
         "address": cdn_domain,
         "port": 443,
         # SNI и Host — домен CDN, а не origin: клиент открывает TLS именно к
@@ -2179,7 +2185,7 @@ def create_remnawave_host(api, prof_uuid, inbound_tag, cdn_domain, path,
     return huuid
 
 
-def update_host_address(api, host_uuid, cdn_domain):
+def update_host_address(api, host_uuid, cdn_domain, remark=None):
     """Переставить хост на домен CDN, когда провайдер его наконец выдал.
 
     Хост создаётся до настройки CDN — там ещё нечего прописать, кроме origin,
@@ -2191,7 +2197,7 @@ def update_host_address(api, host_uuid, cdn_domain):
         return False
     resp, code = api("PATCH", "hosts", {
         "uuid": host_uuid,
-        "remark": "CDN %s" % cdn_domain,
+        "remark": remark or "CDN %s" % cdn_domain,
         "address": cdn_domain,
         "sni": cdn_domain,
         "host": cdn_domain,
@@ -2658,7 +2664,8 @@ def install_node_only(cfg):
     step("Создание хоста, сквада и юзера на панели")
     host_uuid = create_remnawave_host(api, prof_uuid, inbounds[0]["tag"], origin,
                                       path,
-                                      inbound_uuid=tag2uuid.get(inbounds[0]["tag"]))
+                                      inbound_uuid=tag2uuid.get(inbounds[0]["tag"]),
+                                      remark=host_remark(cfg["cdn"]))
     add_inbounds_to_squad(api, inbound_uuids)
     pdom, _ = run_remote(panel, 'grep -oP "PANEL_DOMAIN=\\K.*" '
                          '/opt/remnawave/.env 2>/dev/null')
@@ -3256,7 +3263,8 @@ def main():
 
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
     if public_domain and result.get("host_uuid"):
-        update_host_address(result["api"], result["host_uuid"], public_domain)
+        update_host_address(result["api"], result["host_uuid"], public_domain,
+                            remark=host_remark(cdn_name))
 
     # ── проверка служб/портов/конфига ──
     try:
