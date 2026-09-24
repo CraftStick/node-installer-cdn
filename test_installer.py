@@ -1221,5 +1221,104 @@ class TestMainFlow(unittest.TestCase):
                         "--skip-dns-wait", "--skip-cdn-wait"])
 
 
+class TestWipeLeftovers(unittest.TestCase):
+    """Снос прошлой установки: не только /opt и контейнеры."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.our = os.path.join(self.dir, "ours")
+        self.alien = os.path.join(self.dir, "alien")
+        with open(self.our, "w") as f:
+            f.write(inst.nginx_cdn_origin_config(4443, "/a/b"))
+        with open(self.alien, "w") as f:
+            f.write("server { listen 80; }\n")
+
+    def test_our_configs_carry_the_mark(self):
+        for conf in (inst.nginx_cdn_origin_config(4443, "/a/b"),
+                     inst.nginx_panel_proxy("p.example.com", 3000),
+                     inst.caddy_cdn_origin_config(4443, "/a/b")):
+            self.assertTrue(conf.startswith(inst.CONF_MARK), conf[:60])
+
+    def test_mark_does_not_break_caddy_global_block(self):
+        # глобальный блок Caddyfile должен остаться первым НЕкомментарием
+        lines = [l for l in inst.caddy_cdn_origin_config(4443, "/a/b").splitlines()
+                 if l.strip()]
+        self.assertTrue(lines[0].startswith("#"))
+        self.assertEqual(lines[1].strip(), "{")
+
+    def test_alien_config_is_not_touched(self):
+        self.assertTrue(inst._is_ours(self.our))
+        self.assertFalse(inst._is_ours(self.alien))
+        self.assertFalse(inst._is_ours(os.path.join(self.dir, "нет-такого")))
+
+    def _wipe(self, ours=()):
+        """Прогнать _wipe_front, считая «нашими» перечисленные пути."""
+        orig = inst._is_ours
+        inst._is_ours = lambda path: path in ours
+        try:
+            with fake_run() as cmds:
+                inst._wipe_front()
+        finally:
+            inst._is_ours = orig
+        return "\n".join(cmds)
+
+    def test_wipe_removes_our_nginx_sites_and_symlinks(self):
+        joined = self._wipe(ours=("/etc/nginx/sites-available/default",
+                                  "/etc/nginx/sites-available/panel.conf"))
+        self.assertIn("rm -f /etc/nginx/sites-available/default "
+                      "/etc/nginx/sites-enabled/default", joined)
+        self.assertIn("/etc/nginx/sites-enabled/panel.conf", joined)
+
+    def test_wipe_keeps_nginx_sites_it_did_not_write(self):
+        joined = self._wipe(ours=())
+        self.assertNotIn("sites-available/default", joined)
+
+    def test_wipe_disables_caddy_so_it_frees_443(self):
+        joined = self._wipe(ours=(inst.CADDYFILE,))
+        self.assertIn("systemctl disable --now caddy", joined)
+        self.assertIn("rm -f " + inst.CADDYFILE, joined)
+
+    def test_wipe_drops_stale_docker_networks_and_ufw_rules(self):
+        joined = self._wipe()
+        self.assertIn("docker network rm", joined)
+        self.assertIn("ufw --force delete", joined)
+
+    def test_front_leftovers_reported_before_asking(self):
+        orig = inst._is_ours
+        inst._is_ours = lambda path: path == "/etc/nginx/sites-available/default"
+        try:
+            with fake_run({"docker network ls": ("remnawave_default\n", 0),
+                           "ufw status": ("2222/tcp DENY IN Anywhere\n", 0),
+                           "systemctl is-active": ("", 0)}):
+                found = inst._front_leftovers()
+        finally:
+            inst._is_ours = orig
+        joined = " | ".join(found)
+        self.assertIn("nginx origin", joined)
+        self.assertIn("remnawave_default", joined)
+        self.assertIn("2222", joined)
+
+    def test_wipe_previous_cleans_front_even_without_panel_or_node(self):
+        # режим 3 (только CDN): /opt и контейнеров нет, но фронт сносить надо
+        orig = inst._is_ours
+        inst._is_ours = lambda path: path == inst.CADDYFILE
+        try:
+            with fake_run() as cmds:
+                quiet(inst.wipe_previous, assume_yes=True)
+        finally:
+            inst._is_ours = orig
+        self.assertIn("systemctl disable --now caddy", "\n".join(cmds))
+
+    def test_db_warning_only_when_panel_is_wiped(self):
+        orig = inst._is_ours
+        inst._is_ours = lambda path: path == inst.CADDYFILE
+        try:
+            with fake_run():
+                _, out = quiet(inst.wipe_previous, assume_yes=True)
+        finally:
+            inst._is_ours = orig
+        self.assertNotIn("база панели", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

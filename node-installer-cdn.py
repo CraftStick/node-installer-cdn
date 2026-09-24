@@ -84,6 +84,9 @@ PANEL_PORT = 3000                     # Remnawave слушает только 12
 
 CDN_CRT = "/etc/nginx/ssl/cdn.crt"
 CDN_KEY = "/etc/nginx/ssl/cdn.key"
+# Метка в начале каждого конфига, который пишет установщик: по ней снос
+# отличает свои файлы от дистрибутивных и чужих (см. wipe_previous).
+CONF_MARK = "# node-installer-cdn"
 
 # Reality dest/sni — «прикрытие» для gRPC-входа
 REALITY_DEST = "www.microsoft.com:443"
@@ -1099,7 +1102,8 @@ def nginx_cdn_origin_config(port, path, crt=CDN_CRT, key=CDN_KEY):
     loc = ("    location = %s {\n        return 404;\n    }\n\n"
            "    location %s/ {\n%s    }\n" % (path, path, proxy_block))
 
-    return """upstream xray_xhttp {
+    return CONF_MARK + """
+upstream xray_xhttp {
     server 127.0.0.1:%d;
     keepalive 128;
 }
@@ -1204,7 +1208,7 @@ def caddy_cdn_origin_config(port, path, crt=CDN_CRT, key=CDN_KEY,
     }
 }
 """ % (panel_domain, panel_port)
-    return globals_block + "\n" + origin + panel
+    return CONF_MARK + "\n" + globals_block + "\n" + origin + panel
 
 
 def install_caddy():
@@ -1553,6 +1557,71 @@ def _leftovers(paths, containers, vol_filter=""):
     return found
 
 
+# Конфиги веб-фронта, которые пишет установщик: имя файла -> что это такое.
+OUR_NGINX_SITES = {"default": "конфиг nginx origin (туннель прошлой установки)",
+                   "panel.conf": "конфиг nginx панели"}
+CADDYFILE = "/etc/caddy/Caddyfile"
+
+
+def _is_ours(path):
+    """True, если этот конфиг писал установщик (по метке CONF_MARK в начале).
+
+    Дистрибутивный /etc/nginx/sites-available/default и чужие сайты на сервере
+    метки не имеют — их снос не трогает.
+    """
+    try:
+        with open(path) as f:
+            return CONF_MARK in f.read(200)
+    except OSError:
+        return False
+
+
+def _front_leftovers():
+    """Остатки веб-фронта прошлой установки.
+
+    Удаление /opt/remnawave и контейнеров их не убирает, а мешают они по-разному:
+    Caddy с прошлого запуска держит :443 и новый nginx на порт не встаёт, а
+    старый sites-enabled/default оставляет включённым прежний путь туннеля.
+    """
+    found = []
+    for name, what in sorted(OUR_NGINX_SITES.items()):
+        if _is_ours("/etc/nginx/sites-available/%s" % name):
+            found.append(what)
+    if _is_ours(CADDYFILE):
+        found.append("Caddyfile прошлой установки")
+        if run("systemctl is-active --quiet caddy")[1] == 0:
+            found.append("caddy занимает :80/:443")
+    nets, _ = run("docker network ls --format '{{.Name}}' "
+                  "--filter name=remnawave --filter name=remnanode 2>/dev/null")
+    found += ["docker-сеть " + n for n in nets.split()]
+    if "2222/tcp" in run("ufw status 2>/dev/null")[0]:
+        found.append("правила ufw на порт ноды 2222")
+    return found
+
+
+def _wipe_front():
+    """Снести веб-фронт прошлой установки: конфиги, caddy, сети, правила ufw."""
+    for name in OUR_NGINX_SITES:
+        path = "/etc/nginx/sites-available/%s" % name
+        if _is_ours(path):
+            run("rm -f %s /etc/nginx/sites-enabled/%s" % (path, name))
+    if _is_ours(CADDYFILE):
+        # disable, а не только stop: иначе caddy вернётся после перезагрузки
+        # и заберёт :443 у nginx.
+        run("systemctl disable --now caddy 2>/dev/null")
+        run("rm -f " + CADDYFILE)
+    run("docker network ls -q --filter name=remnawave --filter name=remnanode "
+        "2>/dev/null | xargs -r docker network rm 2>/dev/null")
+    # Правила ufw на 2222 привязаны к IP прошлой панели: он мог смениться, а
+    # правило пережило бы снос и пускало чужой сервер. Номера сдвигаются после
+    # каждого удаления, поэтому идём с конца и ограничиваем число проходов.
+    run("for i in 1 2 3 4 5 6 7 8; do "
+        "n=$(ufw status numbered 2>/dev/null | grep -E ' 2222/(tcp|udp)' | tail -1 "
+        r"| sed -n 's/^\[ *\([0-9]*\).*/\1/p'); "
+        "[ -n \"$n\" ] || break; "
+        "ufw --force delete $n >/dev/null 2>&1 || break; done")
+
+
 def wipe_previous(panel=False, node=False, assume_yes=False):
     """Снести прошлую установку до начала новой.
 
@@ -1568,12 +1637,14 @@ def wipe_previous(panel=False, node=False, assume_yes=False):
                             "remnawave")
     if node:
         found += _leftovers(["/opt/remnanode"], ["remnanode"])
+    found += _front_leftovers()
     if not found:
         return
     warn("Найдены остатки прошлой установки:")
     for f in found:
         say("    - %s" % f)
-    say("  Вместе с ними удалится база панели (пользователи, ноды, подписки)")
+    if panel:
+        say("  Вместе с ними удалится база панели (пользователи, ноды, подписки)")
     if not assume_yes and sys.stdin.isatty():
         if ask("Снести и поставить начисто? (Y/n)", "y").lower() in ("n", "no", "н", "нет"):
             say("  Оставляю как есть — установка продолжится поверх")
@@ -1591,6 +1662,7 @@ def wipe_previous(panel=False, node=False, assume_yes=False):
             timeout=120)
         run("docker rm -f remnanode 2>/dev/null")
         run("rm -rf /opt/remnanode")
+    _wipe_front()
     ok("Прошлая установка удалена")
 
 
@@ -2421,7 +2493,8 @@ def upgrade_origin_cert(origin_domain, skip=False):
 
 def nginx_panel_proxy(domain, upstream_port, crt=CDN_CRT, key=CDN_KEY):
     """nginx-конфиг для проксирования панели (80->443 redirect + proxy)."""
-    return """server {
+    return CONF_MARK + """
+server {
     listen 80;
     server_name %s;
     location /.well-known/acme-challenge/ { root /var/www/certbot; }
