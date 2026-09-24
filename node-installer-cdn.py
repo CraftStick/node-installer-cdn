@@ -2863,6 +2863,9 @@ def choose(prompt, options):
             return int(v)
         if not sys.stdin.isatty():
             no_input("нужен ответ на «%s»" % prompt)
+        # Молча переспрашивать нельзя: человек не понимает, что ввод отвергнут
+        warn("Нужен номер от 1 до %d%s" % (len(options),
+             (", а не '%s'" % v[:20]) if v else ""))
 
 
 CDN_NAMES = {1: "yandex", 2: "timeweb"}

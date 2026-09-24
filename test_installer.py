@@ -980,6 +980,33 @@ class TestAptLocking(unittest.TestCase):
         self.assertTrue(all("DPkg::Lock::Timeout" in c for c in cmds if "apt-get" in c))
 
 
+class TestChoose(unittest.TestCase):
+    def _choose(self, answers):
+        """choose() с подставными ответами: возвращает (выбор, вывод)."""
+        replies = list(answers)
+        orig_ask, orig_save = inst.ask, inst.state_save
+        inst.ask = lambda *a, **kw: replies.pop(0)
+        inst.state_save = lambda: None
+        try:
+            return quiet(inst.choose, "Режим?", ["раз", "два"])
+        finally:
+            inst.ask, inst.state_save = orig_ask, orig_save
+
+    def test_valid_number_is_returned(self):
+        self.assertEqual(self._choose(["2"])[0], 2)
+
+    def test_garbage_is_explained_not_silently_reasked(self):
+        value, out = self._choose(["че", "1"])
+        self.assertEqual(value, 1)
+        self.assertIn("Нужен номер от 1 до 2", out)
+        self.assertIn("че", out)
+
+    def test_number_out_of_range_is_rejected(self):
+        value, out = self._choose(["9", "1"])
+        self.assertEqual(value, 1)
+        self.assertIn("Нужен номер", out)
+
+
 class TestModeRenumbering(unittest.TestCase):
     """Старый режим 2 (нода по SSH) убран, 3 -> 2 и 4 -> 3."""
 
