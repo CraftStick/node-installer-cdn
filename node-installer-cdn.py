@@ -2915,6 +2915,24 @@ def resolve_cdn(value):
     return CDN_NAMES[num]
 
 
+def vless_link(uuid, domain, path, cdn_name):
+    """Ссылка для ручного импорта — с теми же xhttpSettings, что у ноды.
+
+    Без параметра extra клиент берёт умолчания (аплинк POST, паддинг
+    ?x_padding=) и туннель не поднимается: CDN отбивает POST, xray — чужой
+    паддинг. Подписка панели такой extra отдаёт, а печатаемая ссылка раньше
+    нет, из-за чего по ней не работало, а по подписке работало.
+    """
+    q = lambda v: urllib.parse.quote(v, safe="")
+    return ("vless://%s@%s:443?type=xhttp&security=tls&sni=%s&fp=random"
+            "&alpn=%s&path=%s&host=%s&mode=packet-up&extra=%s"
+            "&encryption=none#user1-%s"
+            % (uuid, domain, domain, q("h3,h2,http/1.1"),
+               q("/" + path.strip("/") + "/"), domain,
+               q(json.dumps(xhttp_settings(path), separators=(",", ":"))),
+               cdn_name))
+
+
 def final_selfcheck(cfg, xport, path):
     """Локальная проверка готовности origin-фронта после установки.
 
@@ -3197,12 +3215,7 @@ def main():
     state_clear()      # дошли до конца — продолжать нечего
 
     if public_domain and result.get("user_uuid"):
-        xpath = urllib.parse.quote("/" + path.strip("/") + "/", safe="")
-        link = ("vless://%s@%s:443?type=xhttp&security=tls&sni=%s&fp=random"
-                "&alpn=%s&path=%s&host=%s&mode=packet-up&encryption=none#user1-%s"
-                % (result["user_uuid"], public_domain, public_domain,
-                   urllib.parse.quote("h3,h2,http/1.1", safe=""),
-                   xpath, public_domain, cdn_name))
+        link = vless_link(result["user_uuid"], public_domain, path, cdn_name)
         callout("VLESS CDN ссылка", [link], color=C_TITLE)
     if result.get("reality"):
         # Всё, что нужно клиенту для запасного входа: без serviceName

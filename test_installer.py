@@ -190,6 +190,20 @@ class TestXhttpSettings(unittest.TestCase):
             self.assertEqual(inst.xhttp_settings(raw)["path"], "/a/b/")
 
 
+class TestVlessLink(unittest.TestCase):
+    def test_link_carries_the_same_xhttp_settings(self):
+        import urllib.parse as up
+        link = inst.vless_link("U-1", "cdn.example.com", "/uploadfiles/abc", "yandex")
+        q = up.parse_qs(up.urlparse(link).query)
+        self.assertEqual(json.loads(q["extra"][0]),
+                         inst.xhttp_settings("/uploadfiles/abc"))
+        self.assertEqual(q["path"][0], "/uploadfiles/abc/")
+        self.assertEqual(q["host"][0], "cdn.example.com")
+        self.assertEqual(q["sni"][0], "cdn.example.com")
+        self.assertEqual(q["mode"][0], "packet-up")
+        self.assertTrue(link.startswith("vless://U-1@cdn.example.com:443?"))
+
+
 class TestXrayInbounds(unittest.TestCase):
     def test_xhttp_inbound_shape(self):
         ib = inst.build_xhttp_inbound(4443, "/uploadfiles/abc", "VK_CDN")
