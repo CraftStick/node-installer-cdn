@@ -321,6 +321,21 @@ def rand_password(n=28):
 PATH_PREFIXES = ["uploadfiles", "content/media", "static/files", "upload/data",
                  "assets/video", "files/storage"]
 
+def rand_label():
+    """Случайная метка поддомена для origin: 'a7f3k2'.
+
+    Прежний фиксированный 'origin.<домен>' стоит первым в любом словаре для
+    поиска настоящего IP за CDN — подбирается за секунды. Первый символ буква:
+    цифру в начале метки принимают не все панели DNS.
+
+    Случайность прячет origin только от перебора. Если на него выпустить
+    Let's Encrypt, имя всё равно попадёт в публичные CT-логи — тогда прятать
+    его смысла нет (см. upgrade_origin_cert).
+    """
+    return _rng.choice("abcdefghijklmnopqrstuvwxyz") + rand(
+        _rng.randint(5, 7), "abcdefghijklmnopqrstuvwxyz0123456789")
+
+
 def rand_path():
     """Путь xhttp: правдоподобный каталог + случайный хвост.
 
@@ -2302,6 +2317,11 @@ def upgrade_origin_cert(origin_domain, skip=False):
         return False
     say("  Пробую выпустить Let's Encrypt для origin %s..." % origin_domain)
     if issue_le_cert(origin_domain):
+        # Выпущенный сертификат публикуется в CT-логах: имя origin становится
+        # видно через поиск вроде crt.sh, и случайный поддомен уже не прячет
+        # сервер. Кому это важно — ставить с --no-origin-le.
+        say("  Имя %s теперь видно в публичных CT-логах сертификатов; "
+            "чтобы не светить его — ставь с --no-origin-le" % origin_domain)
         run("chmod 600 %s" % shq(CDN_KEY))
         return True
     say("  Остаётся self-signed — у CDN-провайдера включи "
@@ -2579,6 +2599,8 @@ def parse_args():
                    help="Не трогать прошлую установку (ставить поверх)")
     p.add_argument("--fresh", action="store_true",
                    help="Забыть сохранённый прогресс и начать с нуля")
+    p.add_argument("--origin-domain", help="Домен источника для CDN. Без него "
+                   "берётся случайный поддомен вида a7f3k2.<домен>")
     p.add_argument("--cdn-domain", help="Технический домен ресурса CDN "
                    "(например xxx.cdn.twcstorage.ru) — иначе спросим в конце")
     p.add_argument("--client-domain", help="Свой домен для клиентов: CNAME на "
@@ -2934,7 +2956,16 @@ def main():
         if hint:
             say("  " + hint)
         sys.exit(1)
-    origin = "origin." + domain
+    # Поддомен origin — случайный, но постоянный между перезапусками: он уже
+    # прописан в nginx, в сертификате и в ресурсе CDN (state_value).
+    origin = (args.origin_domain or "").strip()
+    if origin and not RE_DOMAIN.match(origin):
+        err("Origin '%s' не похож на домен" % origin)
+        hint = homoglyph_hint(origin)
+        if hint:
+            say("  " + hint)
+        sys.exit(1)
+    origin = origin or state_value("origin", lambda: "%s.%s" % (rand_label(), domain))
 
     # путь/upstream-порт: режим 3 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
     if mode == "3":

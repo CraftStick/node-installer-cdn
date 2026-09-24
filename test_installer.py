@@ -92,6 +92,17 @@ class TestSecrets(unittest.TestCase):
         self.assertEqual(len(v), 32)
         self.assertTrue(set(v) <= set("ab"))
 
+    def test_origin_label_is_a_valid_subdomain(self):
+        for _ in range(200):
+            label = inst.rand_label()
+            self.assertRegex(label, r"^[a-z][a-z0-9]{5,7}$")
+            self.assertRegex(label + ".example.com", inst.RE_DOMAIN)
+
+    def test_origin_label_is_not_guessable_word(self):
+        labels = {inst.rand_label() for _ in range(50)}
+        self.assertGreater(len(labels), 45)          # не константа
+        self.assertNotIn("origin", labels)
+
     def test_generated_values_differ(self):
         self.assertNotEqual(inst.rand_password(), inst.rand_password())
         self.assertNotEqual(inst.rand_path(), inst.rand_path())
@@ -992,7 +1003,21 @@ class TestMainFlow(unittest.TestCase):
         seen, out = self._main(["--mode", "1", "--cdn", "yandex",
                                 "--client-domain", "cdn.e.com"] + self.BASE)
         self.assertIn("CNAME  cdn.e.com  ->  xxx.cdn.twcstorage.ru", out)
-        self.assertIn("A      origin.e.com  ->  203.0.113.9", out)
+        a_record = re.search(r"A\s+(\S+)\s+->\s+203\.0\.113\.9", out)
+        self.assertIsNotNone(a_record, out)
+        self.assertTrue(a_record.group(1).endswith(".e.com"))
+        self.assertFalse(a_record.group(1).startswith("origin."))   # не угадывается
+
+    def test_origin_domain_flag_overrides_random_label(self):
+        seen, out = self._main(["--mode", "1", "--cdn", "yandex",
+                                "--origin-domain", "src.e.com"] + self.BASE)
+        self.assertEqual(seen["install_remnawave"]["origin_domain"], "src.e.com")
+        self.assertIn("A      src.e.com", out)
+
+    def test_bad_origin_domain_stops_installation(self):
+        with self.assertRaises(SystemExit):
+            self._main(["--mode", "1", "--cdn", "yandex",
+                        "--origin-domain", "не домен"] + self.BASE)
 
     def test_bad_domain_stops_installation(self):
         with self.assertRaises(SystemExit):
