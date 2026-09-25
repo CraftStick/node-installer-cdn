@@ -2676,11 +2676,13 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
        Имя                      %s
        Домены                   %s
        Тип проверки             DNS
+
   Затем Yandex покажет запись для проверки. Заведите её в DNS:
        Type                     CNAME
        Name                     _acme-challenge.%s
        Target                   <значение со страницы сертификата>
        Proxy                    DNS only
+
   Значение копируйте кнопкой. Ждите статуса Issued (5-30 минут), после
   выпуска запись не удалять — по ней идёт автопродление.
 
@@ -2709,6 +2711,7 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
        Name                     %s
        Target                   <строка CNAME из блока>
        Proxy                    DNS only
+
   Её же введёте ниже. Раскатка до 15 минут: коды 000, 502 и 200 в это
   время чередуются — это нормально.
 """ % (cert, client_domain, client_domain,

@@ -836,7 +836,7 @@ class TestCdnInstructions(unittest.TestCase):
     def test_instruction_stays_short(self):
         # смысл правки: раньше инструкция расползлась на 70+ строк
         out = self._print("yandex", "cdn.example.com")
-        self.assertLess(len(out.splitlines()), 50, out)
+        self.assertLess(len(out.splitlines()), 55, out)
 
     def test_caching_and_compression_are_switched_off_everywhere(self):
         # названия полей у провайдеров свои («Кеш CDN» / «CDN-кэширование»),
