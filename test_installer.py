@@ -179,11 +179,13 @@ class TestXhttpSettings(unittest.TestCase):
             "xPaddingHeader": "X-Cache",
             "xPaddingMethod": "tokenish",
             "uplinkHTTPMethod": "GET",
+            "uplinkDataPlacement": "header",
+            "uplinkDataKey": "data",
             "xPaddingObfsMode": True,
             "xPaddingPlacement": "queryInHeader",
-            "scMaxEachPostBytes": 524288,
+            "scMaxEachPostBytes": 4096,
             "scMaxConcurrentPosts": 1,
-            "scMinPostsIntervalMs": 150,
+            "scMinPostsIntervalMs": 30,
         })
 
     def test_path_is_normalised_to_directory(self):
@@ -218,6 +220,8 @@ class TestXrayInbounds(unittest.TestCase):
         # аплинк ровно GET заглавными: CDN, который не пропускает POST,
         # отбивает его кодом 405, и туннель работает только в одну сторону
         self.assertEqual(xs["uplinkHTTPMethod"], "GET")
+        # данные аплинка в заголовке: тело GET узлы CDN у операторов режут
+        self.assertEqual(xs["uplinkDataPlacement"], "header")
 
     def test_xhttp_path_is_normalised_to_directory(self):
         for raw in ("/abc", "abc", "/abc/", "abc/"):

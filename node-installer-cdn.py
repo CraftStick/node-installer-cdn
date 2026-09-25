@@ -1030,6 +1030,14 @@ def xhttp_settings(path):
     GET) и так в рабочей конфигурации, с которой это снято. Аплинк GET'ами —
     единственный способ пройти CDN, который не пропускает POST.
 
+    Данные аплинка — в заголовке, а не в теле GET. Узел Yandex CDN внутри сети
+    Мегафона тело GET-запроса не пропускает: до origin доходили только
+    загрузки, аплинк не доходил ни разу, и туннель висел без ошибок. Узлы в
+    других сетях тело пропускали, поэтому по Wi-Fi и на МТС всё работало. В
+    заголовок большой кусок не влезает (лимит на CDN 8–16 КБ, а данные ещё и
+    раздуваются base64), отсюда 4096 байт на запрос и короткий интервал,
+    чтобы аплинк не стал совсем медленным.
+
     path у xray со слешем на конце: nginx проксирует всё, что под путём, а сам
     путь без слеша отдаёт 404.
     """
@@ -1040,11 +1048,13 @@ def xhttp_settings(path):
         "xPaddingHeader": "X-Cache",
         "xPaddingMethod": "tokenish",
         "uplinkHTTPMethod": "GET",
+        "uplinkDataPlacement": "header",
+        "uplinkDataKey": "data",
         "xPaddingObfsMode": True,
         "xPaddingPlacement": "queryInHeader",
-        "scMaxEachPostBytes": 524288,
+        "scMaxEachPostBytes": 4096,
         "scMaxConcurrentPosts": 1,
-        "scMinPostsIntervalMs": 150,
+        "scMinPostsIntervalMs": 30,
     }
 
 
