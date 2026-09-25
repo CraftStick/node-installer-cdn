@@ -460,8 +460,8 @@ class TestHostAndSquad(unittest.TestCase):
               inbound_uuid="I-1", remark=inst.host_remark("yandex"))
         self.assertEqual(api.calls[0][2]["remark"], "Yandex bypass")
         quiet(inst.update_host_address, api, "H-1", "c.net",
-              remark=inst.host_remark("timeweb"))
-        self.assertEqual(api.calls[-1][2]["remark"], "Timeweb bypass")
+              remark=inst.host_remark("yandex"))
+        self.assertEqual(api.calls[-1][2]["remark"], "Yandex bypass")
 
     def test_host_is_skipped_without_profile(self):
         api = FakeApi({})
@@ -482,12 +482,12 @@ class TestHostAndSquad(unittest.TestCase):
 
     def test_update_host_moves_address_sni_and_host(self):
         api = FakeApi({("PATCH", "hosts"): ({"response": {"uuid": "H-1"}}, 200)})
-        okd, _ = quiet(inst.update_host_address, api, "H-1", "xxx.cdn.twcstorage.ru")
+        okd, _ = quiet(inst.update_host_address, api, "H-1", "c5d6df02.topology.gslb.yccdn.ru")
         self.assertTrue(okd)
         body = api.calls[0][2]
         self.assertEqual(body["uuid"], "H-1")
         for field in ("address", "sni", "host"):
-            self.assertEqual(body[field], "xxx.cdn.twcstorage.ru")
+            self.assertEqual(body[field], "c5d6df02.topology.gslb.yccdn.ru")
 
     def test_update_host_is_noop_without_uuid_or_domain(self):
         api = FakeApi({})
@@ -807,9 +807,9 @@ class TestCdnInstructions(unittest.TestCase):
             self.assertIn("выкл", out, provider)
 
     def test_removed_providers_have_no_instructions(self):
-        for provider in ("vk", "beeline"):
+        for provider in ("vk", "beeline", "timeweb"):
             out = self._print(provider)
-            for word in ("VK Cloud", "CDNvideo", "trbcdn"):
+            for word in ("VK Cloud", "CDNvideo", "trbcdn", "twcstorage"):
                 self.assertNotIn(word, out, provider)
 
     def test_yandex_steps_carry_real_values_not_placeholders(self):
@@ -822,11 +822,6 @@ class TestCdnInstructions(unittest.TestCase):
                       "Имя SNI-хоста:          origin.example.com",
                       "CNAME  jsq98fs.example.com"):
             self.assertIn(value, out)
-
-    def test_timeweb_does_not_demand_a_client_domain(self):
-        out = self._print("timeweb", "")
-        self.assertIn("1.2.3.4", out)
-        self.assertNotIn("Домен для клиентов", out)
 
 
 class TestCdnSelection(unittest.TestCase):
@@ -873,8 +868,8 @@ class TestCdnDomains(unittest.TestCase):
                                                   "cdn.e.com")), 1)
 
     def test_preset_domain_is_validated_not_trusted(self):
-        good, _ = quiet(inst.ask_domain, "?", "xxx.cdn.twcstorage.ru")
-        self.assertEqual(good, "xxx.cdn.twcstorage.ru")
+        good, _ = quiet(inst.ask_domain, "?", "c5d6df02.topology.gslb.yccdn.ru")
+        self.assertEqual(good, "c5d6df02.topology.gslb.yccdn.ru")
         bad, out = quiet(inst.ask_domain, "?", "not a domain")
         self.assertEqual(bad, "")                    # не уедет в vless-ссылку
         self.assertIn("не похож на домен", out)
@@ -1205,7 +1200,7 @@ class TestMainFlow(unittest.TestCase):
             os.geteuid, sys.argv, sys.stdin = geteuid, argv_saved, stdin
 
     BASE = ["--domain", "e.com", "--skip-dns-wait", "--skip-cdn-wait", "--no-wipe",
-            "--cdn-domain", "xxx.cdn.twcstorage.ru"]
+            "--cdn-domain", "c5d6df02.topology.gslb.yccdn.ru"]
 
     def test_install_runs_without_tty(self):
         seen, out = self._main(["--mode", "1", "--cdn", "yandex"] + self.BASE)
@@ -1219,7 +1214,7 @@ class TestMainFlow(unittest.TestCase):
         self.assertIn("install_remnawave", seen)
 
     def test_cdn_only_mode_reports_and_keeps_given_path(self):
-        seen, out = self._main(["--mode", "3", "--cdn", "timeweb", "--path",
+        seen, out = self._main(["--mode", "3", "--path",
                                 "/upload/data/ab", "--xport", "4443"] + self.BASE)
         self.assertEqual(seen["install_cdn_only"]["path"], "/upload/data/ab")
         self.assertIn("только CDN", out)
@@ -1227,7 +1222,7 @@ class TestMainFlow(unittest.TestCase):
     def test_client_domain_goes_into_link_and_dns(self):
         seen, out = self._main(["--mode", "1", "--cdn", "yandex",
                                 "--client-domain", "cdn.e.com"] + self.BASE)
-        self.assertIn("CNAME  cdn.e.com  ->  xxx.cdn.twcstorage.ru", out)
+        self.assertIn("CNAME  cdn.e.com  ->  c5d6df02.topology.gslb.yccdn.ru", out)
         a_record = re.search(r"A\s+(\S+)\s+->\s+203\.0\.113\.9", out)
         self.assertIsNotNone(a_record, out)
         self.assertTrue(a_record.group(1).endswith(".e.com"))

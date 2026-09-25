@@ -2670,8 +2670,8 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
 def cdn_dns_records(origin, my_ip, cdn_domain, client_domain=""):
     """Строки DNS-записей под CDN: A на origin и CNAME своего домена.
 
-    Домен CDN провайдер выдаёт технический (xxx.cdn.twcstorage.ru,
-    xxx.edgecdn.ru). Если клиентам показывают свой — он направляется на
+    Домен CDN провайдер выдаёт технический (xxxxxxxx.topology.gslb.yccdn.ru).
+    Если клиентам показывают свой — он направляется на
     технический именно CNAME-записью, A тут не годится: адреса edge-узлов
     провайдер меняет без предупреждения.
     """
@@ -2877,7 +2877,7 @@ def parse_args():
     p.add_argument("--origin-domain", help="Домен источника для CDN. Без него "
                    "берётся случайный поддомен вида a7f3k2.<домен>")
     p.add_argument("--cdn-domain", help="Технический домен ресурса CDN "
-                   "(например xxx.cdn.twcstorage.ru) — иначе спросим в конце")
+                   "(вида xxxxxxxx.topology.gslb.yccdn.ru) — иначе спросим в конце")
     p.add_argument("--client-domain", help="Свой домен для клиентов: CNAME на "
                    "технический домен CDN. Без него клиенты идут на технический")
     p.add_argument("--skip-dns-wait", action="store_true")
