@@ -782,14 +782,10 @@ class TestCdnInstructions(unittest.TestCase):
                        "origin.example.com", client, "1.2.3.4", "/uploadfiles/abc")
         return out
 
-    def test_every_provider_prints_the_source_and_the_path(self):
-        # источник у Yandex — имя, у Timeweb — IP: в инструкции должно стоять
-        # ровно то, что человек вобьёт в консоли провайдера
+    def test_instructions_print_the_origin_and_the_path(self):
         for provider in inst.CDN_NAMES.values():
             out = self._print(provider)
-            want = ("origin.example.com" if inst.origin_needs_dns(provider)
-                    else "1.2.3.4")
-            self.assertIn(want, out, provider)
+            self.assertIn("origin.example.com", out, provider)
             self.assertIn("/uploadfiles/abc", out, provider)
             self.assertNotIn("%s", out, provider)
 
@@ -834,20 +830,22 @@ class TestCdnInstructions(unittest.TestCase):
 
 
 class TestCdnSelection(unittest.TestCase):
-    def test_only_yandex_and_timeweb_remain(self):
-        self.assertEqual(sorted(inst.CDN_NAMES.values()), ["timeweb", "yandex"])
+    def test_only_yandex_remains(self):
+        self.assertEqual(sorted(inst.CDN_NAMES.values()), ["yandex"])
 
     def test_provider_accepted_by_name(self):
-        for name in ("yandex", "Timeweb", " timeweb "):
-            self.assertEqual(quiet(inst.resolve_cdn, name)[0], name.strip().lower())
+        for name in ("yandex", "Yandex", " yandex "):
+            self.assertEqual(quiet(inst.resolve_cdn, name)[0], "yandex")
 
-    def test_digits_follow_new_numbering_with_a_notice(self):
-        value, out = quiet(inst.resolve_cdn, "2")
-        self.assertEqual(value, "timeweb")           # раньше 2 был Yandex
-        self.assertIn("Нумерация CDN изменилась", out)
+    def test_timeweb_falls_back_to_yandex_with_the_reason(self):
+        # у Timeweb CDN пропускает только пути с расширением в последнем
+        # сегменте, а XHTTP шлёт /путь/<сессия>/<номер> — туннель не проходит
+        value, out = quiet(inst.resolve_cdn, "timeweb")
+        self.assertEqual(value, "yandex")
+        self.assertIn("403", out)
 
     def test_removed_provider_numbers_are_refused(self):
-        for old in ("3", "4", "9"):
+        for old in ("2", "3", "4", "9"):
             value, out = quiet(inst.resolve_cdn, old)
             self.assertEqual(value, "")
             self.assertIn("не существует", out)
@@ -1525,110 +1523,6 @@ class TestNodeReloadClients(unittest.TestCase):
             self.assertIn("node_reload_clients()", src, fn.__name__)
             self.assertLess(src.index("publish_for_clients"),
                             src.index("node_reload_clients()"), fn.__name__)
-
-
-class TestCdnDomainHint(unittest.TestCase):
-    def test_every_provider_has_its_own_place_named(self):
-        for provider in inst.CDN_NAMES.values():
-            self.assertIn(provider, inst.CDN_DOMAIN_HINT, provider)
-        # подсказка Yandex не должна попадать в вопрос про Timeweb
-        self.assertNotIn("Настройки DNS", inst.CDN_DOMAIN_HINT["timeweb"])
-        self.assertIn("Настройки DNS", inst.CDN_DOMAIN_HINT["yandex"])
-
-
-class TestOriginDns(unittest.TestCase):
-    """A-запись на источник просят только там, где CDN ходит по имени."""
-
-    def test_yandex_needs_it_timeweb_does_not(self):
-        self.assertTrue(inst.origin_needs_dns("yandex"))
-        self.assertFalse(inst.origin_needs_dns("timeweb"))
-
-    def test_cdn_records_skip_the_origin_row_for_timeweb(self):
-        rows = inst.cdn_dns_records("o.e.com", "1.2.3.4", "x.cdn.twcstorage.ru",
-                                    cdn_name="timeweb")
-        self.assertNotIn("o.e.com", " ".join(rows))
-
-    def test_cdn_records_keep_it_for_yandex(self):
-        rows = inst.cdn_dns_records("o.e.com", "1.2.3.4", "x.yccdn.ru",
-                                    client_domain="c.e.com", cdn_name="yandex")
-        joined = " ".join(rows)
-        self.assertIn("o.e.com", joined)
-        self.assertIn("CNAME  c.e.com", joined)
-
-    def test_timeweb_instructions_name_the_ip_not_the_origin_domain(self):
-        _, out = quiet(inst.print_cdn_instructions, "timeweb", "o.e.com", "",
-                       "1.2.3.4", "/a/b")
-        self.assertNotIn("o.e.com", out)
-        self.assertIn("1.2.3.4", out)
-
-    def test_timeweb_install_does_not_ask_for_the_origin_record(self):
-        orig = inst.choose
-        inst.choose = lambda prompt, options: 2          # Timeweb
-        try:
-            _, out = TestMainFlow._main(
-                TestMainFlow(methodName="run"),
-                ["--mode", "1", "--domain", "e.com", "--skip-cdn-wait",
-                 "--no-wipe", "--cdn-domain", "xxx.cdn.twcstorage.ru"])
-        finally:
-            inst.choose = orig
-        # домен панели просим, случайный поддомен источника — нет
-        self.assertIn("A     e.com", out)
-        self.assertNotIn(".e.com   ->", out)
-
-
-class TestOriginCertFromMenu(unittest.TestCase):
-    """Провайдер из меню решает всё сам — флаги для этого не нужны."""
-
-    def _pick(self, choice):
-        """Пройти main(), выбрав провайдера пунктом меню, без --cdn."""
-        orig = inst.choose
-        inst.choose = lambda prompt, options: choice
-        try:
-            seen, _ = TestMainFlow._main(
-                TestMainFlow(methodName="run"),
-                ["--mode", "1", "--domain", "e.com", "--skip-dns-wait",
-                 "--skip-cdn-wait", "--no-wipe",
-                 "--cdn-domain", "xxx.cdn.twcstorage.ru"])
-        finally:
-            inst.choose = orig
-        return seen["install_remnawave"]
-
-    def test_picking_timeweb_skips_the_origin_certificate(self):
-        cfg = self._pick(2)
-        self.assertEqual(cfg["cdn"], "timeweb")
-        self.assertTrue(cfg["no_origin_le"])
-
-    def test_picking_yandex_still_issues_it(self):
-        cfg = self._pick(1)
-        self.assertEqual(cfg["cdn"], "yandex")
-        self.assertFalse(cfg["no_origin_le"])
-
-
-class TestOriginCertDecision(unittest.TestCase):
-    """Сертификат источника нужен Yandex и не нужен Timeweb."""
-
-    class Args(object):
-        def __init__(self, no_origin_le=False, origin_le=False):
-            self.no_origin_le = no_origin_le
-            self.origin_le = origin_le
-
-    def test_yandex_gets_a_certificate_by_default(self):
-        self.assertTrue(inst.want_origin_cert("yandex", self.Args()))
-
-    def test_timeweb_skips_it_without_any_flag(self):
-        # Timeweb ходит к источнику по HTTP: сертификат не участвует, а
-        # выпуск тратит лимит LE и светит имя источника в CT-логах
-        self.assertFalse(inst.want_origin_cert("timeweb", self.Args()))
-
-    def test_flags_override_the_provider_both_ways(self):
-        self.assertTrue(inst.want_origin_cert("timeweb",
-                                              self.Args(origin_le=True)))
-        self.assertFalse(inst.want_origin_cert("yandex",
-                                               self.Args(no_origin_le=True)))
-
-    def test_no_origin_le_wins_over_origin_le(self):
-        args = self.Args(no_origin_le=True, origin_le=True)
-        self.assertFalse(inst.want_origin_cert("yandex", args))
 
 
 if __name__ == "__main__":

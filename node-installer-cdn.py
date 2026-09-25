@@ -16,7 +16,7 @@ node-installer-cdn.py — установщик прокси-инфраструк
   1  Панель + нода на этом сервере
   2  Нода + CDN к уже существующей панели (панель — по SSH)
   3  Только CDN перед уже работающей нодой
-Панель: Remnawave 3.x. CDN: Yandex Cloud / Timeweb.
+Панель: Remnawave 3.x. CDN: Yandex Cloud.
 
 ЗАПУСК
 ------
@@ -1538,12 +1538,12 @@ NODE_COUNTRY = "RU"               # флаг в панели: трафик кл�
 
 
 def profile_name(cdn_name):
-    """Имя профиля в панели: CDN-YANDEX, CDN-TIMEWEB."""
+    """Имя профиля в панели: CDN-YANDEX."""
     return "CDN-%s" % cdn_name.upper()
 
 
 def host_remark(cdn_name):
-    """Подпись хоста в панели и в клиенте: «Yandex bypass», «Timeweb bypass»."""
+    """Подпись хоста в панели и в клиенте: «Yandex bypass»."""
     return "%s bypass" % cdn_name.capitalize()
 
 
@@ -2532,22 +2532,6 @@ def setup_panel_web(cfg, xport, path):
     upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
 
 
-def want_origin_cert(cdn_name, args):
-    """Нужен ли origin настоящий сертификат Let's Encrypt.
-
-    Решает провайдер, а не пользователь: Yandex ходит к источнику по HTTPS и
-    проверяет его имя, Timeweb — по HTTP на порт 80, и сертификат там не
-    участвует вообще. Выпускать его для Timeweb значит зря потратить
-    недельный лимит Let's Encrypt и опубликовать имя источника в CT-логах.
-    Флагами можно переспорить в обе стороны.
-    """
-    if args.no_origin_le:
-        return False
-    if args.origin_le:
-        return True
-    return cdn_name != "timeweb"
-
-
 def upgrade_origin_cert(origin_domain, skip=False):
     """Заменить self-signed на Let's Encrypt для origin, если получится.
 
@@ -2612,18 +2596,14 @@ server {
 def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
     """Инструкция провайдеру — с подставленными значениями, а не примерами.
 
-    provider: yandex|timeweb. client_domain — домен, который увидят клиенты;
-    у Yandex он обязателен (на техническом домене нет вашего сертификата), у
-    Timeweb может быть пустым — там технический домен годится как есть.
+    client_domain — домен, который увидят клиенты; он обязателен: вашего
+    сертификата на техническом домене Yandex нет.
     """
     print("", flush=True)
     print("  " + _c("1;" + C_TITLE, "Настройка CDN у провайдера")
           + _c(C_DIM, " · %s" % provider), flush=True)
     hr()
-    if origin_needs_dns(provider):
-        say("  Origin:              %s   (A -> %s)" % (origin, my_ip))
-    else:
-        say("  Источник:            %s   (по IP, имя не участвует)" % my_ip)
+    say("  Origin:              %s   (A -> %s)" % (origin, my_ip))
     if client_domain:
         say("  Домен для клиентов:  %s" % client_domain)
     say("  Путь туннеля:        /%s/\n" % path.strip("/"))
@@ -2686,105 +2666,8 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
 """ % (cert, client_domain, client_domain,
        origin.split(".")[0], origin, origin.split(".")[0],
        origin, origin, client_domain, cert, client_domain))
-    elif provider == "timeweb":
-        say("""  ШАГ 1 · Создание ресурса
-  timeweb.cloud -> CDN -> Добавить CDN-ресурс
-    1. Источник контента:
-       - Вкладка:                IP-адрес   (не "Домен" и не "S3-бакет")
-       - IP-адрес:               %s:80
-         Порт обязателен. Без него Timeweb берёт 443, идёт туда по HTTPS
-         и упирается в самоподписанный сертификат — ресурс отдаёт 502.
-       - "Использовать HTTPS соединение для источника":  СНЯТЬ
-         При создании галка стоит. По HTTP идёт только участок
-         CDN -> ваш сервер; клиент до CDN идёт по HTTPS.
-       Сюда вписывается ВАШ СЕРВЕР. Домен, который вы собираетесь отдать
-       клиентам, источником быть не может: он ведёт на сам CDN, и
-       получится петля.
-    2. Тариф: платите за исходящий трафик, менять нечего.
-    3. Информация: название любое. Нажмите "Заказать".
 
-  ШАГ 2 · Проверка настроек (менять почти наверняка нечего)
-  Вкладка "Управление". Всё, что ломает туннель, Timeweb по умолчанию
-  держит выключенным — пройдитесь и убедитесь:
-       - Кэширование -> CDN-кэширование:            ВЫКЛ
-       - Кэширование -> Кэширование в браузере:     ВЫКЛ
-       - Кэширование -> Всегда онлайн:              ВЫКЛ
-       - Кэширование -> Учитывать query string:     ВЫКЛ
-       - Контент и подключение -> HTTP/3:           ВЫКЛ
-       - Контент и подключение -> Сжатие Gzip:      ВЫКЛ
-       - Контент и подключение -> Ускорение
-         загрузки больших файлов:                   ВЫКЛ
-       - Безопасность -> Secure token:              ВЫКЛ
-       - HTTP-заголовки:                            ничего не добавлять
-  Кеш ломает туннель: он передаёт не файлы, а поток запросов, и
-  закешированный ответ уйдёт не тому клиенту.
-
-  ШАГ 3 · Дождаться статуса "Доступен"
-  Пока вверху "Применяются настройки", CDN отдаёт 403 на ВСЕ пути,
-  включая /. Это не ошибка настройки: узел ещё не принял ресурс в
-  раздачу и на источник даже не ходит. Обычно 10-20 минут.
-       curl -sSI https://<ваш>.cdn.twcstorage.ru/ | head -3
-  403 с заголовком x-reason-code: 7 — ещё раскатывается.
-
-  ШАГ 4 · Технический домен
-  Дашборд ресурса -> блок "Ресурсы" -> строка "Домен":
-       xxxxxxxxxx.cdn.twcstorage.ru
-  Скопируйте кнопкой, не набирайте руками: там легко спутать 0 и O,
-  l и 1. Его и вводите ниже. Сертификат на нём уже валидный, отдавать
-  клиентам можно как есть — свой домен НЕ обязателен.
-  Вкладка "SSL-сертификаты" при этом пишет "Нет подходящих
-  сертификатов" — это нормально, она только про свои домены.
-
-  ШАГ 5 · Свой домен — если хотите (необязательно)
-  Порядок жёсткий, иначе не выпустится сертификат:
-    1. Управление -> Источник и домены раздачи -> "+ Добавить домен"
-       (до 2 своих поддоменов), вписать домен и СОХРАНИТЬ.
-    2. У DNS-провайдера завести CNAME:
-           Name:   <поддомен>              (только имя, без зоны)
-           Target: xxxxxxxxxx.cdn.twcstorage.ru
-           Без проксирования (в Cloudflare — серое облачко).
-       Не перепутайте местами: слева ваше имя, справа чужое.
-    3. ПРОВЕРИТЬ, что запись реально попала в зону, — она может
-       показываться в панели DNS и при этом не отдаваться:
-           dig +short <ваш домен> @<авторитетный NS зоны>
-       NS берётся так:  dig +short NS <ваша зона>
-       Должен вернуться технический домен CDN, а через обычный
-       резолвер (@1.1.1.1) — ещё и IP-адреса.
-    4. Только теперь "SSL-сертификаты" -> "Выпустить Let's Encrypt".
-       Пока домен не резолвится, Timeweb отвечает "Не у всех доменов
-       правильно настроены DNS-записи". Выпуск занимает минуты.
-  Пока добавленный домен не доведён до конца, ресурс может отдавать
-  403 и на техническом домене — доделайте домен или уберите его
-  крестиком из списка.
-
-  Если 403 держится после статуса "Доступен": узел кеширует отказы, и
-  сброс кеша (иконка метёлки на странице ресурса) расходится не сразу.
-  Проверяйте адресом, который ещё не запрашивали.
-""" % my_ip)
-
-
-# Где у провайдера лежит технический домен ресурса — подсказка в вопросе.
-# Раньше тут стоял «блок Настройки DNS» для всех, а это формулировка Yandex:
-# в консоли Timeweb такого блока нет вовсе.
-CDN_DOMAIN_HINT = {
-    "yandex": "из блока «Настройки DNS» на странице ресурса",
-    "timeweb": "Дашборд ресурса → «Ресурсы» → «Домен»",
-}
-
-
-def origin_needs_dns(cdn_name):
-    """Нужна ли A-запись на домен источника.
-
-    Yandex ходит к источнику по имени (SNI и заголовок Host), Timeweb — по
-    IP-адресу и порту 80. Для Timeweb имя источника не участвует нигде:
-    сертификат для него не выпускается (см. want_origin_cert), в ресурсе CDN
-    стоит IP, а nginx отдаёт туннель на default_server. Просить такую запись
-    значит гонять человека в DNS без причины.
-    """
-    return cdn_name != "timeweb"
-
-
-def cdn_dns_records(origin, my_ip, cdn_domain, client_domain="", cdn_name=""):
+def cdn_dns_records(origin, my_ip, cdn_domain, client_domain=""):
     """Строки DNS-записей под CDN: A на origin и CNAME своего домена.
 
     Домен CDN провайдер выдаёт технический (xxx.cdn.twcstorage.ru,
@@ -2792,9 +2675,7 @@ def cdn_dns_records(origin, my_ip, cdn_domain, client_domain="", cdn_name=""):
     технический именно CNAME-записью, A тут не годится: адреса edge-узлов
     провайдер меняет без предупреждения.
     """
-    rows = []
-    if not cdn_name or origin_needs_dns(cdn_name):
-        rows.append("A      %s  ->  %s   (источник CDN, DNS only)" % (origin, my_ip))
+    rows = ["A      %s  ->  %s   (источник CDN, DNS only)" % (origin, my_ip)]
     if client_domain and cdn_domain:
         rows.append("CNAME  %s  ->  %s   (домен для клиентов)"
                     % (client_domain, cdn_domain))
@@ -2949,8 +2830,8 @@ def parse_args():
                    "2=Node+CDN to existing panel, 3=CDN origin only")
     # Панель только Remnawave: флаг остался ради старых команд (--panel 1)
     p.add_argument("--panel", help=argparse.SUPPRESS)
-    p.add_argument("--cdn", help="CDN provider: yandex | timeweb "
-                   "(или номером: 1=Yandex, 2=Timeweb)")
+    # Провайдер остался один; флаг принимается, чтобы не ломать старые команды.
+    p.add_argument("--cdn", help=argparse.SUPPRESS)
     p.add_argument("--front", choices=["nginx", "caddy"], default="nginx",
                    help="Origin-фронт: nginx (по умолчанию) или caddy "
                         "(в режиме с панелью caddy обслуживает и панель "
@@ -2987,9 +2868,6 @@ def parse_args():
     p.add_argument("--no-origin-le", action="store_true",
                    help="Не выпускать Let's Encrypt для источника "
                    "(оставить самоподписанный)")
-    p.add_argument("--origin-le", action="store_true",
-                   help="Выпустить Let's Encrypt для источника даже там, где "
-                   "он не нужен (Timeweb ходит к источнику по HTTP)")
     p.add_argument("--wipe", action="store_true",
                    help="Снести прошлую установку без вопросов (для автозапуска)")
     p.add_argument("--no-wipe", action="store_true",
@@ -3237,32 +3115,33 @@ def choose(prompt, options):
              (", а не '%s'" % v[:20]) if v else ""))
 
 
-CDN_NAMES = {1: "yandex", 2: "timeweb"}
-CDN_LABELS = {1: "Yandex Cloud", 2: "Timeweb"}
+CDN_NAMES = {1: "yandex"}
+CDN_LABELS = {1: "Yandex Cloud"}
 
 
 def resolve_cdn(value):
     """Провайдер из --cdn: имя ('yandex') или номер. '' — значение негодное.
 
-    VK Cloud и Beeline (CDNvideo) убраны, номера сдвинулись: раньше 2 был
-    Yandex, а 4 — Timeweb. Старый номер молча означал бы другого провайдера,
-    поэтому про смену нумерации говорим вслух. Установку это не рушит: выбор
-    провайдера влияет только на печатаемую инструкцию и имя тега инбаунда,
-    поэтому спрашивать подтверждение (как у --mode) здесь незачем.
+    Провайдер остался один. Timeweb убран: его CDN пропускает на источник
+    только запросы, последний сегмент пути которых похож на файл (есть
+    расширение), а XHTTP шлёт /<путь>/<сессия>/<номер> — и каждый такой
+    запрос отбивается 403, не доходя до сервера. Проверено на живом ресурсе:
+    /a/b/t.m3u8 -> 404 от источника, /a/b/t.m3u8/abc123/0 -> 403 от CDN.
     """
     value = (value or "").strip().lower()
     if value in CDN_NAMES.values():
         return value
+    if value == "timeweb":
+        err("Timeweb убран: его CDN отбивает запросы туннеля (403), потому "
+            "что в последнем сегменте пути нет расширения файла")
+        say("  Остался Yandex Cloud — ставлю его")
+        return "yandex"
     if not value.isdigit():
         return ""
     num = int(value)
-    numbering = ", ".join("%d=%s" % (i, CDN_LABELS[i]) for i in sorted(CDN_LABELS))
     if num not in CDN_NAMES:
-        err("CDN '%s' не существует: VK Cloud и Beeline убраны, осталось %s"
-            % (value, numbering))
+        err("CDN '%s' не существует: остался только 1 = Yandex Cloud" % value)
         return ""
-    warn("Нумерация CDN изменилась (VK и Beeline убраны): %s — ставлю %s"
-         % (numbering, CDN_LABELS[num]))
     return CDN_NAMES[num]
 
 
@@ -3390,12 +3269,9 @@ def main():
             % args.panel)
         sys.exit(1)
 
-    # ── CDN: нужен во всех режимах ──
-    if args.cdn:
-        cdn_name = resolve_cdn(args.cdn)
-    else:
-        cdn_name = CDN_NAMES[choose("CDN провайдер?",
-                                    [CDN_LABELS[i] for i in sorted(CDN_LABELS)])]
+    # ── CDN ──
+    # Провайдер один, спрашивать нечего: флаг принимается ради старых команд.
+    cdn_name = resolve_cdn(args.cdn) if args.cdn else "yandex"
     if not cdn_name:
         sys.exit(1)
 
@@ -3443,24 +3319,17 @@ def main():
     cfg = {"mode": mode, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
            "xport": xport,
-           "no_origin_le": not want_origin_cert(cdn_name, args),
-           "front": args.front}
+           "no_origin_le": args.no_origin_le, "front": args.front}
 
     # ── DNS ──
     # Обе записи — A на этот сервер. Домен панели CNAME'ить на CDN нельзя:
     # Let's Encrypt проверяет его прямо здесь, по webroot. Домен CDN клиенту
     # выдаёт провайдер, он в DNS не заводится.
-    records = []
-    if origin_needs_dns(cdn_name):
-        records.append("A     %s   ->  %s   (DNS only, серое облако)"
-                       % (origin, my_ip))
+    records = ["A     %s   ->  %s   (DNS only, серое облако)" % (origin, my_ip)]
     if mode != "3":
         records.append("A     %s   ->  %s   (DNS only) — панель и её сертификат"
                        % (domain, my_ip))
-    if records:
-        dns_wait(records, skip=args.skip_dns_wait)
-    else:
-        say("  DNS-записи не нужны: %s ходит к источнику по IP" % cdn_name)
+    dns_wait(records, skip=args.skip_dns_wait)
 
     # ── снести прошлую установку тех компонентов, которые ставим сейчас ──
     if state_is_done("wipe"):
@@ -3515,8 +3384,7 @@ def main():
     # Технический домен уходит в CNAME; опечатка здесь даёт рабочую на вид,
     # но неподключаемую подписку
     cdn_domain = ask_domain(
-        "Технический домен CDN (%s)"
-        % CDN_DOMAIN_HINT.get(cdn_name, "со страницы ресурса"),
+        "Технический домен CDN (из блока «Настройки DNS» на странице ресурса)",
         args.cdn_domain)
     if not client_domain:
         client_domain = ask_domain(
@@ -3524,8 +3392,7 @@ def main():
             % (cdn_domain or "домен CDN"), "")
     if cdn_domain or client_domain:
         callout("DNS для CDN",
-                cdn_dns_records(origin, my_ip, cdn_domain, client_domain,
-                                cdn_name))
+                cdn_dns_records(origin, my_ip, cdn_domain, client_domain))
     public_domain = client_domain or cdn_domain
 
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
@@ -3541,10 +3408,7 @@ def main():
 
     # ── финальный отчёт ──
     cdn_val = public_domain or "— укажи после настройки провайдера"
-    # У Timeweb источник задаётся IP: печатать имя с A-записью значит
-    # обещать запись, которой нигде нет.
-    origin_row = ("Origin", "%s  (A → %s)" % (origin, my_ip)) \
-        if origin_needs_dns(cdn_name) else ("Источник", "%s  (по IP)" % my_ip)
+    origin_row = ("Origin", "%s  (A → %s)" % (origin, my_ip))
     if mode == "3":
         rows = [("Режим", "только CDN"),
                 origin_row,
