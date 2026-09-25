@@ -1527,6 +1527,15 @@ class TestNodeReloadClients(unittest.TestCase):
                             src.index("node_reload_clients()"), fn.__name__)
 
 
+class TestCdnDomainHint(unittest.TestCase):
+    def test_every_provider_has_its_own_place_named(self):
+        for provider in inst.CDN_NAMES.values():
+            self.assertIn(provider, inst.CDN_DOMAIN_HINT, provider)
+        # подсказка Yandex не должна попадать в вопрос про Timeweb
+        self.assertNotIn("Настройки DNS", inst.CDN_DOMAIN_HINT["timeweb"])
+        self.assertIn("Настройки DNS", inst.CDN_DOMAIN_HINT["yandex"])
+
+
 class TestOriginDns(unittest.TestCase):
     """A-запись на источник просят только там, где CDN ходит по имени."""
 

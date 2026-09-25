@@ -2738,6 +2738,15 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
 """ % my_ip)
 
 
+# Где у провайдера лежит технический домен ресурса — подсказка в вопросе.
+# Раньше тут стоял «блок Настройки DNS» для всех, а это формулировка Yandex:
+# в консоли Timeweb такого блока нет вовсе.
+CDN_DOMAIN_HINT = {
+    "yandex": "из блока «Настройки DNS» на странице ресурса",
+    "timeweb": "Дашборд ресурса → «Ресурсы» → «Домен»",
+}
+
+
 def origin_needs_dns(cdn_name):
     """Нужна ли A-запись на домен источника.
 
@@ -3480,8 +3489,10 @@ def main():
         pause("Enter когда CDN настроен и серт выпущен")
     # Технический домен уходит в CNAME; опечатка здесь даёт рабочую на вид,
     # но неподключаемую подписку
-    cdn_domain = ask_domain("Технический домен CDN (из блока «Настройки DNS»)",
-                            args.cdn_domain)
+    cdn_domain = ask_domain(
+        "Технический домен CDN (%s)"
+        % CDN_DOMAIN_HINT.get(cdn_name, "со страницы ресурса"),
+        args.cdn_domain)
     if not client_domain:
         client_domain = ask_domain(
             "Свой домен для клиентов, CNAME на %s (Enter — пропустить)"
