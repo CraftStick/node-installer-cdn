@@ -18,6 +18,7 @@ import hashlib
 import os
 import re
 import sys
+import inspect
 import contextlib
 import importlib.util
 import tempfile
@@ -1481,6 +1482,42 @@ class TestRefactorRegressions(unittest.TestCase):
                 self.assertEqual(inst.panel_env_value("MISSING"), "")
             finally:
                 inst.PANEL_ENV = orig
+
+
+class TestNodeReloadClients(unittest.TestCase):
+    """Нода должна забрать пользователей сразу, а не через несколько минут."""
+
+    def test_restarts_the_node_and_waits_for_it(self):
+        seen = []
+        orig = inst.node_wait_ready
+        inst.node_wait_ready = lambda: seen.append("wait") or True
+        try:
+            with fake_run() as cmds:
+                (res, _) = quiet(inst.node_reload_clients)
+        finally:
+            inst.node_wait_ready = orig
+        self.assertIn("docker restart remnanode", "\n".join(cmds))
+        self.assertEqual(seen, ["wait"])
+        self.assertTrue(res)
+
+    def test_failed_restart_warns_with_the_manual_command(self):
+        orig = inst.node_wait_ready
+        inst.node_wait_ready = lambda: True
+        try:
+            with fake_run({"docker restart": ("no such container", 1)}):
+                (res, out) = quiet(inst.node_reload_clients)
+        finally:
+            inst.node_wait_ready = orig
+        self.assertFalse(res)
+        self.assertIn("docker restart remnanode", out)
+
+    def test_both_install_modes_reload_after_creating_the_user(self):
+        # порядок важен: перезапуск до создания юзера ничего не даёт
+        for fn in (inst.install_remnawave, inst.install_node_only):
+            src = inspect.getsource(fn)
+            self.assertIn("node_reload_clients()", src, fn.__name__)
+            self.assertLess(src.index("publish_for_clients"),
+                            src.index("node_reload_clients()"), fn.__name__)
 
 
 if __name__ == "__main__":

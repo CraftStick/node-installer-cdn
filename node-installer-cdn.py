@@ -1880,6 +1880,7 @@ def install_remnawave(cfg):
 
     host_uuid, sub_url, user_uuid = publish_for_clients(
         api, cfg, prof_uuid, inbounds, tag2uuid, user_uuid, domain)
+    node_reload_clients()
 
     return {"token": token, "user_uuid": user_uuid, "sub_url": sub_url,
             "prof_uuid": prof_uuid,
@@ -2192,6 +2193,26 @@ def node_wait_ready():
         time.sleep(5)
     warn("Нода не отрапортовала о запуске — проверь: docker logs remnanode")
     return False
+
+
+def node_reload_clients():
+    """Перезапустить ноду, чтобы она сразу забрала пользователей из панели.
+
+    Конфиг нода получает при старте, а юзер создаётся позже — на свежей
+    установке она остаётся с пустым списком клиентов. Панель дошлёт его сама,
+    но не сразу, и всё это время клиент подключается «успешно» и не передаёт
+    ни байта: nginx отдаёт 200 на каждый запрос, а xray рвёт поток на
+    авторизации, потому что такого id он не знает. Перезапуск убирает это
+    окно: на старте нода запрашивает конфиг заново, уже с юзером.
+    """
+    say("  Перезапуск ноды, чтобы она забрала пользователей...")
+    _, rc = run("docker restart remnanode", timeout=120)
+    if rc != 0:
+        warn("нода не перезапустилась — пользователи появятся на ней с задержкой")
+        say("  Если сразу после установки соединение есть, а трафика нет: "
+            "docker restart remnanode")
+        return False
+    return node_wait_ready()
 
 
 def build_xray_profile(name, inbounds):
@@ -2780,6 +2801,7 @@ def install_node_only(cfg):
     host_uuid, sub_url, user_uuid = publish_for_clients(
         api, cfg, prof_uuid, inbounds, tag2uuid, user_uuid,
         pdom.strip() or panel["ip"])
+    node_reload_clients()
     return {"user_uuid": user_uuid, "prof_uuid": prof_uuid, "my_ip": my_ip,
             "sub_url": sub_url, "host_uuid": host_uuid, "api": api}
 
