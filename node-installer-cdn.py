@@ -2732,8 +2732,11 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
   проверьте источник, подтянется чужой, и CDN пойдёт не к вам.
 
   ШАГ 3 · DNS
-  На странице ресурса, блок "Настройки DNS", будет значение вида
-  xxxxxxxx.topology.gslb.yccdn.ru. Заведите запись так:
+  На странице ресурса, внизу, блок "Настройки DNS". Там две строки:
+       $ORIGIN %s          <- ваш домен, он уже известен
+       CNAME   xxxxxxxx.topology.gslb.yccdn.ru   <- нужно ЭТО
+  Вторую и копируйте — её же введёте ниже в ответ на вопрос. Заведите
+  запись так:
        Type:   CNAME
        Name:   %s
        Target: <значение из блока "Настройки DNS">
@@ -2748,7 +2751,7 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
   только перезапускают отсчёт.
 """ % (cert, client_domain, client_domain, client_domain,
        origin, origin, origin, client_domain, cert,
-       client_domain, client_domain))
+       client_domain, client_domain, client_domain))
 
 
 def cdn_dns_records(origin, my_ip, cdn_domain, client_domain=""):
@@ -3478,8 +3481,10 @@ def main():
         pause("Enter когда CDN настроен и серт выпущен")
     # Технический домен уходит в CNAME; опечатка здесь даёт рабочую на вид,
     # но неподключаемую подписку
+    # В блоке «Настройки DNS» две строки: $ORIGIN с вашим же доменом и CNAME
+    # со значением провайдера. Нужна вторая, и спросить надо именно так.
     cdn_domain = ask_domain(
-        "Технический домен CDN (из блока «Настройки DNS» на странице ресурса)",
+        "Значение CNAME из блока «Настройки DNS» (вида ...yccdn.ru)",
         args.cdn_domain)
     if not client_domain:
         client_domain = ask_domain(

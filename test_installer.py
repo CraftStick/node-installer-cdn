@@ -835,6 +835,12 @@ class TestCdnInstructions(unittest.TestCase):
                       "Name:   jsq98fs.example.com"):
             self.assertIn(value, out)
 
+    def test_dns_block_says_which_of_the_two_lines_to_copy(self):
+        # в блоке «Настройки DNS» две строки, и $ORIGIN — это свой же домен
+        out = self._print("yandex", "cdn.example.com")
+        self.assertIn("$ORIGIN cdn.example.com", out)
+        self.assertIn("нужно ЭТО", out)
+
     def test_resource_form_marks_which_domain_is_which(self):
         """Поля источника и ресурса называются похоже — подписываем их."""
         out = self._print("yandex", "cdn.example.com")
