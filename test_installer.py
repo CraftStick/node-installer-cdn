@@ -1483,6 +1483,35 @@ class TestPanelDomain(unittest.TestCase):
             self._main(["--panel-domain", "не домен"])
 
 
+class TestClientDnsCheck(unittest.TestCase):
+    """Домен для клиентов должен резолвиться, иначе установка врёт «ГОТОВО»."""
+
+    def test_passes_when_the_name_resolves(self):
+        with fake_run({"getent": ("203.0.113.9\n", 0)}):
+            res, out = quiet(inst.check_client_dns, "cdn.e.com", "x.yccdn.ru")
+        self.assertTrue(res)
+        self.assertIn("резолвится", out)
+
+    def test_names_the_missing_record(self):
+        orig = inst.time.sleep
+        inst.time.sleep = lambda s: None
+        try:
+            with fake_run():
+                res, out = quiet(inst.check_client_dns, "cdn.e.com", "x.yccdn.ru",
+                                 tries=2)
+        finally:
+            inst.time.sleep = orig
+        self.assertFalse(res)
+        self.assertIn("не резолвится", out)
+        self.assertIn("Name    cdn.e.com", out)
+        self.assertIn("Target  x.yccdn.ru", out)
+
+    def test_skipped_without_a_client_domain(self):
+        with fake_run() as cmds:
+            self.assertTrue(quiet(inst.check_client_dns, "", "x.yccdn.ru")[0])
+        self.assertEqual(cmds, [])
+
+
 class TestUninstall(unittest.TestCase):
     """--uninstall снимает всё, что установщик клал на сервер."""
 

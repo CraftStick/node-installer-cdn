@@ -3396,6 +3396,34 @@ def vless_link(uuid, domain, path, cdn_name):
                cdn_name))
 
 
+def check_client_dns(client_domain, cdn_domain, tries=6):
+    """Проверить, что домен для клиентов уже резолвится.
+
+    Раньше запись CNAME просто печаталась, и установка рапортовала «ГОТОВО»
+    при домене, которого нет в DNS. Клиент в таком случае не подключается
+    вовсе (в приложении «n/a» вместо пинга), и причину ищут где угодно, кроме
+    единственной незаведённой записи.
+    """
+    if not client_domain:
+        return True
+    for attempt in range(tries):
+        out, _ = run("getent ahostsv4 %s | awk 'NR==1{print $1}'" % shq(client_domain))
+        if out.strip():
+            ok("домен для клиентов %s резолвится" % client_domain)
+            return True
+        if attempt + 1 < tries:
+            say("  жду DNS %s ... (%d/%d)" % (client_domain, attempt + 1, tries))
+            time.sleep(10)
+    warn("домен для клиентов %s не резолвится — клиенты не подключатся"
+         % client_domain)
+    say("  Заведите запись у DNS-провайдера:")
+    say("       Type    CNAME")
+    say("       Name    %s" % client_domain)
+    say("       Target  %s" % (cdn_domain or "<технический домен CDN>"))
+    say("       Proxy   DNS only, серое облачко")
+    return False
+
+
 def final_selfcheck(cfg, xport, path):
     """Локальная проверка готовности origin-фронта после установки.
 
@@ -3646,6 +3674,8 @@ def main():
         callout("DNS для CDN",
                 cdn_dns_records(origin, my_ip, cdn_domain, client_domain))
     public_domain = client_domain or cdn_domain
+    if not args.skip_dns_wait:
+        check_client_dns(client_domain, cdn_domain)
 
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
     if public_domain and result.get("host_uuid"):
