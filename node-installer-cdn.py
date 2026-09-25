@@ -339,6 +339,17 @@ def rand_label():
     return _rng.choice(string.ascii_lowercase) + rand(_rng.randint(5, 7), LOWER_ALNUM)
 
 
+def panel_host(cfg):
+    """Домен панели: свой поддомен, а не корень домена.
+
+    На корне панель стояла бы по угадываемому адресу, а её сертификат
+    выпускался бы на один и тот же набор имён при каждой переустановке — а
+    там недельный лимит Let's Encrypt в 5 штук, в который упираешься после
+    нескольких прогонов подряд. Случайный поддомен снимает оба вопроса.
+    """
+    return cfg.get("panel_domain") or cfg["domain"]
+
+
 def rand_path():
     """Путь xhttp: правдоподобный каталог + случайный хвост.
 
@@ -1742,7 +1753,7 @@ def remnawave_bringup(cfg):
 
     Общая часть подъёма панели Remnawave. Возвращает API-токен
     (или '' при неудаче)."""
-    domain   = cfg["domain"]
+    domain   = panel_host(cfg)
     admin_pw = cfg["admin_pass"]
 
     step("Установка панели Remnawave 3.x")
@@ -1868,7 +1879,7 @@ def remnawave_bringup(cfg):
 
 def install_remnawave(cfg):
     """Install Remnawave 3.x panel + node + profile + host + user (mode 1, local)."""
-    domain   = cfg["domain"]
+    domain   = panel_host(cfg)
     path     = cfg["path"]
     xport    = cfg["xport"]
 
@@ -2562,8 +2573,8 @@ def setup_panel_web(cfg, xport, path):
     продление подхватывается само. Origin остаётся на cdn.crt: его CDN всё
     равно не проверяет.
     """
-    domain = cfg["domain"]
-    origin = cfg.get("origin_domain", domain)
+    domain = panel_host(cfg)
+    origin = cfg.get("origin_domain", cfg["domain"])
     step("nginx: панель и CDN")
     say("  Порядок: пакеты → самоподписанный сертификат → конфиги → "
         "Let's Encrypt для панели и origin")
@@ -2934,6 +2945,8 @@ def parse_args():
                    help="Забыть сохранённый прогресс и начать с нуля")
     p.add_argument("--origin-domain", help="Домен источника для CDN. Без него "
                    "берётся случайный поддомен вида a7f3k2.<домен>")
+    p.add_argument("--panel-domain", help="Домен панели. Без него берётся "
+                   "случайный поддомен вида k9x2mt.<домен>")
     p.add_argument("--cdn-domain", help="Технический домен ресурса CDN "
                    "(вида xxxxxxxx.topology.gslb.yccdn.ru) — иначе спросим в конце")
     p.add_argument("--client-domain", help="Свой домен для клиентов: CNAME на "
@@ -3371,19 +3384,32 @@ def main():
         xport = XHTTP_PORT
     admin_pw = state_value("admin_pw", rand_password)
 
+    # Домен панели — свой поддомен, как и у источника. На корне панель стояла
+    # бы по угадываемому адресу, а её сертификат выпускался бы на один и тот
+    # же набор имён при каждой переустановке — и упирался в недельный лимит
+    # Let's Encrypt. Постоянный между перезапусками: он уже в .env и в vhost.
+    pdom = (args.panel_domain or "").strip()
+    if pdom and not RE_DOMAIN.match(pdom):
+        err("Домен панели '%s' не похож на домен" % pdom)
+        say_homoglyph_hint(pdom)
+        sys.exit(1)
+    pdom = pdom or state_value("panel_domain",
+                               lambda: "%s.%s" % (rand_label(), domain))
+
     cfg = {"mode": mode, "cdn": cdn_name, "domain": domain,
-           "origin_domain": origin, "path": path, "admin_pass": admin_pw,
-           "xport": xport,
+           "origin_domain": origin, "panel_domain": pdom, "path": path,
+           "admin_pass": admin_pw, "xport": xport,
            "no_origin_le": args.no_origin_le, "front": args.front}
 
     # ── DNS ──
     # Обе записи — A на этот сервер. Домен панели CNAME'ить на CDN нельзя:
     # Let's Encrypt проверяет его прямо здесь, по webroot. Домен CDN клиенту
     # выдаёт провайдер, он в DNS не заводится.
-    records = ["A     %s   ->  %s   (DNS only, серое облако)" % (origin, my_ip)]
+    records = ["A     %s   ->  %s   (DNS only, серое облако) — источник CDN"
+               % (origin, my_ip)]
     if mode != "3":
         records.append("A     %s   ->  %s   (DNS only) — панель и её сертификат"
-                       % (domain, my_ip))
+                       % (pdom, my_ip))
     dns_wait(records, skip=args.skip_dns_wait)
 
     # ── снести прошлую установку тех компонентов, которые ставим сейчас ──
@@ -3473,7 +3499,7 @@ def main():
                 origin_row,
                 ("CDN", cdn_val)]
     else:
-        rows = [("Панель", "https://%s/" % domain),
+        rows = [("Панель", "https://%s/" % pdom),
                 ("Логин", "admin"),
                 ("Пароль", admin_pw),
                 origin_row,

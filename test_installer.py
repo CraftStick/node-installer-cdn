@@ -1409,6 +1409,42 @@ class TestWipeLeftovers(unittest.TestCase):
         self.assertNotIn("база панели", out)
 
 
+class TestPanelDomain(unittest.TestCase):
+    """Панель живёт на своём поддомене, а не на корне домена."""
+
+    def test_panel_host_falls_back_to_the_zone(self):
+        self.assertEqual(inst.panel_host({"domain": "e.com"}), "e.com")
+        self.assertEqual(
+            inst.panel_host({"domain": "e.com", "panel_domain": "p.e.com"}),
+            "p.e.com")
+
+    def _main(self, extra):
+        seen, out = TestMainFlow._main(
+            TestMainFlow(methodName="run"),
+            ["--mode", "1", "--domain", "e.com", "--skip-dns-wait",
+             "--skip-cdn-wait", "--no-wipe",
+             "--cdn-domain", "c5d6df02.topology.gslb.yccdn.ru"] + extra)
+        return seen["install_remnawave"], out
+
+    def test_random_subdomain_by_default(self):
+        cfg, out = self._main([])
+        pdom = cfg["panel_domain"]
+        self.assertTrue(pdom.endswith(".e.com"), pdom)
+        self.assertNotEqual(pdom, "e.com")
+        self.assertNotEqual(pdom, cfg["origin_domain"])   # два разных имени
+        self.assertIn("A     %s" % pdom, out)             # просим завести запись
+        self.assertIn("https://%s/" % pdom, out)          # и печатаем в карточке
+
+    def test_flag_overrides_the_generated_one(self):
+        cfg, out = self._main(["--panel-domain", "panel.e.com"])
+        self.assertEqual(cfg["panel_domain"], "panel.e.com")
+        self.assertIn("https://panel.e.com/", out)
+
+    def test_bad_panel_domain_stops_installation(self):
+        with self.assertRaises(SystemExit):
+            self._main(["--panel-domain", "не домен"])
+
+
 class TestLeRateLimit(unittest.TestCase):
     """Упёршись в недельный лимит, certbot повторять бесполезно."""
 
