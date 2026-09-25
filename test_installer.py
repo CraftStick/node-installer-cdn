@@ -1455,14 +1455,12 @@ class TestPanelDomain(unittest.TestCase):
              "--cdn-domain", "c5d6df02.topology.gslb.yccdn.ru"] + extra)
         return seen["install_remnawave"], out
 
-    def test_random_subdomain_by_default(self):
+    def test_panel_subdomain_by_default(self):
         cfg, out = self._main([])
-        pdom = cfg["panel_domain"]
-        self.assertTrue(pdom.endswith(".e.com"), pdom)
-        self.assertNotEqual(pdom, "e.com")
-        self.assertNotEqual(pdom, cfg["origin_domain"])   # два разных имени
-        self.assertIn("A     %s" % pdom, out)             # просим завести запись
-        self.assertIn("https://%s/" % pdom, out)          # и печатаем в карточке
+        self.assertEqual(cfg["panel_domain"], "panel.e.com")
+        self.assertNotEqual(cfg["panel_domain"], cfg["origin_domain"])
+        self.assertIn("A     panel.e.com", out)           # просим завести запись
+        self.assertIn("https://panel.e.com/", out)        # и печатаем в карточке
 
     def test_flag_overrides_the_generated_one(self):
         cfg, out = self._main(["--panel-domain", "panel.e.com"])

@@ -340,13 +340,7 @@ def rand_label():
 
 
 def panel_host(cfg):
-    """Домен панели: свой поддомен, а не корень домена.
-
-    На корне панель стояла бы по угадываемому адресу, а её сертификат
-    выпускался бы на один и тот же набор имён при каждой переустановке — а
-    там недельный лимит Let's Encrypt в 5 штук, в который упираешься после
-    нескольких прогонов подряд. Случайный поддомен снимает оба вопроса.
-    """
+    """Домен панели: поддомен panel.<домен>, а не корень домена."""
     return cfg.get("panel_domain") or cfg["domain"]
 
 
@@ -2964,8 +2958,8 @@ def parse_args():
                    help="Забыть сохранённый прогресс и начать с нуля")
     p.add_argument("--origin-domain", help="Домен источника для CDN. Без него "
                    "берётся случайный поддомен вида a7f3k2.<домен>")
-    p.add_argument("--panel-domain", help="Домен панели. Без него берётся "
-                   "случайный поддомен вида k9x2mt.<домен>")
+    p.add_argument("--panel-domain", help="Домен панели. По умолчанию "
+                   "panel.<домен>")
     p.add_argument("--cdn-domain", help="Технический домен ресурса CDN "
                    "(вида xxxxxxxx.topology.gslb.yccdn.ru) — иначе спросим в конце")
     p.add_argument("--client-domain", help="Свой домен для клиентов: CNAME на "
@@ -3403,17 +3397,17 @@ def main():
         xport = XHTTP_PORT
     admin_pw = state_value("admin_pw", rand_password)
 
-    # Домен панели — свой поддомен, как и у источника. На корне панель стояла
-    # бы по угадываемому адресу, а её сертификат выпускался бы на один и тот
-    # же набор имён при каждой переустановке — и упирался в недельный лимит
-    # Let's Encrypt. Постоянный между перезапусками: он уже в .env и в vhost.
+    # Домен панели — поддомен, а не корень домена: на корне панель занимала бы
+    # главное имя, а её сертификат мешался бы с сертификатом для самого сайта.
+    # Имя предсказуемое (panel.<домен>), его проще запомнить и продиктовать;
+    # цена — недельный лимит Let's Encrypt на повторный выпуск одного и того
+    # же имени, при частых переустановках обходится флагом --panel-domain.
     pdom = (args.panel_domain or "").strip()
     if pdom and not RE_DOMAIN.match(pdom):
         err("Домен панели '%s' не похож на домен" % pdom)
         say_homoglyph_hint(pdom)
         sys.exit(1)
-    pdom = pdom or state_value("panel_domain",
-                               lambda: "%s.%s" % (rand_label(), domain))
+    pdom = pdom or state_value("panel_domain", lambda: "panel.%s" % domain)
 
     cfg = {"mode": mode, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "panel_domain": pdom, "path": path,
