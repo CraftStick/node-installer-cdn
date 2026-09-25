@@ -1483,6 +1483,60 @@ class TestPanelDomain(unittest.TestCase):
             self._main(["--panel-domain", "не домен"])
 
 
+class TestUninstall(unittest.TestCase):
+    """--uninstall снимает всё, что установщик клал на сервер."""
+
+    def _run(self, replies=None):
+        orig = (inst._is_ours, inst.panel_env_value)
+        inst._is_ours = lambda path: True
+        inst.panel_env_value = lambda var: "panel.e.com"
+        try:
+            with fake_run(replies or {}) as cmds:
+                _, out = quiet(inst.uninstall, assume_yes=True)
+        finally:
+            inst._is_ours, inst.panel_env_value = orig
+        return "\n".join(cmds), out
+
+    def test_removes_containers_volumes_networks_and_images(self):
+        joined, _ = self._run()
+        for part in ("docker compose down -v", "docker rm -f remnawave",
+                     "docker volume rm", "docker network rm", "docker rmi -f"):
+            self.assertIn(part, joined)
+        self.assertIn(inst.REMNANODE_IMAGE, joined)
+
+    def test_removes_every_file_it_creates(self):
+        joined, _ = self._run()
+        for path in inst.our_files():
+            self.assertIn("rm -rf %s" % path, joined, path)
+
+    def test_removes_swap_and_system_tuning(self):
+        joined, _ = self._run()
+        self.assertIn("swapoff /swapfile", joined)
+        self.assertIn("/etc/fstab", joined)          # запись из fstab тоже
+        self.assertIn("99-vpn-tuning.conf", joined)
+
+    def test_purges_packages_it_installed(self):
+        joined, _ = self._run()
+        self.assertIn("purge -y", joined)
+        for pkg in ("docker-ce", "nginx", "certbot"):
+            self.assertIn(pkg, joined)
+        self.assertIn("rm -rf /var/lib/docker", joined)
+
+    def test_deletes_only_its_own_letsencrypt_certificates(self):
+        joined, _ = self._run()
+        self.assertIn("certbot delete --cert-name panel.e.com", joined)
+
+    def test_without_tty_and_flag_it_refuses(self):
+        stdin = sys.stdin
+        sys.stdin = io.StringIO()
+        try:
+            with fake_run():
+                with self.assertRaises(SystemExit):
+                    quiet(inst.uninstall)
+        finally:
+            sys.stdin = stdin
+
+
 class TestLeRateLimit(unittest.TestCase):
     """Упёршись в недельный лимит, certbot повторять бесполезно."""
 

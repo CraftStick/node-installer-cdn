@@ -1660,6 +1660,106 @@ def _wipe_front(panel=True, node=True):
         "ufw --force delete $n >/dev/null 2>&1 || break; done")
 
 
+OUR_IMAGES = [REMNAWAVE_IMAGE, POSTGRES_IMAGE, VALKEY_IMAGE, REMNANODE_IMAGE]
+OUR_PACKAGES = "docker-ce docker-ce-cli containerd.io docker-compose-plugin nginx certbot caddy"
+
+
+def our_files():
+    """Файлы и каталоги, которые кладёт установщик, — их снимает --uninstall."""
+    return ["/opt/remnawave", "/opt/remnanode",
+            CDN_CRT, CDN_KEY, "/var/www/html/index.html", "/var/www/certbot",
+            "/etc/sysctl.d/99-vpn-tuning.conf",
+            "/etc/security/limits.d/99-nofile.conf",
+            "/etc/letsencrypt/renewal-hooks/deploy/cert.sh",
+            STATE_PATH]
+
+
+def le_domains():
+    """Домены, на которые установщик выпускал сертификаты Let's Encrypt.
+
+    Чужие сертификаты трогать нельзя, а свои узнать неоткуда, кроме как по
+    собственным следам: домен панели лежит в .env, домен источника — в
+    nginx-конфиге, который писали мы (по метке CONF_MARK).
+    """
+    found = []
+    pdom = panel_env_value("PANEL_DOMAIN")
+    if pdom:
+        found.append(pdom)
+    conf = "/etc/nginx/sites-available/default"
+    if _is_ours(conf):
+        out, _ = run("grep -oP 'ssl_certificate /etc/letsencrypt/live/\\K[^/]+' %s"
+                     % shq(conf))
+        found += out.split()
+    return sorted(set(d.strip() for d in found if d.strip()))
+
+
+def uninstall(assume_yes=False):
+    """Снести всё, что установщик поставил: контейнеры, файлы, пакеты, swap.
+
+    Отдельно от wipe_previous: тот готовит сервер к новой установке и потому
+    щадит систему (docker и пакеты следующей установке пригодятся). Здесь
+    наоборот — убрать следы целиком.
+    """
+    domains = le_domains()
+    warn("Будет удалено:")
+    for line in ["контейнеры, тома и образы Remnawave и ноды",
+                 "каталоги /opt/remnawave и /opt/remnanode",
+                 "конфиги nginx и Caddy, которые писал установщик",
+                 "самоподписанный сертификат origin и страница-заглушка",
+                 "тюнинг sysctl, лимиты на файлы, swap-файл /swapfile",
+                 "сохранённый прогресс установки",
+                 "пакеты: docker, nginx, certbot, caddy",
+                 "правила ufw на порт ноды 2222"]:
+        say("    - %s" % line)
+    if domains:
+        say("    - сертификаты Let's Encrypt: %s" % ", ".join(domains))
+    say("  Вместе с этим удалится база панели: пользователи, ноды, подписки")
+    say("  Останутся: ufw с его политикой, правила SSH и 80/443, остальные")
+    say("  пакеты системы и чужие конфиги nginx")
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            err("Без терминала подтвердить нечего — запусти с --wipe")
+            sys.exit(1)
+        if not confirm("Удалить всё это? (y/N)", default=False):
+            say("  Отменено")
+            return
+
+    step("Удаление")
+    for d in ("/opt/remnawave", "/opt/remnanode"):
+        run("cd %s && docker compose down -v --remove-orphans 2>/dev/null" % d,
+            timeout=120)
+    run("docker rm -f remnawave remnawave-db remnawave-redis remnanode 2>/dev/null")
+    run("docker volume ls -q --filter name=remnawave | xargs -r docker volume rm -f "
+        "2>/dev/null")
+    run("docker network ls -q --filter name=remnawave --filter name=remnanode "
+        "2>/dev/null | xargs -r docker network rm 2>/dev/null")
+    run("docker rmi -f %s 2>/dev/null" % " ".join(OUR_IMAGES))
+    ok("Контейнеры, тома, сети и образы удалены")
+
+    _wipe_front()
+    for path in our_files():
+        run("rm -rf %s" % shq(path))
+    run("systemctl disable --now caddy 2>/dev/null")
+    ok("Файлы и конфиги удалены")
+
+    for d in domains:
+        run("certbot delete --cert-name %s --non-interactive 2>/dev/null" % shq(d))
+    if domains:
+        ok("Сертификаты Let's Encrypt удалены: %s" % ", ".join(domains))
+
+    # swap: сначала отключить, иначе файл удалится, а запись в fstab останется
+    run("swapoff /swapfile 2>/dev/null; rm -f /swapfile; "
+        "sed -i '\\|^/swapfile |d' /etc/fstab")
+    run("sysctl --system >/dev/null 2>&1")
+    ok("swap и системный тюнинг сняты")
+
+    run(APT_GET + " purge -y " + OUR_PACKAGES + " 2>&1 | tail -2", timeout=600)
+    run(APT_GET + " autoremove -y 2>&1 | tail -2", timeout=600)
+    run("rm -rf /var/lib/docker /var/lib/containerd /etc/docker /etc/caddy")
+    ok("Пакеты удалены")
+    ok("Готово — следов установщика на сервере не осталось")
+
+
 def wipe_previous(panel=False, node=False, assume_yes=False):
     """Снести прошлую установку до начала новой.
 
@@ -2926,6 +3026,8 @@ def parse_args():
                    help="Не трогать прошлую установку (ставить поверх)")
     p.add_argument("--fresh", action="store_true",
                    help="Забыть сохранённый прогресс и начать с нуля")
+    p.add_argument("--uninstall", action="store_true",
+                   help="Снести всё, что поставил установщик, и выйти")
     p.add_argument("--origin-domain", help="Домен источника для CDN. Без него "
                    "берётся случайный поддомен вида a7f3k2.<домен>")
     p.add_argument("--panel-domain", help="Домен панели. По умолчанию "
@@ -3280,6 +3382,10 @@ def main():
         err("Нужны права root — запусти через sudo")
         sys.exit(1)
     check_ubuntu()
+
+    if args.uninstall:
+        uninstall(assume_yes=args.wipe)
+        sys.exit(0)
 
     my_ip = get_ip() or "<SERVER_IP>"
     say("   " + _c(C_DIM, "◦ Server IP: ") + _c(C_VAL, my_ip))
