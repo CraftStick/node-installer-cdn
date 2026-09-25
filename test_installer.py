@@ -942,10 +942,42 @@ class TestReviewRegressions(unittest.TestCase):
             quiet(inst.setup_docker_mirror)
         self.assertFalse(any("daemon.json" in c for c in cmds))
 
+    def _mirror(self, existing=None):
+        """setup_docker_mirror на недоступном реестре; -> (daemon.json, cmds, файлы)."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "daemon.json")
+            if existing is not None:
+                with open(path, "w") as f:
+                    f.write(existing)
+            orig = inst.DOCKER_DAEMON_JSON
+            inst.DOCKER_DAEMON_JSON = path
+            try:
+                with fake_run({"registry-1.docker.io": ("000", 0)}) as cmds:
+                    quiet(inst.setup_docker_mirror)
+            finally:
+                inst.DOCKER_DAEMON_JSON = orig
+            with open(path) as f:
+                text = f.read()
+            return text, cmds, sorted(os.listdir(d))
+
     def test_docker_mirror_configured_when_unreachable(self):
-        with fake_run({"registry-1.docker.io": ("000", 0)}) as cmds:
-            quiet(inst.setup_docker_mirror)
-        self.assertTrue(any("daemon.json" in c for c in cmds))
+        text, cmds, _ = self._mirror()
+        self.assertEqual(json.loads(text)["registry-mirrors"], inst.DOCKER_MIRRORS)
+        self.assertIn("systemctl restart docker", cmds)
+
+    def test_docker_mirror_keeps_existing_settings_and_backs_up(self):
+        text, _, files = self._mirror(json.dumps(
+            {"log-opts": {"max-size": "10m"}, "registry-mirrors": ["https://my.mirror"]}))
+        conf = json.loads(text)
+        self.assertEqual(conf["log-opts"], {"max-size": "10m"})
+        self.assertEqual(conf["registry-mirrors"],
+                         ["https://my.mirror"] + inst.DOCKER_MIRRORS)
+        self.assertTrue(any(f.startswith("daemon.json.bak.") for f in files))
+
+    def test_docker_mirror_leaves_broken_json_alone(self):
+        text, cmds, _ = self._mirror("{not json")
+        self.assertEqual(text, "{not json")
+        self.assertNotIn("systemctl restart docker", cmds)
 
     def test_swap_fstab_append_is_grouped(self):
         orig = inst.write_file
@@ -1318,6 +1350,146 @@ class TestWipeLeftovers(unittest.TestCase):
         finally:
             inst._is_ours = orig
         self.assertNotIn("база панели", out)
+
+
+class TestRefactorRegressions(unittest.TestCase):
+    """Баги, найденные при ревью: не должны вернуться."""
+
+    def test_nginx_origin_tolerates_trailing_slash_in_path(self):
+        # --path /abc/ в режиме 3 давал 'location /abc// {' — туннель не работал
+        c = inst.nginx_cdn_origin_config(4443, "/upload/ab/")
+        self.assertIn("location = /upload/ab {", c)
+        self.assertIn("location /upload/ab/ {", c)
+        self.assertNotIn("//", c.replace("http://", "").replace("https://", ""))
+
+    def test_confirm_accepts_russian_yes_and_honours_default(self):
+        orig = inst.ask
+        try:
+            for reply, default, expected in [("да", False, True), ("д", False, True),
+                                             ("", False, False), ("нет", True, False),
+                                             ("", True, True), ("что-то", True, True)]:
+                inst.ask = lambda prompt, d=None, _r=reply: _r or d
+                self.assertEqual(inst.confirm("?", default=default), expected,
+                                 (reply, default))
+        finally:
+            inst.ask = orig
+
+    def test_profile_suffix_does_not_stack_on_repeated_conflicts(self):
+        names = []
+
+        def api(method, path, data=None):
+            names.append(data["name"])
+            if len(names) < 3:
+                return {"message": "name already exists"}, 409
+            return {"response": {"uuid": "P", "inbounds": []}}, 201
+
+        quiet(inst.create_config_profile, api, "CDN-YANDEX",
+              [inst.build_xhttp_inbound(4443, "/a", "T")])
+        self.assertEqual(len(names), 3)
+        for n in names[1:]:
+            self.assertRegex(n, r"^CDN-YANDEX-[a-z0-9]{4}$")
+
+    def test_no_sleep_after_last_unanswered_attempt(self):
+        slept, orig = [], inst.time.sleep
+        inst.time.sleep = slept.append
+        try:
+            quiet(inst.create_config_profile, lambda *a: ({}, 0), "X",
+                  [inst.build_xhttp_inbound(4443, "/a", "T")], tries=3)
+        finally:
+            inst.time.sleep = orig
+        self.assertEqual(len(slept), 2)
+
+    def test_login_over_ssh_does_not_attach_stored_token(self):
+        seen, orig = [], inst.run_remote
+
+        def fake(cred, cmd, timeout=600, input=None):
+            seen.append((cmd, input))
+            return "{}\n200", 0
+
+        inst.run_remote = fake
+        try:
+            inst.rw_login_ssh({"ip": "1.2.3.4"}, "admin", "pw")
+        finally:
+            inst.run_remote = orig
+        self.assertEqual(len(seen), 1)                 # без чтения .panel_token
+        self.assertNotIn("Authorization", seen[0][1])
+
+    def test_xray_download_uses_private_temp_dir(self):
+        with fake_run({"version": ("", 1)}) as cmds:
+            quiet(inst.download_xray_binary, "/opt/remnanode/xray-custom")
+        dl = next(c for c in cmds if "curl" in c)
+        self.assertIn("mktemp -d", dl)
+        self.assertNotIn("/tmp", dl)
+
+    SS_TCP = ("LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\n"
+              "LISTEN 0 4096 *:2222 *:*\n"
+              "LISTEN 0 4096 [::]:2053 [::]:*\n"
+              "LISTEN 0 4096 127.0.0.1:4443 0.0.0.0:*\n"
+              "LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n"
+              "LISTEN 0 4096 [::1]:25 [::]:*\n")
+
+    def test_listening_ports_skip_loopback(self):
+        with fake_run({"ss -ltnH": (self.SS_TCP, 0),
+                       "ss -lunH": ("UNCONN 0 0 0.0.0.0:8443 0.0.0.0:*\n", 0)}):
+            live = inst.listening_ports()
+        self.assertEqual(live, {"tcp": {22, 2222, 2053}, "udp": {8443}})
+
+    def test_cdn_only_firewall_keeps_running_node_ports(self):
+        # ufw выключен: deny incoming не должен закрыть 2222 и запасной вход
+        with fake_run({"which ufw": ("/usr/sbin/ufw", 0), "ufw status": ("", 0),
+                       "ss -ltnH": (self.SS_TCP, 0), "sshd -T": ("22", 0)}) as cmds:
+            quiet(inst.firewall_setup, keep_listening=True)
+        joined = "\n".join(cmds)
+        for port in ("2222/tcp", "2053/tcp", "80/tcp", "443/tcp"):
+            self.assertIn("ufw allow " + port, joined)
+        self.assertNotIn("4443", joined)             # loopback наружу не открываем
+        allow_2222 = joined.index("ufw allow 2222/tcp")
+        self.assertLess(allow_2222, joined.index("ufw default deny incoming"))
+
+    def test_cdn_only_firewall_leaves_active_ufw_policy_alone(self):
+        with fake_run({"which ufw": ("/usr/sbin/ufw", 0),
+                       "ufw status": ("Status: active", 0)}) as cmds:
+            quiet(inst.firewall_setup, keep_listening=True)
+        joined = "\n".join(cmds)
+        self.assertIn("ufw allow 443/tcp", joined)
+        self.assertNotIn("ufw default", joined)
+        self.assertNotIn("ufw --force enable", joined)
+
+    def test_secret_flags_are_warned_about(self):
+        _, out = quiet(inst.warn_secret_flags, ["--panel-ssh-pass", "x",
+                                                "--panel-token=T", "--panel-user", "a"])
+        self.assertIn("CDN_PANEL_SSH_PASS", out)
+        self.assertIn("CDN_PANEL_TOKEN", out)
+        self.assertNotIn("CDN_PANEL_PASS ", out)
+        _, out = quiet(inst.warn_secret_flags, ["--mode", "2"])
+        self.assertEqual(out, "")
+
+    def test_secrets_are_read_from_environment(self):
+        saved_argv, saved_env = sys.argv, dict(os.environ)
+        os.environ.update({"CDN_PANEL_SSH_PASS": "s", "CDN_PANEL_PASS": "p",
+                           "CDN_PANEL_TOKEN": "t"})
+        sys.argv = ["installer"]
+        try:
+            args = inst.parse_args()
+        finally:
+            sys.argv = saved_argv
+            os.environ.clear()
+            os.environ.update(saved_env)
+        self.assertEqual((args.panel_ssh_pass, args.panel_pass, args.panel_token),
+                         ("s", "p", "t"))
+
+    def test_panel_env_value_reads_local_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, ".env")
+            with open(path, "w") as f:
+                f.write("FRONT_END_DOMAIN=x.com\nPANEL_DOMAIN=p.com\n")
+            orig = inst.PANEL_ENV
+            inst.PANEL_ENV = path
+            try:
+                self.assertEqual(inst.panel_env_value("PANEL_DOMAIN"), "p.com")
+                self.assertEqual(inst.panel_env_value("MISSING"), "")
+            finally:
+                inst.PANEL_ENV = orig
 
 
 if __name__ == "__main__":
