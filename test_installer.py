@@ -812,45 +812,56 @@ class TestCdnInstructions(unittest.TestCase):
             for word in ("VK Cloud", "CDNvideo", "trbcdn", "twcstorage"):
                 self.assertNotIn(word, out, provider)
 
-    def test_dns_records_name_the_fields_and_the_direction(self):
-        """Поля Name/Target путают местами — инструкция должна их называть."""
+    def test_fields_are_named_so_they_can_be_copied(self):
+        """Инструкция — таблица «поле — значение», без пересказа формы."""
         out = self._print("yandex", "cdn.example.com")
-        self.assertIn("Name:   _acme-challenge.cdn.example.com", out)
-        self.assertIn("Target: <значение со страницы сертификата>"
-                      ".cm.yandexcloud.net", out)
-        self.assertIn("Name:   cdn.example.com", out)
-        self.assertIn("слева ваше имя, справа чужое", out)
-        # и команда для проверки, а не «заведите и надейтесь»
-        self.assertIn("dig +short _acme-challenge.cdn.example.com", out)
-        self.assertIn("dig +short cdn.example.com", out)
+        for line in ("Name                     _acme-challenge.cdn.example.com",
+                     "Доменное имя источника   origin.example.com   <- ваш сервер",
+                     "Имя SNI-хоста            origin.example.com",
+                     "Значение заголовка       origin.example.com",
+                     "Доменное имя             cdn.example.com   <- для клиентов",
+                     "Name                     cdn.example.com"):
+            self.assertIn(line, out)
+
+    def test_source_and_client_domains_are_marked(self):
+        # за день их дважды перепутали местами — пометки обязательны
+        out = self._print("yandex", "cdn.example.com")
+        server = [l for l in out.splitlines() if "<- ваш сервер" in l]
+        client = [l for l in out.splitlines() if "<- для клиентов" in l]
+        self.assertEqual(len(server), 1)
+        self.assertIn("origin.example.com", server[0])
+        self.assertEqual(len(client), 1)
+        self.assertIn("cdn.example.com", client[0])
+
+    def test_instruction_stays_short(self):
+        # смысл правки: раньше инструкция расползлась на 70+ строк
+        out = self._print("yandex", "cdn.example.com")
+        self.assertLess(len(out.splitlines()), 50, out)
+
+    def test_caching_and_compression_are_switched_off_everywhere(self):
+        # названия полей у провайдеров свои («Кеш CDN» / «CDN-кэширование»),
+        # проверяем смысл: про кеш и про сжатие сказано, и сказано «выкл»
+        for provider in inst.CDN_NAMES.values():
+            out = self._print(provider).lower()
+            self.assertRegex(out, r"к[еэ]ш", provider)
+            self.assertIn("gzip", out, provider)
+            self.assertIn("выкл", out, provider)
+
+    def test_removed_providers_have_no_instructions(self):
+        for provider in ("vk", "beeline", "timeweb"):
+            out = self._print(provider)
+            for word in ("VK Cloud", "CDNvideo", "trbcdn", "twcstorage"):
+                self.assertNotIn(word, out, provider)
 
     def test_yandex_steps_carry_real_values_not_placeholders(self):
         """Инструкция должна быть готовой к копированию, без «например»."""
         out = self._print("yandex", "jsq98fs.example.com")
         for value in ("jsq98fs-example-com",              # имя сертификата
                       "_acme-challenge.jsq98fs.example.com",
-                      "Доменное имя источника: origin.example.com",
-                      "Имя SNI-хоста:          origin.example.com",
-                      "Доменное имя:           jsq98fs.example.com",
-                      "Name:   jsq98fs.example.com"):
+                      "origin.example.com",
+                      "jsq98fs.example.com"):
             self.assertIn(value, out)
-
-    def test_dns_block_says_which_of_the_two_lines_to_copy(self):
-        # в блоке «Настройки DNS» две строки, и $ORIGIN — это свой же домен
-        out = self._print("yandex", "cdn.example.com")
-        self.assertIn("$ORIGIN cdn.example.com", out)
-        self.assertIn("нужно ЭТО", out)
-
-    def test_resource_form_marks_which_domain_is_which(self):
-        """Поля источника и ресурса называются похоже — подписываем их."""
-        out = self._print("yandex", "cdn.example.com")
-        server_lines = [l for l in out.splitlines() if "<- ВАШ СЕРВЕР" in l]
-        self.assertEqual(len(server_lines), 3)               # источник, SNI, Host
-        for line in server_lines:
-            self.assertIn("origin.example.com", line)
-        client = [l for l in out.splitlines() if "<- ДЛЯ КЛИЕНТОВ" in l]
-        self.assertEqual(len(client), 1)
-        self.assertIn("cdn.example.com", client[0])
+        self.assertNotIn("%s", out)
 
 
 class TestCdnSelection(unittest.TestCase):
