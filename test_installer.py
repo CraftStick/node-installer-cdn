@@ -1067,14 +1067,34 @@ class TestAptLocking(unittest.TestCase):
         orig = (inst.fix_dns, inst.ensure_apt_mirror)
         inst.fix_dns = inst.ensure_apt_mirror = lambda cred=None: None
         try:
-            with fake_run() as cmds:
+            with fake_run({"dpkg-query": ("", 1)}) as cmds:
                 quiet(inst.pkg_install, "curl")
         finally:
             inst.fix_dns, inst.ensure_apt_mirror = orig
         joined = "\n".join(cmds)
+        self.assertIn("install -y curl", joined)
         self.assertNotIn("kill -9", joined)
         self.assertNotIn("rm -f /var/lib/dpkg/lock", joined)
         self.assertTrue(all("DPkg::Lock::Timeout" in c for c in cmds if "apt-get" in c))
+
+
+    def test_pkg_install_skips_apt_when_already_installed(self):
+        with fake_run() as cmds:
+            self.assertTrue(quiet(inst.pkg_install, "certbot")[0])
+        self.assertFalse(any("apt-get" in c for c in cmds))
+
+    def test_pkg_install_checks_status_not_just_dpkg_s(self):
+        # у снесённого, но не вычищенного пакета `dpkg -s` выходит с нулём,
+        # хотя файлов нет: проверять надо «install ok installed»
+        orig = (inst.fix_dns, inst.ensure_apt_mirror)
+        inst.fix_dns = inst.ensure_apt_mirror = lambda cred=None: None
+        try:
+            with fake_run({"dpkg-query": ("", 1)}) as cmds:
+                quiet(inst.pkg_install, "nginx")
+        finally:
+            inst.fix_dns, inst.ensure_apt_mirror = orig
+        self.assertIn("install ok installed", cmds[0])
+        self.assertTrue(any("install -y nginx" in c for c in cmds))
 
 
 class TestChoose(unittest.TestCase):
@@ -1333,6 +1353,25 @@ class TestWipeLeftovers(unittest.TestCase):
             inst._is_ours = orig
         self.assertIn("systemctl disable --now caddy", "\n".join(cmds))
 
+    def test_cdn_only_wipe_keeps_node_firewall_and_panel_site(self):
+        # режим 3: нода и панель работают — правила 2222 и panel.conf не трогаем
+        ours = ("/etc/nginx/sites-available/default",
+                "/etc/nginx/sites-available/panel.conf")
+        orig = inst._is_ours
+        inst._is_ours = lambda path: path in ours
+        try:
+            with fake_run({"ufw status": ("2222/tcp ALLOW IN 1.2.3.4\n", 0)}) as cmds:
+                found = inst._front_leftovers(panel=False, node=False)
+                inst._wipe_front(panel=False, node=False)
+        finally:
+            inst._is_ours = orig
+        joined = "\n".join(cmds)
+        self.assertNotIn("ufw --force delete", joined)
+        self.assertNotIn("panel.conf", joined)
+        self.assertNotIn("docker network", joined)
+        self.assertIn("sites-available/default", joined)
+        self.assertFalse(any("2222" in f or "панели" in f for f in found))
+
     def test_db_warning_only_when_panel_is_wiped(self):
         orig = inst._is_ours
         inst._is_ours = lambda path: path == inst.CADDYFILE
@@ -1346,6 +1385,24 @@ class TestWipeLeftovers(unittest.TestCase):
 
 class TestRefactorRegressions(unittest.TestCase):
     """Баги, найденные при ревью: не должны вернуться."""
+
+    def _api_token_fallback(self, token_field):
+        """remnawave_api_token по запасному пути /api/tokens."""
+        orig = (inst.mint_api_token, inst.rw_api_local)
+        inst.mint_api_token = lambda runner: ""
+        inst.rw_api_local = lambda *a, **kw: ({"response": {"token": token_field}}, 201)
+        try:
+            with fake_run():
+                return quiet(inst.remnawave_api_token, "login-jwt")[0]
+        finally:
+            inst.mint_api_token, inst.rw_api_local = orig
+
+    def test_api_token_fallback_accepts_plain_string(self):
+        # 3.x отдаёт {"response": {"token": "<jwt>"}} — раньше .get на str падал
+        self.assertEqual(self._api_token_fallback(" jwt.a.b "), "jwt.a.b")
+
+    def test_api_token_fallback_accepts_nested_object(self):
+        self.assertEqual(self._api_token_fallback({"token": "jwt.c.d"}), "jwt.c.d")
 
     def test_nginx_origin_tolerates_trailing_slash_in_path(self):
         # --path /abc/ в режиме 3 давал 'location /abc// {' — туннель не работал

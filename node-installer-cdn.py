@@ -619,7 +619,7 @@ def write_file(path, content, mode=None):
         os.makedirs(parent, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
                  0o644 if mode is None else mode)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         if mode is not None:
             os.fchmod(fd, mode)      # файл мог существовать с другими правами
         f.write(content)
@@ -633,7 +633,7 @@ def env_grep_cmd(var):
 def panel_env_value(var):
     """Значение var из локального .env панели; '' — нет файла или переменной."""
     try:
-        with open(PANEL_ENV) as f:
+        with open(PANEL_ENV, encoding="utf-8") as f:
             for line in f:
                 if line.startswith(var + "="):
                     return line.split("=", 1)[1].strip()
@@ -775,6 +775,14 @@ exit 0
 
 def pkg_install(packages):
     """Установить пакеты apt: чинит DNS, зеркало, ждёт блокировку, повторяет."""
+    # За установку сюда приходят по нескольку раз (certbot — на каждый выпуск
+    # сертификата), и каждый раз это apt-get update до трёх минут.
+    # Проверка именно по Status, а не по `dpkg -s`: у снесённого, но не
+    # вычищенного пакета остаётся статус «deinstall ok config-files», и
+    # `dpkg -s` на нём выходит с нулём — установка молча пропускалась бы.
+    if run("for p in %s; do dpkg-query -W -f='${Status}' \"$p\" 2>/dev/null "
+           "| grep -q '^install ok installed$' || exit 1; done" % packages)[1] == 0:
+        return True
     say("  Ставлю пакеты: %s" % packages)
     fix_dns()
     ensure_apt_mirror()
@@ -836,7 +844,7 @@ def setup_docker_mirror():
     # настройки (log-opts, data-root, insecure-registries), и затереть их —
     # значит незаметно поменять поведение docker на сервере.
     try:
-        with open(DOCKER_DAEMON_JSON) as f:
+        with open(DOCKER_DAEMON_JSON, encoding="utf-8") as f:
             old_text = f.read()
     except FileNotFoundError:
         old_text = ""
@@ -1524,7 +1532,10 @@ def remnawave_api_token(login_jwt):
         resp, code = rw_api_local(login_jwt, "POST", "tokens",
                                   {"name": "installer",
                                    "description": "node-installer-cdn"})
-        tok = ((api_response(resp).get("token") or {}).get("token") or "").strip()
+        tok = api_response(resp).get("token")
+        if isinstance(tok, dict):         # в части ревизий токен вложен ещё раз
+            tok = tok.get("token")
+        tok = tok.strip() if isinstance(tok, str) else ""
         if tok:
             ok("API-токен выпущен через /api/tokens")
             return tok
@@ -1547,10 +1558,6 @@ def host_remark(cdn_name):
     return "%s bypass" % cdn_name.capitalize()
 
 
-def _slug(prefix):
-    return "%s-%s" % (prefix, rand(6, LOWER_ALNUM))
-
-
 def _leftovers(paths, containers, vol_filter=""):
     """Что осталось от прошлой установки: каталоги, контейнеры, тома."""
     found = [p for p in paths if os.path.exists(p)]
@@ -1562,9 +1569,11 @@ def _leftovers(paths, containers, vol_filter=""):
     return found
 
 
-# Конфиги веб-фронта, которые пишет установщик: имя файла -> что это такое.
-OUR_NGINX_SITES = {"default": "конфиг nginx origin (туннель прошлой установки)",
-                   "panel.conf": "конфиг nginx панели"}
+# Конфиги веб-фронта, которые пишет установщик: имя файла -> (что это, чей).
+# Чей — какой компонент должен сноситься, чтобы трогать файл: конфиг панели в
+# режиме 3 («только CDN» на сервере с панелью) удалять нельзя.
+OUR_NGINX_SITES = {"default": ("конфиг nginx origin (туннель прошлой установки)", None),
+                   "panel.conf": ("конфиг nginx панели", "panel")}
 CADDYFILE = "/etc/caddy/Caddyfile"
 
 
@@ -1575,48 +1584,67 @@ def _is_ours(path):
     метки не имеют — их снос не трогает.
     """
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             return CONF_MARK in f.read(200)
     except OSError:
         return False
 
 
-def _front_leftovers():
+def _our_sites(panel):
+    """Наши nginx-сайты, которые сносятся вместе с выбранными компонентами."""
+    for name, (what, owner) in sorted(OUR_NGINX_SITES.items()):
+        path = "/etc/nginx/sites-available/%s" % name
+        if (owner != "panel" or panel) and _is_ours(path):
+            yield name, path, what
+
+
+def _net_filters(panel, node):
+    """--filter для docker network ls: только сети сносимых компонентов."""
+    names = [n for n, on in (("remnawave", panel), ("remnanode", node)) if on]
+    return " ".join("--filter name=" + n for n in names)
+
+
+def _front_leftovers(panel=True, node=True):
     """Остатки веб-фронта прошлой установки.
 
     Удаление /opt/remnawave и контейнеров их не убирает, а мешают они по-разному:
     Caddy с прошлого запуска держит :443 и новый nginx на порт не встаёт, а
     старый sites-enabled/default оставляет включённым прежний путь туннеля.
+
+    panel/node — какие компоненты ставятся заново. Режим 3 ставит фронт перед
+    РАБОЧЕЙ нодой: её правила ufw на 2222 и конфиг панели трогать нельзя.
     """
-    found = []
-    for name, what in sorted(OUR_NGINX_SITES.items()):
-        if _is_ours("/etc/nginx/sites-available/%s" % name):
-            found.append(what)
+    found = [what for _, _, what in _our_sites(panel)]
     if _is_ours(CADDYFILE):
         found.append("Caddyfile прошлой установки")
         if run("systemctl is-active --quiet caddy")[1] == 0:
             found.append("caddy занимает :80/:443")
-    nets, _ = run("docker network ls --format '{{.Name}}' "
-                  "--filter name=remnawave --filter name=remnanode 2>/dev/null")
-    found += ["docker-сеть " + n for n in nets.split()]
-    if "2222/tcp" in run("ufw status 2>/dev/null")[0]:
+    filters = _net_filters(panel, node)
+    if filters:
+        nets, _ = run("docker network ls --format '{{.Name}}' %s 2>/dev/null" % filters)
+        found += ["docker-сеть " + n for n in nets.split()]
+    if node and "2222/tcp" in run("ufw status 2>/dev/null")[0]:
         found.append("правила ufw на порт ноды 2222")
     return found
 
 
-def _wipe_front():
+def _wipe_front(panel=True, node=True):
     """Снести веб-фронт прошлой установки: конфиги, caddy, сети, правила ufw."""
-    for name in OUR_NGINX_SITES:
-        path = "/etc/nginx/sites-available/%s" % name
-        if _is_ours(path):
-            run("rm -f %s /etc/nginx/sites-enabled/%s" % (path, name))
+    for name, path, _ in list(_our_sites(panel)):
+        run("rm -f %s /etc/nginx/sites-enabled/%s" % (path, name))
     if _is_ours(CADDYFILE):
         # disable, а не только stop: иначе caddy вернётся после перезагрузки
         # и заберёт :443 у nginx.
         run("systemctl disable --now caddy 2>/dev/null")
         run("rm -f " + CADDYFILE)
-    run("docker network ls -q --filter name=remnawave --filter name=remnanode "
-        "2>/dev/null | xargs -r docker network rm 2>/dev/null")
+    filters = _net_filters(panel, node)
+    if filters:
+        run("docker network ls -q %s 2>/dev/null | xargs -r docker network rm "
+            "2>/dev/null" % filters)
+    if not node:
+        # Нода работает и остаётся: без её правил панель к ней не достучится
+        # (ufw с deny incoming), а firewall_setup(keep_listening) их не вернёт.
+        return
     # Правила ufw на 2222 привязаны к IP прошлой панели: он мог смениться, а
     # правило пережило бы снос и пускало чужой сервер. Номера сдвигаются после
     # каждого удаления, поэтому идём с конца и ограничиваем число проходов.
@@ -1642,7 +1670,7 @@ def wipe_previous(panel=False, node=False, assume_yes=False):
                             "remnawave")
     if node:
         found += _leftovers(["/opt/remnanode"], ["remnanode"])
-    found += _front_leftovers()
+    found += _front_leftovers(panel, node)
     if not found:
         return
     warn("Найдены остатки прошлой установки:")
@@ -1667,7 +1695,7 @@ def wipe_previous(panel=False, node=False, assume_yes=False):
             timeout=120)
         run("docker rm -f remnanode 2>/dev/null")
         run("rm -rf /opt/remnanode")
-    _wipe_front()
+    _wipe_front(panel, node)
     ok("Прошлая установка удалена")
 
 
@@ -2947,7 +2975,7 @@ def state_load():
     """Прочитать состояние прошлого запуска. Возвращает True, если оно есть."""
     global _STATE
     try:
-        with open(STATE_PATH) as f:
+        with open(STATE_PATH, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and data.get("answers") is not None:
             _STATE = {"answers": data.get("answers") or {},
@@ -3176,43 +3204,40 @@ def final_selfcheck(cfg, xport, path):
     step("Проверка служб и портов")
     front = cfg.get("front", "nginx")
 
+    def check(passed, what, good, bad):
+        (ok if passed else warn)("%s — %s" % (what, good if passed else bad))
+
     # 1. xray upstream на 127.0.0.1:xport
     out, _ = run("ss -ltnH 2>/dev/null | grep -E '(127\\.0\\.0\\.1|\\*):%d[[:space:]]' "
                  "| head -1" % xport)
-    (ok if out.strip() else warn)(
-        "xray upstream 127.0.0.1:%d — %s"
-        % (xport, "слушает" if out.strip() else "порт не слушается"))
+    check(out.strip(), "xray upstream 127.0.0.1:%d" % xport,
+          "слушает", "порт не слушается")
 
     # 2. фронт на :443
     out, _ = run("ss -ltnH 2>/dev/null | grep -E ':443\\b' | head -1")
-    (ok if out.strip() else warn)(
-        "origin-фронт :443 — %s" % ("слушает" if out.strip() else "порт закрыт"))
+    check(out.strip(), "origin-фронт :443", "слушает", "порт закрыт")
 
     # 3. сервис фронта активен
     svc = "caddy" if front == "caddy" else "nginx"
     out, _ = run("systemctl is-active %s 2>/dev/null" % svc)
-    (ok if out.strip() == "active" else warn)(
-        "служба %s — %s" % (svc, out.strip() or "не активна"))
+    check(out.strip() == "active", "служба %s" % svc, "active",
+          out.strip() or "не активна")
 
     # 4. сертификат origin на месте
-    have_crt = os.path.exists(CDN_CRT) and os.path.exists(CDN_KEY)
-    (ok if have_crt else warn)(
-        "сертификат origin — %s" % ("найден" if have_crt else "нет %s/%s"
-                                    % (CDN_CRT, CDN_KEY)))
+    check(os.path.exists(CDN_CRT) and os.path.exists(CDN_KEY),
+          "сертификат origin", "найден", "нет %s/%s" % (CDN_CRT, CDN_KEY))
 
     # 5. health-заглушка отвечает (нода жива, TLS снимается)
     out, _ = run("curl -sk --max-time 5 https://127.0.0.1/health")
-    (ok if '"status":"ok"' in out else warn)(
-        "health origin — %s" % ("ответ ok" if '"status":"ok"' in out
-                                else "нет ответа"))
+    check('"status":"ok"' in out, "health origin", "ответ ok", "нет ответа")
 
     # 6. голый путь туннеля обязан отдавать 404 (неотличим от 404 несущест-ей)
+    bare = path.strip("/")
     code, _ = run("curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 "
-                  "https://127.0.0.1/%s" % path.strip("/"))
-    (ok if code.strip() == "404" else warn)(
-        "голый путь /%s — %s" % (path.strip("/"),
-                                 "404 как надо" if code.strip() == "404"
-                                 else "код %s (ожидался 404)" % code.strip()))
+                  "https://127.0.0.1/%s" % bare)
+    code = code.strip()
+    check(code == "404", "голый путь /%s" % bare,
+          "404 как надо", "код %s (ожидался 404)" % code)
 
 
 # Ключ ответа в состоянии — текст вопроса; по нему же main() показывает домен
@@ -3351,10 +3376,8 @@ def main():
         cfg["panel_token"] = args.panel_token
         cfg["panel_user"] = args.panel_user
         cfg["panel_pass"] = args.panel_pass
-        if cfg["panel_key"]:
-            cfg["panel_ssh_pass"] = args.panel_ssh_pass or ""
-        else:
-            cfg["panel_ssh_pass"] = args.panel_ssh_pass
+        cfg["panel_ssh_pass"] = args.panel_ssh_pass or ""
+        if not cfg["panel_key"]:
             while not cfg["panel_ssh_pass"]:
                 if not sys.stdin.isatty():
                     no_input("нужен --panel-ssh-pass или --panel-key")
@@ -3429,7 +3452,8 @@ def main():
         # Без хоста подписка пустая: клиенту не к чему подключаться
         rows.append(("Хост", "НЕ создан — добавь в панели вручную"))
     if client_domain:
-        rows.append(("CNAME", "%s → %s" % (client_domain, cdn_domain)))
+        rows.append(("CNAME", "%s → %s" % (client_domain,
+                                           cdn_domain or "<домен CDN>")))
     if result.get("sub_url"):
         rows.append(("Подписка", result["sub_url"]))
     card("ГОТОВО · УСТАНОВКА ЗАВЕРШЕНА", rows, color=C_OK)
