@@ -1661,7 +1661,27 @@ def _wipe_front(panel=True, node=True):
 
 
 OUR_IMAGES = [REMNAWAVE_IMAGE, POSTGRES_IMAGE, VALKEY_IMAGE, REMNANODE_IMAGE]
-OUR_PACKAGES = "docker-ce docker-ce-cli containerd.io docker-compose-plugin nginx certbot caddy"
+OUR_CONTAINERS = ("remnawave", "remnawave-db", "remnawave-redis", "remnanode")
+DOCKER_PACKAGES = "docker-ce docker-ce-cli containerd.io docker-compose-plugin"
+# Статический docker: устанавливается запасным путём, apt о нём не знает.
+DOCKER_STATIC_UNIT = "/etc/systemd/system/docker.service"
+DOCKER_STATIC_BINS = ("docker dockerd containerd containerd-shim-runc-v2 ctr "
+                      "runc docker-init docker-proxy")
+
+
+def foreign_nginx_sites():
+    """Чужие сайты nginx: с ними пакет удалять нельзя, поломается их хостинг."""
+    out, _ = run("ls /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null")
+    names = [n for n in out.split() if not n.endswith(":")]
+    return [n for n in names
+            if not _is_ours("/etc/nginx/sites-available/" + n)
+            and not _is_ours("/etc/nginx/conf.d/" + n)]
+
+
+def foreign_containers():
+    """Чужие контейнеры: тогда docker оставляем, иначе снесём их вместе с ним."""
+    out, _ = run("docker ps -a --format '{{.Names}}' 2>/dev/null")
+    return [n for n in out.split() if n not in OUR_CONTAINERS]
 
 
 def our_files():
@@ -1671,7 +1691,7 @@ def our_files():
             "/etc/sysctl.d/99-vpn-tuning.conf",
             "/etc/security/limits.d/99-nofile.conf",
             "/etc/letsencrypt/renewal-hooks/deploy/cert.sh",
-            STATE_PATH]
+            os.path.dirname(STATE_PATH)]
 
 
 def le_domains():
@@ -1708,14 +1728,15 @@ def uninstall(assume_yes=False):
                  "самоподписанный сертификат origin и страница-заглушка",
                  "тюнинг sysctl, лимиты на файлы, swap-файл /swapfile",
                  "сохранённый прогресс установки",
-                 "пакеты: docker, nginx, certbot, caddy",
-                 "правила ufw на порт ноды 2222"]:
+                 "пакеты: docker, nginx, certbot, caddy, sshpass",
+                 "правила ufw и iptables на порт ноды 2222"]:
         say("    - %s" % line)
     if domains:
         say("    - сертификаты Let's Encrypt: %s" % ", ".join(domains))
     say("  Вместе с этим удалится база панели: пользователи, ноды, подписки")
     say("  Останутся: ufw с его политикой, правила SSH и 80/443, остальные")
-    say("  пакеты системы и чужие конфиги nginx")
+    say("  пакеты системы. Если на сервере есть чужие контейнеры или сайты")
+    say("  nginx, соответствующий пакет не удаляется — только наше")
     if not assume_yes:
         if not sys.stdin.isatty():
             err("Без терминала подтвердить нечего — запусти с --wipe")
@@ -1753,9 +1774,40 @@ def uninstall(assume_yes=False):
     run("sysctl --system >/dev/null 2>&1")
     ok("swap и системный тюнинг сняты")
 
-    run(APT_GET + " purge -y " + OUR_PACKAGES + " 2>&1 | tail -2", timeout=600)
+    # Правила iptables на порт ноды: ставятся, когда ufw неактивен, и
+    # переживают удаление контейнера — порт остался бы закрыт навсегда.
+    for spec in ("-p tcp --dport 2222 -s 127.0.0.1 -j ACCEPT",
+                 "-p tcp --dport 2222 -s 172.16.0.0/12 -j ACCEPT",
+                 "-p tcp --dport 2222 -j DROP"):
+        run("iptables -D INPUT %s 2>/dev/null" % spec)
+    run("netfilter-persistent save >/dev/null 2>&1")
+
+    pkgs = ["certbot", "caddy", "sshpass"]
+    foreign = foreign_containers()
+    if foreign:
+        warn("docker оставлен: на сервере есть чужие контейнеры (%s)"
+             % ", ".join(foreign[:3]))
+    else:
+        pkgs.append(DOCKER_PACKAGES)
+        run("systemctl disable --now docker 2>/dev/null")
+    sites = foreign_nginx_sites()
+    if sites:
+        warn("nginx оставлен: на сервере есть чужие сайты (%s)"
+             % ", ".join(sites[:3]))
+    else:
+        pkgs.append("nginx")
+    run(APT_GET + " purge -y " + " ".join(pkgs) + " 2>&1 | tail -2", timeout=600)
     run(APT_GET + " autoremove -y 2>&1 | tail -2", timeout=600)
-    run("rm -rf /var/lib/docker /var/lib/containerd /etc/docker /etc/caddy")
+    run("rm -rf /etc/caddy")
+    if not foreign:
+        # Запасной путь установки docker кладёт юнит и бинарники мимо apt
+        if os.path.exists(DOCKER_STATIC_UNIT):
+            run("rm -f " + DOCKER_STATIC_UNIT)
+            run("cd /usr/bin && rm -f %s" % DOCKER_STATIC_BINS)
+            run("systemctl daemon-reload")
+        run("rm -rf /var/lib/docker /var/lib/containerd /etc/docker")
+    if not sites:
+        run("rm -rf /etc/nginx")
     ok("Пакеты удалены")
     ok("Готово — следов установщика на сервере не осталось")
 

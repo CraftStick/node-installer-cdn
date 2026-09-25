@@ -1486,9 +1486,9 @@ class TestPanelDomain(unittest.TestCase):
 class TestUninstall(unittest.TestCase):
     """--uninstall снимает всё, что установщик клал на сервер."""
 
-    def _run(self, replies=None):
+    def _run(self, replies=None, is_ours=None):
         orig = (inst._is_ours, inst.panel_env_value)
-        inst._is_ours = lambda path: True
+        inst._is_ours = is_ours or (lambda path: True)
         inst.panel_env_value = lambda var: "panel.e.com"
         try:
             with fake_run(replies or {}) as cmds:
@@ -1525,6 +1525,40 @@ class TestUninstall(unittest.TestCase):
     def test_deletes_only_its_own_letsencrypt_certificates(self):
         joined, _ = self._run()
         self.assertIn("certbot delete --cert-name panel.e.com", joined)
+
+    def test_removes_iptables_rules_for_the_node_port(self):
+        joined, _ = self._run()
+        self.assertIn("iptables -D INPUT -p tcp --dport 2222", joined)
+        self.assertIn("netfilter-persistent save", joined)
+
+    def test_removes_static_docker_left_outside_apt(self):
+        orig = os.path.exists
+        os.path.exists = lambda p: p == inst.DOCKER_STATIC_UNIT or orig(p)
+        try:
+            joined, _ = self._run()
+        finally:
+            os.path.exists = orig
+        self.assertIn("rm -f " + inst.DOCKER_STATIC_UNIT, joined)
+        self.assertIn("rm -f docker dockerd", joined)
+        self.assertIn("systemctl daemon-reload", joined)
+
+    def test_keeps_docker_when_foreign_containers_exist(self):
+        joined, out = self._run({"docker ps -a": ("mysql\n", 0)})
+        self.assertNotIn("docker-ce", joined)
+        self.assertNotIn("rm -rf /var/lib/docker", joined)
+        self.assertIn("docker оставлен", out)
+        # свои контейнеры при этом всё равно сносятся
+        self.assertIn("docker rm -f remnawave", joined)
+
+    def test_keeps_nginx_when_foreign_sites_exist(self):
+        joined, out = self._run({"ls /etc/nginx": ("default shop.conf\n", 0)},
+                                is_ours=lambda p: "default" in p)
+        self.assertIn("nginx оставлен", out)
+        self.assertNotIn("rm -rf /etc/nginx", joined.splitlines())
+
+    def test_purges_nginx_when_only_its_own_sites(self):
+        joined, _ = self._run({"ls /etc/nginx": ("default panel.conf\n", 0)})
+        self.assertIn("rm -rf /etc/nginx", joined.splitlines())
 
     def test_without_tty_and_flag_it_refuses(self):
         stdin = sys.stdin
