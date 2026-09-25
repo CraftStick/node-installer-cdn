@@ -1678,10 +1678,18 @@ def wipe_previous(panel=False, node=False, assume_yes=False):
         say("    - %s" % f)
     if panel:
         say("  Вместе с ними удалится база панели (пользователи, ноды, подписки)")
-    if (not assume_yes and sys.stdin.isatty()
-            and not confirm("Снести и поставить начисто? (Y/n)", default=True)):
-        say("  Оставляю как есть — установка продолжится поверх")
-        return
+    if not assume_yes:
+        # Без терминала спросить некого, а снос уносит базу панели вместе с
+        # пользователями. Раньше здесь проверялся isatty() — и неинтерактивный
+        # запуск (пайп, cron) сносил всё молча, из-за чего --wipe ничего не
+        # решал. Теперь без терминала нужен явный --wipe.
+        if not sys.stdin.isatty():
+            say("  Без терминала ничего не сношу — нужен явный --wipe")
+            say("  Установка продолжится поверх прошлой")
+            return
+        if not confirm("Снести и поставить начисто? (Y/n)", default=True):
+            say("  Оставляю как есть — установка продолжится поверх")
+            return
     step("Удаление прошлой установки")
     if panel:
         run("cd /opt/remnawave && docker compose down -v --remove-orphans 2>/dev/null",
@@ -2897,7 +2905,8 @@ def parse_args():
                    help="Не выпускать Let's Encrypt для источника "
                    "(оставить самоподписанный)")
     p.add_argument("--wipe", action="store_true",
-                   help="Снести прошлую установку без вопросов (для автозапуска)")
+                   help="Снести прошлую установку без вопросов. Без терминала "
+                   "(пайп, cron) снос без этого флага не делается вовсе")
     p.add_argument("--no-wipe", action="store_true",
                    help="Не трогать прошлую установку (ставить поверх)")
     p.add_argument("--fresh", action="store_true",

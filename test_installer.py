@@ -1372,6 +1372,32 @@ class TestWipeLeftovers(unittest.TestCase):
         self.assertIn("sites-available/default", joined)
         self.assertFalse(any("2222" in f or "панели" in f for f in found))
 
+    def test_without_tty_nothing_is_wiped_without_the_flag(self):
+        # пайп или cron: спросить некого, а снос уносит базу панели
+        orig, stdin = inst._is_ours, sys.stdin
+        inst._is_ours = lambda path: path == inst.CADDYFILE
+        sys.stdin = io.StringIO()
+        try:
+            with fake_run() as cmds:
+                _, out = quiet(inst.wipe_previous, panel=True, node=True)
+        finally:
+            inst._is_ours, sys.stdin = orig, stdin
+        joined = "\n".join(cmds)
+        self.assertIn("--wipe", out)
+        self.assertNotIn("docker compose down", joined)
+        self.assertNotIn("rm -rf /opt/remnawave", joined)
+
+    def test_without_tty_the_flag_still_wipes(self):
+        orig, stdin = inst._is_ours, sys.stdin
+        inst._is_ours = lambda path: path == inst.CADDYFILE
+        sys.stdin = io.StringIO()
+        try:
+            with fake_run() as cmds:
+                quiet(inst.wipe_previous, panel=True, node=True, assume_yes=True)
+        finally:
+            inst._is_ours, sys.stdin = orig, stdin
+        self.assertIn("rm -rf /opt/remnawave", "\n".join(cmds))
+
     def test_db_warning_only_when_panel_is_wiped(self):
         orig = inst._is_ours
         inst._is_ours = lambda path: path == inst.CADDYFILE
