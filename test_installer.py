@@ -1506,6 +1506,15 @@ class TestClientDnsCheck(unittest.TestCase):
         self.assertIn("Name    cdn.e.com", out)
         self.assertIn("Target  x.yccdn.ru", out)
 
+    def test_flags_a_record_pointing_at_this_server(self):
+        # A на сервер резолвится, но клиент тогда идёт мимо CDN
+        with fake_run({"getent": ("203.0.113.9\n", 0)}):
+            res, out = quiet(inst.check_client_dns, "cdn.e.com", "x.yccdn.ru",
+                             "203.0.113.9")
+        self.assertFalse(res)
+        self.assertIn("мимо CDN", out)
+        self.assertIn("Target  x.yccdn.ru", out)
+
     def test_skipped_without_a_client_domain(self):
         with fake_run() as cmds:
             self.assertTrue(quiet(inst.check_client_dns, "", "x.yccdn.ru")[0])

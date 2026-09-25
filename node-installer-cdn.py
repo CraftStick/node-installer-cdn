@@ -3396,19 +3396,35 @@ def vless_link(uuid, domain, path, cdn_name):
                cdn_name))
 
 
-def check_client_dns(client_domain, cdn_domain, tries=6):
-    """Проверить, что домен для клиентов уже резолвится.
+def check_client_dns(client_domain, cdn_domain, my_ip="", tries=6):
+    """Проверить, что домен для клиентов резолвится — и именно в CDN.
 
     Раньше запись CNAME просто печаталась, и установка рапортовала «ГОТОВО»
     при домене, которого нет в DNS. Клиент в таком случае не подключается
     вовсе (в приложении «n/a» вместо пинга), и причину ищут где угодно, кроме
     единственной незаведённой записи.
+
+    Резолвиться мало: A-запись на этот сервер (или CNAME на origin) тоже
+    резолвится, а origin принимает TLS с любым SNI. Клиент тогда ходит мимо
+    CDN прямо на сервер — по Wi-Fi работает, а на мобильном интернете с белыми
+    списками, где пускают только адреса Yandex, не работает.
     """
     if not client_domain:
         return True
     for attempt in range(tries):
         out, _ = run("getent ahostsv4 %s | awk 'NR==1{print $1}'" % shq(client_domain))
-        if out.strip():
+        ip = out.strip()
+        if ip and my_ip and ip == my_ip:
+            warn("домен для клиентов %s указывает прямо на этот сервер (%s) — "
+                 "трафик идёт мимо CDN" % (client_domain, ip))
+            say("  По Wi-Fi это работает, а мобильный интернет с белыми списками")
+            say("  такой адрес режет. Замените запись у DNS-провайдера:")
+            say("       Type    CNAME   (не A, и не на origin)")
+            say("       Name    %s" % client_domain)
+            say("       Target  %s" % (cdn_domain or "<технический домен CDN>"))
+            say("       Proxy   DNS only, серое облачко")
+            return False
+        if ip:
             ok("домен для клиентов %s резолвится" % client_domain)
             return True
         if attempt + 1 < tries:
@@ -3675,7 +3691,7 @@ def main():
                 cdn_dns_records(origin, my_ip, cdn_domain, client_domain))
     public_domain = client_domain or cdn_domain
     if not args.skip_dns_wait:
-        check_client_dns(client_domain, cdn_domain)
+        check_client_dns(client_domain, cdn_domain, my_ip)
 
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
     if public_domain and result.get("host_uuid"):
