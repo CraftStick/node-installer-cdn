@@ -2483,6 +2483,17 @@ def create_remnawave_user(api, username, vless_uuid, domain):
 #  Let's Encrypt (certbot webroot)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def le_rate_limited(out):
+    """Отказ certbot — это недельный лимит Let's Encrypt, а не сбой проверки.
+
+    Лимит на повторный выпуск одинакового набора имён (5 в неделю) выбирают
+    несколько переустановок подряд. Повторять попытки бесполезно, а молчаливое
+    «certbot не прошёл» отправляет искать проблему в DNS, которого тут нет.
+    """
+    low = (out or "").lower()
+    return "too many certificates" in low or "ratelimited" in low
+
+
 def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY):
     """Выпустить LE через certbot webroot, скопировать в cdn.crt/cdn.key.
 
@@ -2504,9 +2515,10 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY):
     for attempt in range(3):
         say("  certbot: запрашиваю сертификат для %s (попытка %d из 3)..."
             % (domain, attempt + 1))
-        run("certbot certonly --webroot -w /var/www/certbot -d %s "
-            "--non-interactive --agree-tos "
-            "--register-unsafely-without-email" % shq(domain), timeout=180)
+        out, _ = run("certbot certonly --webroot -w /var/www/certbot -d %s "
+                     "--non-interactive --agree-tos "
+                     "--register-unsafely-without-email 2>&1" % shq(domain),
+                     timeout=180)
         live = "/etc/letsencrypt/live/%s" % domain
         if os.path.isfile(live + "/fullchain.pem"):
             # crt=None — копия не нужна: vhost смотрит прямо в live-каталог,
@@ -2525,8 +2537,17 @@ def issue_le_cert(domain, crt=CDN_CRT, key=CDN_KEY):
                 run("nginx -s reload 2>/dev/null || true")
             ok("Сертификат LE получен для %s" % domain)
             return True
+        if le_rate_limited(out):
+            # Повторы бессмысленны: лимит недельный, он не «отпустит» через 20 с
+            warn("Let's Encrypt: лимит на %s исчерпан" % domain)
+            say("  5 сертификатов в неделю на один и тот же набор имён — "
+                "обычно упираются после нескольких переустановок подряд")
+            say("  Обход: поставить панель на другой поддомен, например "
+                "--domain panel2.%s — у него свой счётчик" % domain)
+            break
         say("  certbot не прошёл (попытка %d/3), повтор через 20с..." % (attempt + 1))
-        time.sleep(20)
+        if attempt + 1 < 3:      # после последней попытки ждать нечего
+            time.sleep(20)
     warn("сертификат для %s не выпущен — self-signed" % domain)
     return False
 

@@ -1409,6 +1409,35 @@ class TestWipeLeftovers(unittest.TestCase):
         self.assertNotIn("база панели", out)
 
 
+class TestLeRateLimit(unittest.TestCase):
+    """Упёршись в недельный лимит, certbot повторять бесполезно."""
+
+    LIMIT = ("An unexpected error occurred: too many certificates (5) already "
+             "issued for this exact set of domains")
+
+    def test_limit_is_recognised(self):
+        self.assertTrue(inst.le_rate_limited(self.LIMIT))
+        self.assertTrue(inst.le_rate_limited("urn:...:rateLimited"))
+        self.assertFalse(inst.le_rate_limited("timeout during connect"))
+        self.assertFalse(inst.le_rate_limited(""))
+
+    def test_certbot_stops_retrying_and_names_the_reason(self):
+        orig = (inst.pkg_install, inst.get_ip, inst.time.sleep)
+        inst.pkg_install = lambda pkgs: True
+        inst.get_ip = lambda: "1.2.3.4"
+        inst.time.sleep = lambda s: None
+        try:
+            with fake_run({"certbot certonly": (self.LIMIT, 1),
+                           "getent": ("1.2.3.4", 0)}) as cmds:
+                res, out = quiet(inst.issue_le_cert, "e.com")
+        finally:
+            inst.pkg_install, inst.get_ip, inst.time.sleep = orig
+        self.assertFalse(res)
+        self.assertEqual(len([c for c in cmds if "certbot certonly" in c]), 1)
+        self.assertIn("лимит", out)
+        self.assertIn("--domain panel2.e.com", out)
+
+
 class TestRefactorRegressions(unittest.TestCase):
     """Баги, найденные при ревью: не должны вернуться."""
 
