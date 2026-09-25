@@ -782,10 +782,14 @@ class TestCdnInstructions(unittest.TestCase):
                        "origin.example.com", client, "1.2.3.4", "/uploadfiles/abc")
         return out
 
-    def test_every_provider_prints_origin_and_path(self):
+    def test_every_provider_prints_the_source_and_the_path(self):
+        # источник у Yandex — имя, у Timeweb — IP: в инструкции должно стоять
+        # ровно то, что человек вобьёт в консоли провайдера
         for provider in inst.CDN_NAMES.values():
             out = self._print(provider)
-            self.assertIn("origin.example.com", out, provider)
+            want = ("origin.example.com" if inst.origin_needs_dns(provider)
+                    else "1.2.3.4")
+            self.assertIn(want, out, provider)
             self.assertIn("/uploadfiles/abc", out, provider)
             self.assertNotIn("%s", out, provider)
 
@@ -1518,6 +1522,46 @@ class TestNodeReloadClients(unittest.TestCase):
             self.assertIn("node_reload_clients()", src, fn.__name__)
             self.assertLess(src.index("publish_for_clients"),
                             src.index("node_reload_clients()"), fn.__name__)
+
+
+class TestOriginDns(unittest.TestCase):
+    """A-запись на источник просят только там, где CDN ходит по имени."""
+
+    def test_yandex_needs_it_timeweb_does_not(self):
+        self.assertTrue(inst.origin_needs_dns("yandex"))
+        self.assertFalse(inst.origin_needs_dns("timeweb"))
+
+    def test_cdn_records_skip_the_origin_row_for_timeweb(self):
+        rows = inst.cdn_dns_records("o.e.com", "1.2.3.4", "x.cdn.twcstorage.ru",
+                                    cdn_name="timeweb")
+        self.assertNotIn("o.e.com", " ".join(rows))
+
+    def test_cdn_records_keep_it_for_yandex(self):
+        rows = inst.cdn_dns_records("o.e.com", "1.2.3.4", "x.yccdn.ru",
+                                    client_domain="c.e.com", cdn_name="yandex")
+        joined = " ".join(rows)
+        self.assertIn("o.e.com", joined)
+        self.assertIn("CNAME  c.e.com", joined)
+
+    def test_timeweb_instructions_name_the_ip_not_the_origin_domain(self):
+        _, out = quiet(inst.print_cdn_instructions, "timeweb", "o.e.com", "",
+                       "1.2.3.4", "/a/b")
+        self.assertNotIn("o.e.com", out)
+        self.assertIn("1.2.3.4", out)
+
+    def test_timeweb_install_does_not_ask_for_the_origin_record(self):
+        orig = inst.choose
+        inst.choose = lambda prompt, options: 2          # Timeweb
+        try:
+            _, out = TestMainFlow._main(
+                TestMainFlow(methodName="run"),
+                ["--mode", "1", "--domain", "e.com", "--skip-cdn-wait",
+                 "--no-wipe", "--cdn-domain", "xxx.cdn.twcstorage.ru"])
+        finally:
+            inst.choose = orig
+        # домен панели просим, случайный поддомен источника — нет
+        self.assertIn("A     e.com", out)
+        self.assertNotIn(".e.com   ->", out)
 
 
 class TestOriginCertFromMenu(unittest.TestCase):

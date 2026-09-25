@@ -2620,7 +2620,10 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
     print("  " + _c("1;" + C_TITLE, "Настройка CDN у провайдера")
           + _c(C_DIM, " · %s" % provider), flush=True)
     hr()
-    say("  Origin:              %s   (A -> %s)" % (origin, my_ip))
+    if origin_needs_dns(provider):
+        say("  Origin:              %s   (A -> %s)" % (origin, my_ip))
+    else:
+        say("  Источник:            %s   (по IP, имя не участвует)" % my_ip)
     if client_domain:
         say("  Домен для клиентов:  %s" % client_domain)
     say("  Путь туннеля:        /%s/\n" % path.strip("/"))
@@ -2702,7 +2705,19 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
 """ % my_ip)
 
 
-def cdn_dns_records(origin, my_ip, cdn_domain, client_domain=""):
+def origin_needs_dns(cdn_name):
+    """Нужна ли A-запись на домен источника.
+
+    Yandex ходит к источнику по имени (SNI и заголовок Host), Timeweb — по
+    IP-адресу и порту 80. Для Timeweb имя источника не участвует нигде:
+    сертификат для него не выпускается (см. want_origin_cert), в ресурсе CDN
+    стоит IP, а nginx отдаёт туннель на default_server. Просить такую запись
+    значит гонять человека в DNS без причины.
+    """
+    return cdn_name != "timeweb"
+
+
+def cdn_dns_records(origin, my_ip, cdn_domain, client_domain="", cdn_name=""):
     """Строки DNS-записей под CDN: A на origin и CNAME своего домена.
 
     Домен CDN провайдер выдаёт технический (xxx.cdn.twcstorage.ru,
@@ -2710,7 +2725,9 @@ def cdn_dns_records(origin, my_ip, cdn_domain, client_domain=""):
     технический именно CNAME-записью, A тут не годится: адреса edge-узлов
     провайдер меняет без предупреждения.
     """
-    rows = ["A      %s  ->  %s   (источник CDN, DNS only)" % (origin, my_ip)]
+    rows = []
+    if not cdn_name or origin_needs_dns(cdn_name):
+        rows.append("A      %s  ->  %s   (источник CDN, DNS only)" % (origin, my_ip))
     if client_domain and cdn_domain:
         rows.append("CNAME  %s  ->  %s   (домен для клиентов)"
                     % (client_domain, cdn_domain))
@@ -3366,11 +3383,17 @@ def main():
     # Обе записи — A на этот сервер. Домен панели CNAME'ить на CDN нельзя:
     # Let's Encrypt проверяет его прямо здесь, по webroot. Домен CDN клиенту
     # выдаёт провайдер, он в DNS не заводится.
-    records = ["A     %s   ->  %s   (DNS only, серое облако)" % (origin, my_ip)]
+    records = []
+    if origin_needs_dns(cdn_name):
+        records.append("A     %s   ->  %s   (DNS only, серое облако)"
+                       % (origin, my_ip))
     if mode != "3":
         records.append("A     %s   ->  %s   (DNS only) — панель и её сертификат"
                        % (domain, my_ip))
-    dns_wait(records, skip=args.skip_dns_wait)
+    if records:
+        dns_wait(records, skip=args.skip_dns_wait)
+    else:
+        say("  DNS-записи не нужны: %s ходит к источнику по IP" % cdn_name)
 
     # ── снести прошлую установку тех компонентов, которые ставим сейчас ──
     if state_is_done("wipe"):
@@ -3432,7 +3455,8 @@ def main():
             % (cdn_domain or "домен CDN"), "")
     if cdn_domain or client_domain:
         callout("DNS для CDN",
-                cdn_dns_records(origin, my_ip, cdn_domain, client_domain))
+                cdn_dns_records(origin, my_ip, cdn_domain, client_domain,
+                                cdn_name))
     public_domain = client_domain or cdn_domain
 
     # Хост в панели создавался до того, как провайдер выдал домен — переставить
@@ -3448,21 +3472,25 @@ def main():
 
     # ── финальный отчёт ──
     cdn_val = public_domain or "— укажи после настройки провайдера"
+    # У Timeweb источник задаётся IP: печатать имя с A-записью значит
+    # обещать запись, которой нигде нет.
+    origin_row = ("Origin", "%s  (A → %s)" % (origin, my_ip)) \
+        if origin_needs_dns(cdn_name) else ("Источник", "%s  (по IP)" % my_ip)
     if mode == "3":
         rows = [("Режим", "только CDN"),
-                ("Origin", "%s  (A → %s)" % (origin, my_ip)),
+                origin_row,
                 ("Фронт", ":443 → 127.0.0.1:%d  путь %s" % (xport, path)),
                 ("CDN", cdn_val)]
     elif mode == "2":
         rows = [("Режим", "нода + CDN к существующей панели"),
                 ("Панель", cfg["panel_url"]),
-                ("Origin", "%s  (A → %s)" % (origin, my_ip)),
+                origin_row,
                 ("CDN", cdn_val)]
     else:
         rows = [("Панель", "https://%s/" % domain),
                 ("Логин", "admin"),
                 ("Пароль", admin_pw),
-                ("Origin", "%s  (A → %s)" % (origin, my_ip)),
+                origin_row,
                 ("CDN", cdn_val)]
     if mode in ("1", "2") and not result.get("host_uuid"):
         # Без хоста подписка пустая: клиенту не к чему подключаться
