@@ -1520,5 +1520,32 @@ class TestNodeReloadClients(unittest.TestCase):
                             src.index("node_reload_clients()"), fn.__name__)
 
 
+class TestOriginCertDecision(unittest.TestCase):
+    """Сертификат источника нужен Yandex и не нужен Timeweb."""
+
+    class Args(object):
+        def __init__(self, no_origin_le=False, origin_le=False):
+            self.no_origin_le = no_origin_le
+            self.origin_le = origin_le
+
+    def test_yandex_gets_a_certificate_by_default(self):
+        self.assertTrue(inst.want_origin_cert("yandex", self.Args()))
+
+    def test_timeweb_skips_it_without_any_flag(self):
+        # Timeweb ходит к источнику по HTTP: сертификат не участвует, а
+        # выпуск тратит лимит LE и светит имя источника в CT-логах
+        self.assertFalse(inst.want_origin_cert("timeweb", self.Args()))
+
+    def test_flags_override_the_provider_both_ways(self):
+        self.assertTrue(inst.want_origin_cert("timeweb",
+                                              self.Args(origin_le=True)))
+        self.assertFalse(inst.want_origin_cert("yandex",
+                                               self.Args(no_origin_le=True)))
+
+    def test_no_origin_le_wins_over_origin_le(self):
+        args = self.Args(no_origin_le=True, origin_le=True)
+        self.assertFalse(inst.want_origin_cert("yandex", args))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

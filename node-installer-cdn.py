@@ -2532,6 +2532,22 @@ def setup_panel_web(cfg, xport, path):
     upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
 
 
+def want_origin_cert(cdn_name, args):
+    """Нужен ли origin настоящий сертификат Let's Encrypt.
+
+    Решает провайдер, а не пользователь: Yandex ходит к источнику по HTTPS и
+    проверяет его имя, Timeweb — по HTTP на порт 80, и сертификат там не
+    участвует вообще. Выпускать его для Timeweb значит зря потратить
+    недельный лимит Let's Encrypt и опубликовать имя источника в CT-логах.
+    Флагами можно переспорить в обе стороны.
+    """
+    if args.no_origin_le:
+        return False
+    if args.origin_le:
+        return True
+    return cdn_name != "timeweb"
+
+
 def upgrade_origin_cert(origin_domain, skip=False):
     """Заменить self-signed на Let's Encrypt для origin, если получится.
 
@@ -2542,6 +2558,8 @@ def upgrade_origin_cert(origin_domain, skip=False):
     При неудаче остаётся self-signed — установка не прерывается.
     """
     if skip:
+        say("  Let's Encrypt для источника не выпускаю — CDN к нему по HTTPS "
+            "не ходит (переспорить: --origin-le)")
         return False
     say("  Пробую выпустить Let's Encrypt для origin %s..." % origin_domain)
     if issue_le_cert(origin_domain):
@@ -2883,7 +2901,11 @@ def parse_args():
     p.add_argument("--no-grpc", action="store_true",
                    help=argparse.SUPPRESS)
     p.add_argument("--no-origin-le", action="store_true",
-                   help="Do not try Let's Encrypt for the CDN origin (keep self-signed)")
+                   help="Не выпускать Let's Encrypt для источника "
+                   "(оставить самоподписанный)")
+    p.add_argument("--origin-le", action="store_true",
+                   help="Выпустить Let's Encrypt для источника даже там, где "
+                   "он не нужен (Timeweb ходит к источнику по HTTP)")
     p.add_argument("--wipe", action="store_true",
                    help="Снести прошлую установку без вопросов (для автозапуска)")
     p.add_argument("--no-wipe", action="store_true",
@@ -3337,7 +3359,8 @@ def main():
     cfg = {"mode": mode, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
            "xport": xport,
-           "no_origin_le": args.no_origin_le, "front": args.front}
+           "no_origin_le": not want_origin_cert(cdn_name, args),
+           "front": args.front}
 
     # ── DNS ──
     # Обе записи — A на этот сервер. Домен панели CNAME'ить на CDN нельзя:
