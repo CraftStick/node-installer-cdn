@@ -802,10 +802,13 @@ class TestCdnInstructions(unittest.TestCase):
         self.assertIn("origin.example.com", out)
 
     def test_caching_and_compression_are_switched_off_everywhere(self):
+        # названия полей у провайдеров свои («Кеш CDN» / «CDN-кэширование»),
+        # проверяем смысл: про кеш и про сжатие сказано, и сказано «выкл»
         for provider in inst.CDN_NAMES.values():
-            out = self._print(provider)
-            self.assertIn("Кеш", out, provider)
-            self.assertIn("Gzip/Brotli", out, provider)
+            out = self._print(provider).lower()
+            self.assertRegex(out, r"к[еэ]ш", provider)
+            self.assertIn("gzip", out, provider)
+            self.assertIn("выкл", out, provider)
 
     def test_removed_providers_have_no_instructions(self):
         for provider in ("vk", "beeline"):
