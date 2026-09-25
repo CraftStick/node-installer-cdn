@@ -227,18 +227,23 @@ class TestXrayInbounds(unittest.TestCase):
         ib = inst.build_xhttp_inbound(4443, "/a", "T", uuid="U-1")
         self.assertEqual(ib["settings"]["clients"], [{"id": "U-1", "email": "user1"}])
 
-    def test_grpc_inbound_is_reality_on_all_interfaces(self):
-        ib = inst.build_grpc_inbound(2053, "U", "priv", "ab12", "svc")
-        self.assertEqual(ib["listen"], "0.0.0.0")
-        rs = ib["streamSettings"]["realitySettings"]
-        self.assertEqual(rs["privateKey"], "priv")
-        self.assertEqual(rs["shortIds"], ["ab12"])
-        self.assertEqual(rs["dest"], inst.REALITY_DEST)
-        self.assertNotIn("pub", json.dumps(rs))   # публичный ключ — только клиенту
+    def test_node_gets_exactly_one_inbound(self):
+        # запасной gRPC Reality убран: наружу смотрит только CDN
+        ibs = inst.build_node_inbounds({"cdn": "yandex"}, 4443, "/a/b")
+        self.assertEqual(len(ibs), 1)
+        self.assertEqual(ibs[0]["tag"], "YANDEX_CDN")
+        self.assertEqual(ibs[0]["listen"], "127.0.0.1")
+
+    def test_installer_has_no_reality_leftovers(self):
+        with io.open(os.path.join(_HERE, "node-installer-cdn.py"),
+                     encoding="utf-8") as f:
+            src = f.read()
+        for gone in ("build_grpc_inbound", "gen_x25519", "REALITY_DEST",
+                     "reality_ports", "GRPC_PORT"):
+            self.assertNotIn(gone, src)
 
     def test_inbounds_are_json_serialisable(self):
         json.dumps(inst.build_xhttp_inbound(4443, "/a", "T"))
-        json.dumps(inst.build_grpc_inbound(2053, "U", "p", "s", "svc"))
 
 
 class TestXrayProfile(unittest.TestCase):
@@ -398,31 +403,13 @@ class TestConfigProfile(unittest.TestCase):
     def test_returns_uuid_and_tag_to_uuid_map(self):
         api = FakeApi({("POST", "config-profiles"): (
             {"response": {"uuid": "P-1", "inbounds": [
-                {"tag": "VK_CDN", "uuid": "I-1"},
-                {"tag": "grpc-reality-2053", "uuid": "I-2"}]}}, 201)})
+                {"tag": "VK_CDN", "uuid": "I-1"}]}}, 201)})
         (prof, tags), _ = quiet(
             inst.create_config_profile, api, "cdn-x",
             [inst.build_xhttp_inbound(4443, "/a", "VK_CDN")])
         self.assertEqual(prof, "P-1")
-        self.assertEqual(tags, {"VK_CDN": "I-1", "grpc-reality-2053": "I-2"})
+        self.assertEqual(tags, {"VK_CDN": "I-1"})
 
-    def test_falls_back_to_primary_inbound_when_panel_rejects_full_config(self):
-        calls = []
-
-        def api(method, path, data=None):
-            calls.append(data)
-            if len(data["config"]["inbounds"]) > 1:
-                return {"errorCode": "A112"}, 400
-            return {"response": {"uuid": "P-2",
-                                 "inbounds": [{"tag": "VK_CDN", "uuid": "I-1"}]}}, 201
-
-        inbounds = [inst.build_xhttp_inbound(4443, "/a", "VK_CDN"),
-                    inst.build_grpc_inbound(2053, "U", "p", "s", "svc")]
-        (prof, tags), out = quiet(inst.create_config_profile, api, "cdn-x", inbounds)
-        self.assertEqual(prof, "P-2")
-        self.assertEqual(len(calls), 2)                      # полный, затем урезанный
-        self.assertEqual(len(calls[1]["config"]["inbounds"]), 1)
-        self.assertIn("только основной вход", out)
 
     def test_reports_failure_without_raising(self):
         api = FakeApi({("POST", "config-profiles"): ({"message": "nope"}, 400)})
@@ -1214,12 +1201,16 @@ class TestMainFlow(unittest.TestCase):
     BASE = ["--domain", "e.com", "--skip-dns-wait", "--skip-cdn-wait", "--no-wipe",
             "--cdn-domain", "xxx.cdn.twcstorage.ru"]
 
-    def test_grpc_question_is_skipped_without_tty(self):
-        # без --no-grpc и без терминала установщик раньше падал на вопросе
+    def test_install_runs_without_tty(self):
         seen, out = self._main(["--mode", "1", "--cdn", "yandex"] + self.BASE)
         self.assertIn("install_remnawave", seen)
-        self.assertFalse(seen["install_remnawave"]["no_grpc"])   #по умолчанию вход добавляется
         self.assertIn("ГОТОВО", out)
+
+    def test_old_no_grpc_flag_is_still_accepted(self):
+        # запасной вход убран, но старые команды и автозапуски не ломаем
+        seen, _ = self._main(["--mode", "1", "--cdn", "yandex", "--no-grpc"]
+                             + self.BASE)
+        self.assertIn("install_remnawave", seen)
 
     def test_cdn_only_mode_reports_and_keeps_given_path(self):
         seen, out = self._main(["--mode", "3", "--cdn", "timeweb", "--path",

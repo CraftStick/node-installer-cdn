@@ -79,7 +79,6 @@ RE_IPV4   = re.compile(r"^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})
 # установщике: наружу он не смотрит (TLS снимает nginx), поэтому случайность
 # ничего не даёт, а предсказуемый порт нужен режиму 3 и ручной диагностике.
 XHTTP_PORT = 4443
-GRPC_PORT  = 2053          # запасной gRPC Reality-вход ноды Remnawave
 
 PANEL_PORT = 3000                     # Remnawave слушает только 127.0.0.1:3000
 
@@ -90,10 +89,6 @@ CDN_KEY = "/etc/nginx/ssl/cdn.key"
 # Метка в начале каждого конфига, который пишет установщик: по ней снос
 # отличает свои файлы от дистрибутивных и чужих (см. wipe_previous).
 CONF_MARK = "# node-installer-cdn"
-
-# Reality dest/sni — «прикрытие» для gRPC-входа
-REALITY_DEST = "www.microsoft.com:443"
-REALITY_SNI  = "www.microsoft.com"
 
 # sysctl BBR-тюнинг
 SYSCTL_TUNING = """net.core.default_qdisc = fq
@@ -1005,37 +1000,8 @@ def nginx_write_conf(name, content):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Xray: x25519 и инбаунды
+#  Xray: инбаунды
 # ─────────────────────────────────────────────────────────────────────────────
-
-def gen_x25519():
-    """Generate x25519 keypair for Reality. Returns (private, public) or (None,None)."""
-    variants = [
-        "docker exec remnanode xray x25519 2>/dev/null",
-        "xray x25519 2>/dev/null",
-        "/usr/local/bin/xray x25519 2>/dev/null",
-        "docker run --rm %s xray x25519 2>/dev/null" % REMNANODE_IMAGE,
-    ]
-    for cmd in variants:
-        out, _ = run(cmd)
-        if not out:
-            continue
-        priv = pub = None
-        for line in out.splitlines():
-            low = line.lower()
-            if "private" in low:
-                priv = line.split(":")[-1].strip()
-            elif "public" in low:
-                pub = line.split(":")[-1].strip()
-        # Все варианты выше — это xray: "Private key: <b64>" и "Public key:
-        # <b64>", значение на той же строке. Запасной вариант на openssl отсюда
-        # убран: он печатает priv:/pub: с hex на СЛЕДУЮЩИХ строках, разбор его
-        # не берёт, и пара из него не получалась никогда.
-        if priv and pub:
-            return priv, pub
-    err("Не удалось сгенерировать x25519 ключи")
-    return None, None
-
 
 def xhttp_settings(path):
     """xhttpSettings туннеля — ОДИН набор и для инбаунда ноды, и для хоста.
@@ -1090,33 +1056,6 @@ def build_xhttp_inbound(port, path, tag, uuid=None):
             "security": "none",
             "xhttpSettings": xhttp_settings(path),
         },
-    }
-
-
-def build_grpc_inbound(port, uuid, priv, sid, service):
-    """VLESS Reality gRPC inbound для xray-core."""
-    return {
-        "tag": "grpc-reality-%d" % port,
-        "listen": "0.0.0.0",
-        "port": port,
-        "protocol": "vless",
-        "settings": {
-            "clients": [{"id": uuid, "email": "user1", "flow": ""}],
-            "decryption": "none",
-        },
-        "streamSettings": {
-            "network": "grpc",
-            "security": "reality",
-            "realitySettings": {
-                "dest": REALITY_DEST,
-                "serverNames": [REALITY_SNI],
-                "privateKey": priv,
-                "shortIds": [sid],
-                "fingerprint": "random",
-            },
-            "grpcSettings": {"serviceName": service},
-        },
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
     }
 
 
@@ -1905,11 +1844,11 @@ def install_remnawave(cfg):
     # не существует — провайдеру нечего забирать.
     setup_panel_web(cfg, xport, path)
 
-    # ── профиль + инбаунды (CDN xhttp + опц. gRPC) ──
+    # ── профиль + инбаунд CDN xhttp ──
     step("Создание профиля, ноды, хоста и юзера через API")
     user_uuid = str(_uuid.uuid4())
-    ok("Основной вход: VLESS XHTTP packet-up, 127.0.0.1:%d, путь %s" % (xport, path))
-    inbounds, reality = build_node_inbounds(cfg, user_uuid, xport, path)
+    ok("Вход: VLESS XHTTP packet-up, 127.0.0.1:%d, путь %s" % (xport, path))
+    inbounds = build_node_inbounds(cfg, xport, path)
     prof_uuid, tag2uuid = create_config_profile(api, profile_name(cfg["cdn"]),
                                                 inbounds)
     inbound_uuids = inbound_uuids_of(inbounds, tag2uuid)
@@ -1934,9 +1873,8 @@ def install_remnawave(cfg):
     say("  Запуск контейнера remnanode...")
     start_remnanode()
     # Файрвол ставим до ограничения 2222: тогда правило ноды уходит в ufw и
-    # переживает перезагрузку. Порт запасного канала открываем явно, иначе
-    # политика deny incoming его закроет.
-    firewall_setup(extra_tcp=reality_ports(reality))
+    # переживает перезагрузку.
+    firewall_setup()
     restrict_node_port_2222(gw)
     node_wait_ready()
 
@@ -1944,7 +1882,7 @@ def install_remnawave(cfg):
         api, cfg, prof_uuid, inbounds, tag2uuid, user_uuid, domain)
 
     return {"token": token, "user_uuid": user_uuid, "sub_url": sub_url,
-            "reality": reality, "prof_uuid": prof_uuid,
+            "prof_uuid": prof_uuid,
             "inbound_uuids": inbound_uuids,
             "host_uuid": host_uuid, "api": api}
 
@@ -1959,11 +1897,6 @@ def require_docker():
 def inbound_uuids_of(inbounds, tag2uuid):
     """uuid, которые панель выдала нашим инбаундам, в порядке инбаундов."""
     return [u for u in (tag2uuid.get(i["tag"]) for i in inbounds) if u]
-
-
-def reality_ports(reality):
-    """Порт запасного входа для файрвола: без него deny incoming его закроет."""
-    return [reality["port"]] if reality else []
 
 
 def publish_for_clients(api, cfg, prof_uuid, inbounds, tag2uuid, user_uuid, sub_domain):
@@ -1985,24 +1918,9 @@ def publish_for_clients(api, cfg, prof_uuid, inbounds, tag2uuid, user_uuid, sub_
     return host_uuid, sub_url, user_uuid
 
 
-def build_node_inbounds(cfg, user_uuid, xport, path):
-    """Инбаунды профиля ноды: CDN xhttp всегда, gRPC Reality — если не --no-grpc.
-
-    Возвращает (inbounds, reality); reality — то, что печатается клиенту в
-    конце (serviceName и порт: без них к запасному входу не подключиться, а
-    придумать случайный slug клиент не может), или None.
-    """
-    inbounds = [build_xhttp_inbound(xport, path, "%s_CDN" % cfg["cdn"].upper())]
-    if cfg.get("no_grpc"):
-        return inbounds, None
-    priv, pub = gen_x25519()
-    if not priv:
-        return inbounds, None
-    sid = rand(8, "0123456789abcdef")
-    service = _slug("grpc")
-    inbounds.append(build_grpc_inbound(GRPC_PORT, user_uuid, priv, sid, service))
-    ok("Добавлен gRPC Reality inbound (TCP %d)" % GRPC_PORT)
-    return inbounds, {"pbk": pub, "sid": sid, "service": service, "port": GRPC_PORT}
+def build_node_inbounds(cfg, xport, path):
+    """Инбаунды профиля ноды. Вход один: CDN xhttp через origin."""
+    return [build_xhttp_inbound(xport, path, "%s_CDN" % cfg["cdn"].upper())]
 
 
 def panel_node_secret(api):
@@ -2163,8 +2081,8 @@ def listening_ports():
     """Порты, которые сервер прямо сейчас слушает не на loopback.
 
     Возвращает {"tcp": set, "udp": set}. Нужны режиму 3: там фронт ставится
-    перед уже работающей нодой, и её порты (2222 для панели, запасные входы)
-    должны пережить включение deny incoming.
+    перед уже работающей нодой, и её порты (2222 для панели и всё, что она
+    слушает ещё) должны пережить включение deny incoming.
     """
     found = {}
     for proto, flag in (("tcp", "t"), ("udp", "u")):
@@ -2181,8 +2099,8 @@ def listening_ports():
     return found
 
 
-def firewall_setup(extra_tcp=(), extra_udp=(), keep_listening=False):
-    """ufw с политикой deny incoming: SSH, 80/443 и явно перечисленные порты.
+def firewall_setup(keep_listening=False):
+    """ufw с политикой deny incoming: наружу открыты только SSH и 80/443.
 
     Порт sshd открывается ПЕРВЫМ и только потом включается политика, иначе
     установка обрывает сама себя вместе с SSH-сессией.
@@ -2190,7 +2108,7 @@ def firewall_setup(extra_tcp=(), extra_udp=(), keep_listening=False):
     keep_listening — сервер уже работает (режим 3), и ломать его нельзя:
     включённый ufw не трогаем вовсе, кроме 80/443, а при выключенном
     оставляем открытым всё, что уже слушает наружу. Иначе deny incoming
-    закрыл бы порт 2222 панели и запасные входы ноды.
+    закрыл бы и порт 2222 панели, и остальные входы работающей ноды.
     """
     if run("which ufw")[1] != 0:
         pkg_install("ufw")
@@ -2203,8 +2121,8 @@ def firewall_setup(extra_tcp=(), extra_udp=(), keep_listening=False):
         ok("ufw уже включён — его правила не тронуты, добавлены только 80/443")
         return True
     ssh_ports = detect_ssh_ports()
-    tcp = set(ssh_ports) | {80, 443} | set(extra_tcp)
-    udp = set(extra_udp)
+    tcp = set(ssh_ports) | {80, 443}
+    udp = set()
     if keep_listening:
         live = listening_ports()
         kept = sorted((live["tcp"] - tcp)) + sorted(live["udp"] - udp)
@@ -2221,9 +2139,8 @@ def firewall_setup(extra_tcp=(), extra_udp=(), keep_listening=False):
     run("ufw default allow outgoing >/dev/null 2>&1")
     run("ufw --force enable >/dev/null 2>&1")
     if ufw_active():
-        extra = [str(p) for p in list(extra_tcp) + list(extra_udp)]
-        ok("Файрвол: deny incoming, открыты SSH %s, %s"
-           % ("/".join(map(str, ssh_ports)), ", ".join(["80", "443"] + extra)))
+        ok("Файрвол: deny incoming, открыты SSH %s, 80, 443"
+           % "/".join(map(str, ssh_ports)))
         return True
     warn("ufw не включился — правила не применены")
     return False
@@ -2308,36 +2225,24 @@ def create_config_profile(api, name, inbounds, tries=3):
     ссылаются и сквад, и нода — теги для этого не годятся.
     api(method, path, data) -> (resp, code): работает и локально, и по SSH.
     """
-    # Панель прогоняет конфиг через xray и отвергает целиком (A112), если хоть
-    # один вход невалиден. Поэтому при отказе пробуем оставить только основной
-    # CDN-вход: установка с ним одним лучше, чем никакая.
-    variants = [("полный", inbounds)]
-    if len(inbounds) > 1:
-        variants.append(("только основной вход", inbounds[:1]))
-
     resp, code = None, 0
     base_name = name        # хвост к занятому имени — к исходному, а не к прошлому хвосту
-    for label, inbs in variants:
-        for attempt in range(tries):
-            resp, code = api("POST", "config-profiles", build_xray_profile(name, inbs))
-            # Имя профиля осмысленное (CDN-YANDEX), а на чужой панели такое
-            # может уже существовать: тогда добавляем хвост и пробуем ещё раз
-            if code in (400, 409) and re.search(
-                    r"exist|unique|taken|занят", json.dumps(resp), re.I):
-                name = "%s-%s" % (base_name, rand(4, LOWER_ALNUM))
-                say("  Профиль с таким именем уже есть — беру «%s»" % name)
-                continue
-            if code != 0:
-                break        # ответ получен — повтор его не изменит
-            if attempt + 1 < tries:     # после последней попытки ждать нечего
-                say("  API не ответил (%d/%d), жду 10 сек..." % (attempt + 1, tries))
-                time.sleep(10)
-        if code in (200, 201):
-            if label != "полный":
-                warn("Профиль принят в варианте «%s» — остальные входы панель "
-                     "отвергла" % label)
-            break
-        warn("Профиль «%s» отвергнут: %s" % (label, json.dumps(resp)[:160]))
+    for attempt in range(tries):
+        resp, code = api("POST", "config-profiles", build_xray_profile(name, inbounds))
+        # Имя профиля осмысленное (CDN-YANDEX), а на чужой панели такое
+        # может уже существовать: тогда добавляем хвост и пробуем ещё раз
+        if code in (400, 409) and re.search(
+                r"exist|unique|taken|занят", json.dumps(resp), re.I):
+            name = "%s-%s" % (base_name, rand(4, LOWER_ALNUM))
+            say("  Профиль с таким именем уже есть — беру «%s»" % name)
+            continue
+        if code != 0:
+            break            # ответ получен — повтор его не изменит
+        if attempt + 1 < tries:      # после последней попытки ждать нечего
+            say("  API не ответил (%d/%d), жду 10 сек..." % (attempt + 1, tries))
+            time.sleep(10)
+    if code not in (200, 201):
+        warn("Профиль отвергнут: %s" % json.dumps(resp)[:160])
     r = api_response(resp)
     prof_uuid = r.get("uuid")
     tag2uuid = {i.get("tag"): i.get("uuid") for i in (r.get("inbounds") or [])}
@@ -2841,9 +2746,7 @@ def install_node_only(cfg):
     step("Создание профиля через API панели")
     user_uuid = str(_uuid.uuid4())
     xport = XHTTP_PORT
-    # Запасной вход — как в режиме 1: раньше про него здесь спрашивали, а
-    # инбаунд всё равно создавался только один, и ответ уходил в никуда.
-    inbounds, reality = build_node_inbounds(cfg, user_uuid, xport, path)
+    inbounds = build_node_inbounds(cfg, xport, path)
     prof_uuid, tag2uuid = create_config_profile(api, profile_name(cfg["cdn"]),
                                                 inbounds)
     inbound_uuids = inbound_uuids_of(inbounds, tag2uuid)
@@ -2863,7 +2766,7 @@ def install_node_only(cfg):
     deploy_remnanode_files(secret)
     if apply_origin_front(cfg, xport, path) == "nginx":
         upgrade_origin_cert(origin, skip=cfg.get("no_origin_le"))
-    firewall_setup(extra_tcp=reality_ports(reality))
+    firewall_setup()
     # Панель стоит на другом сервере и стучится к ноде на 2222 снаружи: без этого
     # правила политика deny incoming закрывает порт вообще для всех, и нода
     # появляется в панели, но остаётся неуправляемой.
@@ -2878,8 +2781,7 @@ def install_node_only(cfg):
         api, cfg, prof_uuid, inbounds, tag2uuid, user_uuid,
         pdom.strip() or panel["ip"])
     return {"user_uuid": user_uuid, "prof_uuid": prof_uuid, "my_ip": my_ip,
-            "sub_url": sub_url, "host_uuid": host_uuid, "api": api,
-            "reality": reality}
+            "sub_url": sub_url, "host_uuid": host_uuid, "api": api}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2954,7 +2856,10 @@ def parse_args():
     # запускает стоковый xray. Флаг принимается молча, чтобы не ломать старые
     # команды в чужих скриптах.
     p.add_argument("--no-hy2", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--no-grpc", action="store_true", help="Skip gRPC Reality")
+    # Запасной gRPC Reality-вход убран: флаг принимается молча, чтобы не
+    # ломать старые команды и автозапуски.
+    p.add_argument("--no-grpc", action="store_true",
+                   help=argparse.SUPPRESS)
     p.add_argument("--no-origin-le", action="store_true",
                    help="Do not try Let's Encrypt for the CDN origin (keep self-signed)")
     p.add_argument("--wipe", action="store_true",
@@ -3407,22 +3312,9 @@ def main():
         xport = XHTTP_PORT
     admin_pw = state_value("admin_pw", rand_password)
 
-    # ── запасные каналы ──
-    # Раньше запасной вход добавлялся молча. Теперь спрашиваем — но только
-    # там, где инбаунды вообще создаются, и только если не задано флагом.
-    # Без tty вопрос не задаём: ответа взять неоткуда, а падать на нём нельзя —
-    # остаётся значение по умолчанию (запасной вход добавляется).
-    want_grpc = not args.no_grpc
-    if mode in ("1", "2") and not args.no_grpc and sys.stdin.isatty():
-        say("")
-        say("  Основной вход — VLESS XHTTP packet-up через CDN, он ставится всегда.")
-        want_grpc = choose("Добавить к нему запасной вход?", [
-            "Да, gRPC Reality — прямой вход, работает при отказе CDN",
-            "Нет, только XHTTP через CDN — минимум открытых портов наружу"]) == 1
-
     cfg = {"mode": mode, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "path": path, "admin_pass": admin_pw,
-           "no_grpc": not want_grpc, "xport": xport,
+           "xport": xport,
            "no_origin_le": args.no_origin_le, "front": args.front}
 
     # ── DNS ──
@@ -3540,18 +3432,6 @@ def main():
     if public_domain and result.get("user_uuid"):
         link = vless_link(result["user_uuid"], public_domain, path, cdn_name)
         callout("VLESS CDN ссылка", [link], color=C_TITLE)
-    if result.get("reality"):
-        # Всё, что нужно клиенту для запасного входа: без serviceName
-        # подключиться по этим PBK/SID нельзя.
-        r = result["reality"]
-        callout("Запасной вход · gRPC Reality", [
-            "Адрес:      %s:%s" % (my_ip, r.get("port")),
-            "SNI / dest: %s" % REALITY_SNI,
-            "UUID:       %s" % result.get("user_uuid", ""),
-            "PBK:        %s" % r.get("pbk"),
-            "SID:        %s" % r.get("sid"),
-            "serviceName:%s" % r.get("service"),
-        ], color=C_TITLE)
     print("", flush=True)
 
 
