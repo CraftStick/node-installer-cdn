@@ -2683,11 +2683,20 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
        - Имя:            %s
        - Домены:         %s
        - Тип проверки:   DNS
-  Yandex покажет запись для проверки вида
-       _acme-challenge.%s  ->  <значение>.cm.yandexcloud.net
-  Заведите её у DNS-провайдера как есть (DNS only) и дождитесь статуса
-  "Issued" — это 5-30 минут. После выпуска запись НЕ удалять: по ней идёт
-  автопродление сертификата.
+  Yandex покажет запись для проверки. Заведите её у DNS-провайдера так
+  (в Cloudflare: Add record; ИМЯ слева, ЧУЖОЕ значение справа):
+       Type:   CNAME
+       Name:   _acme-challenge.%s
+               (в Cloudflare зону дописывать не надо)
+       Target: <значение со страницы сертификата>.cm.yandexcloud.net
+       Proxy:  DNS only, серое облачко
+  Значение копируйте кнопкой со страницы сертификата: строка длинная и
+  бессмысленная, руками её набирают с ошибками. В Target идёт именно
+  оно, а НЕ ваш домен — иначе запись ведёт сама на себя.
+  Проверить:  dig +short _acme-challenge.%s @1.1.1.1
+  Должен вернуться домен .cm.yandexcloud.net. Дальше ждите статуса
+  "Issued" — это 5-30 минут. После выпуска запись НЕ удалять: по ней
+  идёт автопродление сертификата.
 
   ШАГ 2 · Группа источников
   console.yandex.cloud -> Cloud CDN -> Группы источников -> Создать
@@ -2725,15 +2734,23 @@ def print_cdn_instructions(provider, origin, client_domain, my_ip, path):
 
   ШАГ 4 · DNS
   На странице ресурса, блок "Настройки DNS", будет значение вида
-  xxxxxxxx.topology.gslb.yccdn.ru. Заведите в Cloudflare:
-       CNAME  %s  ->  <это значение>   (DNS only)
+  xxxxxxxx.topology.gslb.yccdn.ru. Заведите запись так:
+       Type:   CNAME
+       Name:   %s
+       Target: <значение из блока "Настройки DNS">
+       Proxy:  DNS only, серое облачко
+  Правило то же: слева ваше имя, справа чужое. Cloudflare показывает
+  итог строкой "<ваш домен> is an alias of <технический>" — если
+  написано наоборот, поля перепутаны местами.
+  Проверить:  dig +short %s @1.1.1.1
 
   Ресурс раскатывается по узлам до 15 минут, и всё это время коды ответа
   скачут между 000, 502 и 200 — так и должно быть. Повторные сохранения
   только перезапускают отсчёт.
-""" % (cert, client_domain, client_domain,
+""" % (cert, client_domain, client_domain, client_domain,
        origin.split(".")[0], origin, origin.split(".")[0],
-       origin, origin, client_domain, cert, client_domain))
+       origin, origin, client_domain, cert,
+       client_domain, client_domain))
 
 def cdn_dns_records(origin, my_ip, cdn_domain, client_domain=""):
     """Строки DNS-записей под CDN: A на origin и CNAME своего домена.

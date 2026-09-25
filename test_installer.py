@@ -812,6 +812,18 @@ class TestCdnInstructions(unittest.TestCase):
             for word in ("VK Cloud", "CDNvideo", "trbcdn", "twcstorage"):
                 self.assertNotIn(word, out, provider)
 
+    def test_dns_records_name_the_fields_and_the_direction(self):
+        """Поля Name/Target путают местами — инструкция должна их называть."""
+        out = self._print("yandex", "cdn.example.com")
+        self.assertIn("Name:   _acme-challenge.cdn.example.com", out)
+        self.assertIn("Target: <значение со страницы сертификата>"
+                      ".cm.yandexcloud.net", out)
+        self.assertIn("Name:   cdn.example.com", out)
+        self.assertIn("слева ваше имя, справа чужое", out)
+        # и команда для проверки, а не «заведите и надейтесь»
+        self.assertIn("dig +short _acme-challenge.cdn.example.com", out)
+        self.assertIn("dig +short cdn.example.com", out)
+
     def test_yandex_steps_carry_real_values_not_placeholders(self):
         """Инструкция должна быть готовой к копированию, без «например»."""
         out = self._print("yandex", "jsq98fs.example.com")
@@ -820,7 +832,7 @@ class TestCdnInstructions(unittest.TestCase):
                       "origin-origin",                     # имя группы источников
                       "Доменное имя ресурса:   jsq98fs.example.com",
                       "Имя SNI-хоста:          origin.example.com",
-                      "CNAME  jsq98fs.example.com"):
+                      "Name:   jsq98fs.example.com"):
             self.assertIn(value, out)
 
 
