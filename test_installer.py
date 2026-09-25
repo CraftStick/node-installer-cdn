@@ -1520,6 +1520,34 @@ class TestNodeReloadClients(unittest.TestCase):
                             src.index("node_reload_clients()"), fn.__name__)
 
 
+class TestOriginCertFromMenu(unittest.TestCase):
+    """Провайдер из меню решает всё сам — флаги для этого не нужны."""
+
+    def _pick(self, choice):
+        """Пройти main(), выбрав провайдера пунктом меню, без --cdn."""
+        orig = inst.choose
+        inst.choose = lambda prompt, options: choice
+        try:
+            seen, _ = TestMainFlow._main(
+                TestMainFlow(methodName="run"),
+                ["--mode", "1", "--domain", "e.com", "--skip-dns-wait",
+                 "--skip-cdn-wait", "--no-wipe",
+                 "--cdn-domain", "xxx.cdn.twcstorage.ru"])
+        finally:
+            inst.choose = orig
+        return seen["install_remnawave"]
+
+    def test_picking_timeweb_skips_the_origin_certificate(self):
+        cfg = self._pick(2)
+        self.assertEqual(cfg["cdn"], "timeweb")
+        self.assertTrue(cfg["no_origin_le"])
+
+    def test_picking_yandex_still_issues_it(self):
+        cfg = self._pick(1)
+        self.assertEqual(cfg["cdn"], "yandex")
+        self.assertFalse(cfg["no_origin_le"])
+
+
 class TestOriginCertDecision(unittest.TestCase):
     """Сертификат источника нужен Yandex и не нужен Timeweb."""
 
