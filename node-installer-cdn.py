@@ -1713,6 +1713,23 @@ def le_domains():
     return sorted(set(d.strip() for d in found if d.strip()))
 
 
+def installed_traces():
+    """Следы установки на сервере: каталоги, свои контейнеры, свои конфиги.
+
+    По ним решается, предлагать ли удаление в меню. На сервере, где скрипт
+    не запускали, пункт не нужен, а его выбор увёл бы в чистку пакетов,
+    которые ставил не он.
+    """
+    found = [p for p in ("/opt/remnawave", "/opt/remnanode", STATE_PATH)
+             if os.path.exists(p)]
+    names, _ = run("docker ps -a --format '{{.Names}}' 2>/dev/null")
+    found += [c for c in OUR_CONTAINERS if c in names.split()]
+    found += [p for p in ("/etc/nginx/sites-available/default",
+                          "/etc/nginx/sites-available/panel.conf", CADDYFILE)
+              if _is_ours(p)]
+    return found
+
+
 def uninstall(assume_yes=False):
     """Снести всё, что установщик поставил: контейнеры, файлы, пакеты, swap.
 
@@ -1720,6 +1737,11 @@ def uninstall(assume_yes=False):
     щадит систему (docker и пакеты следующей установке пригодятся). Здесь
     наоборот — убрать следы целиком.
     """
+    if not installed_traces():
+        warn("Следов установки не нашёл — удалять нечего")
+        say("  Каталогов /opt/remnawave и /opt/remnanode нет, своих контейнеров")
+        say("  и конфигов тоже. Пакеты системы трогать не буду")
+        return
     domains = le_domains()
     warn("Будет удалено:")
     for line in ["контейнеры, тома и образы Remnawave и ноды",
@@ -3463,11 +3485,12 @@ def main():
     # ── режим ──
     # Удаление — пункт меню, а не только флаг: человек запускает скрипт той же
     # командой, что и ставил, и не обязан знать про --uninstall.
-    mode = args.mode or str(choose("Что делаем?", [
-        "Панель + нода (всё на этом сервере)",
-        "Нода + CDN к существующей панели",
-        "Только CDN (перед уже работающей нодой)",
-        "Удалить всё, что ставил скрипт"]))
+    actions = ["Панель + нода (всё на этом сервере)",
+               "Нода + CDN к существующей панели",
+               "Только CDN (перед уже работающей нодой)"]
+    if installed_traces():          # на чистом сервере удалять нечего
+        actions.append("Удалить всё, что ставил скрипт")
+    mode = args.mode or str(choose("Что делаем?", actions))
     if args.mode:
         mode = check_mode_renumbering(args.mode)
     if mode == "4":

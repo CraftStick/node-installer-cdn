@@ -1560,13 +1560,41 @@ class TestUninstall(unittest.TestCase):
         joined, _ = self._run({"ls /etc/nginx": ("default panel.conf\n", 0)})
         self.assertIn("rm -rf /etc/nginx", joined.splitlines())
 
+    def test_does_nothing_without_traces(self):
+        orig = inst.installed_traces
+        inst.installed_traces = lambda: []
+        try:
+            with fake_run() as cmds:
+                _, out = quiet(inst.uninstall, assume_yes=True)
+        finally:
+            inst.installed_traces = orig
+        self.assertIn("удалять нечего", out)
+        self.assertFalse(any("purge" in c or "rm -rf" in c for c in cmds))
+
+    def test_menu_hides_it_on_a_clean_server(self):
+        picked = {}
+        orig = (inst.choose, inst.installed_traces)
+        inst.choose = lambda prompt, options: (picked.setdefault("opts", options),
+                                               1)[1]
+        inst.installed_traces = lambda: []
+        try:
+            TestMainFlow._main(
+                TestMainFlow(methodName="run"),
+                ["--domain", "e.com", "--skip-dns-wait", "--skip-cdn-wait",
+                 "--no-wipe", "--cdn-domain", "c5d6df02.topology.gslb.yccdn.ru"])
+        finally:
+            inst.choose, inst.installed_traces = orig
+        self.assertEqual(len(picked["opts"]), 3)
+
     def test_menu_offers_it_as_the_fourth_item(self):
         # человек запускает ту же команду, что и ставил, про флаг он не знает
         picked = {}
         orig = (inst.choose, inst.uninstall, inst.banner, inst.check_ubuntu,
                 inst.state_load, os.geteuid, sys.argv)
+        traces = inst.installed_traces
         inst.choose = lambda prompt, options: (picked.setdefault("opts", options),
                                                4)[1]
+        inst.installed_traces = lambda: ["/opt/remnawave"]
         inst.uninstall = lambda assume_yes=False: picked.setdefault("ran", True)
         inst.banner = inst.check_ubuntu = lambda: None
         inst.state_load = lambda: False
@@ -1578,19 +1606,21 @@ class TestUninstall(unittest.TestCase):
         finally:
             (inst.choose, inst.uninstall, inst.banner, inst.check_ubuntu,
              inst.state_load, os.geteuid, sys.argv) = orig
+            inst.installed_traces = traces
         self.assertEqual(e.exception.code, 0)
         self.assertTrue(picked.get("ran"))
         self.assertIn("Удалить всё, что ставил скрипт", picked["opts"])
 
     def test_without_tty_and_flag_it_refuses(self):
-        stdin = sys.stdin
+        stdin, traces = sys.stdin, inst.installed_traces
         sys.stdin = io.StringIO()
+        inst.installed_traces = lambda: ["/opt/remnawave"]
         try:
             with fake_run():
                 with self.assertRaises(SystemExit):
                     quiet(inst.uninstall)
         finally:
-            sys.stdin = stdin
+            sys.stdin, inst.installed_traces = stdin, traces
 
 
 class TestLeRateLimit(unittest.TestCase):
