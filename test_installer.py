@@ -1560,6 +1560,28 @@ class TestUninstall(unittest.TestCase):
         joined, _ = self._run({"ls /etc/nginx": ("default panel.conf\n", 0)})
         self.assertIn("rm -rf /etc/nginx", joined.splitlines())
 
+    def test_menu_offers_it_as_the_fourth_item(self):
+        # человек запускает ту же команду, что и ставил, про флаг он не знает
+        picked = {}
+        orig = (inst.choose, inst.uninstall, inst.banner, inst.check_ubuntu,
+                inst.state_load, os.geteuid, sys.argv)
+        inst.choose = lambda prompt, options: (picked.setdefault("opts", options),
+                                               4)[1]
+        inst.uninstall = lambda assume_yes=False: picked.setdefault("ran", True)
+        inst.banner = inst.check_ubuntu = lambda: None
+        inst.state_load = lambda: False
+        os.geteuid = lambda: 0
+        sys.argv = ["installer"]
+        try:
+            with self.assertRaises(SystemExit) as e:
+                quiet(inst.main)
+        finally:
+            (inst.choose, inst.uninstall, inst.banner, inst.check_ubuntu,
+             inst.state_load, os.geteuid, sys.argv) = orig
+        self.assertEqual(e.exception.code, 0)
+        self.assertTrue(picked.get("ran"))
+        self.assertIn("Удалить всё, что ставил скрипт", picked["opts"])
+
     def test_without_tty_and_flag_it_refuses(self):
         stdin = sys.stdin
         sys.stdin = io.StringIO()

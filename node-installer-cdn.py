@@ -3030,7 +3030,8 @@ def parse_args():
     """Parse CLI args for non-interactive mode."""
     p = argparse.ArgumentParser(description="CDN Installer v%s" % INSTALLER_VERSION)
     p.add_argument("--mode", help="1=Panel+node here, "
-                   "2=Node+CDN to existing panel, 3=CDN origin only")
+                   "2=Node+CDN to existing panel, 3=CDN origin only, "
+                   "4=uninstall")
     # Панель только Remnawave: флаг остался ради старых команд (--panel 1)
     p.add_argument("--panel", help=argparse.SUPPRESS)
     # Провайдер остался один; флаг принимается, чтобы не ломать старые команды.
@@ -3460,14 +3461,20 @@ def main():
             say("  Начинаем с чистого листа")
 
     # ── режим ──
-    mode = args.mode or str(choose("Режим установки?", [
+    # Удаление — пункт меню, а не только флаг: человек запускает скрипт той же
+    # командой, что и ставил, и не обязан знать про --uninstall.
+    mode = args.mode or str(choose("Что делаем?", [
         "Панель + нода (всё на этом сервере)",
         "Нода + CDN к существующей панели",
-        "Только CDN (перед уже работающей нодой)"]))
+        "Только CDN (перед уже работающей нодой)",
+        "Удалить всё, что ставил скрипт"]))
     if args.mode:
         mode = check_mode_renumbering(args.mode)
+    if mode == "4":
+        uninstall(assume_yes=args.wipe)
+        sys.exit(0)
     if mode not in ("1", "2", "3"):
-        err("Режим '%s' не существует — есть 1, 2 и 3" % mode)
+        err("Режим '%s' не существует — есть 1, 2, 3 и 4 (удаление)" % mode)
         sys.exit(1)
 
     # ── панель ──
