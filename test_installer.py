@@ -829,11 +829,22 @@ class TestCdnInstructions(unittest.TestCase):
         out = self._print("yandex", "jsq98fs.example.com")
         for value in ("jsq98fs-example-com",              # имя сертификата
                       "_acme-challenge.jsq98fs.example.com",
-                      "origin-origin",                     # имя группы источников
-                      "Доменное имя ресурса:   jsq98fs.example.com",
+                      "Доменное имя источника: origin.example.com",
                       "Имя SNI-хоста:          origin.example.com",
+                      "Доменное имя:           jsq98fs.example.com",
                       "Name:   jsq98fs.example.com"):
             self.assertIn(value, out)
+
+    def test_resource_form_marks_which_domain_is_which(self):
+        """Поля источника и ресурса называются похоже — подписываем их."""
+        out = self._print("yandex", "cdn.example.com")
+        server_lines = [l for l in out.splitlines() if "<- ВАШ СЕРВЕР" in l]
+        self.assertEqual(len(server_lines), 3)               # источник, SNI, Host
+        for line in server_lines:
+            self.assertIn("origin.example.com", line)
+        client = [l for l in out.splitlines() if "<- ДЛЯ КЛИЕНТОВ" in l]
+        self.assertEqual(len(client), 1)
+        self.assertIn("cdn.example.com", client[0])
 
 
 class TestCdnSelection(unittest.TestCase):
