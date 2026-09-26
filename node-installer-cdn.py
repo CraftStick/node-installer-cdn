@@ -2929,6 +2929,36 @@ def ask_domain(prompt, preset=""):
             return ""
 
 
+def ask_subdomain(prompt, key, flag, suggest, interactive=True):
+    """Домен, который должен совпадать между запусками (origin, панель, клиенты).
+
+    Флаг — без вопросов. interactive=False — сгенерированное suggest() (при
+    продолжении — прошлое). Иначе человек вписывает своё; при продолжении
+    прошлый ответ подставляется по умолчанию. Выбранное запоминается в
+    состоянии, как путь и пароль.
+    """
+    value = (flag or "").strip()
+    if value and not RE_DOMAIN.match(value):
+        err("'%s' не похож на домен" % value)
+        say_homoglyph_hint(value)
+        sys.exit(1)
+    if not value and not interactive:
+        value = state_value(key, suggest)
+    while not value:
+        prev = _STATE["values"].get(key) if _RESUME else None
+        value = (ask(prompt, default=prev, remember=False) or "").strip()
+        if RE_DOMAIN.match(value):
+            break
+        warn("'%s' не похож на домен" % value if value else "Домен обязателен")
+        say_homoglyph_hint(value)
+        if not sys.stdin.isatty():
+            sys.exit(1)
+        value = ""
+    _STATE["values"][key] = value
+    state_save()
+    return value
+
+
 def dns_wait(lines, skip=False):
     """Показать нужные DNS-записи и подождать ENTER (если не skip)."""
     callout("DNS-записи в Cloudflare", lines)
@@ -3576,14 +3606,19 @@ def main():
         err("Домен '%s' не похож на домен (ожидается вид example.com)" % domain)
         say_homoglyph_hint(domain)
         sys.exit(1)
-    # Поддомен origin — случайный, но постоянный между перезапусками: он уже
-    # прописан в nginx, в сертификате и в ресурсе CDN (state_value).
-    origin = (args.origin_domain or "").strip()
-    if origin and not RE_DOMAIN.match(origin):
-        err("Origin '%s' не похож на домен" % origin)
-        say_homoglyph_hint(origin)
-        sys.exit(1)
-    origin = origin or state_value("origin", lambda: "%s.%s" % (rand_label(), domain))
+    # Имена можно сгенерировать или вписать свои. Свои нужны при переустановке:
+    # прежние origin и домен для клиентов уже прописаны в ресурсе CDN и
+    # сертификате Yandex Cloud, новые пришлось бы заводить там заново.
+    # Флаги или запуск без терминала — вопроса нет, недостающее генерируем.
+    own = False
+    if not (args.origin_domain or args.panel_domain or args.client_domain) \
+            and sys.stdin.isatty():
+        own = choose("Домены", [
+            "Сгенерировать автоматически",
+            "Ввести свои (например, прежние — при переустановке)"]) == 2
+    origin = ask_subdomain("Домен источника для CDN (A-запись на этот сервер)",
+                           "origin", args.origin_domain,
+                           lambda: "%s.%s" % (rand_label(), domain), own)
 
     # путь/upstream-порт: режим 3 (только CDN) берёт СУЩЕСТВУЮЩИЕ, остальные — новые
     if mode == "3":
@@ -3613,13 +3648,22 @@ def main():
     # главное имя, а её сертификат мешался бы с сертификатом для самого сайта.
     # Имя предсказуемое (panel.<домен>), его проще запомнить и продиктовать;
     # цена — недельный лимит Let's Encrypt на повторный выпуск одного и того
-    # же имени, при частых переустановках обходится флагом --panel-domain.
-    pdom = (args.panel_domain or "").strip()
-    if pdom and not RE_DOMAIN.match(pdom):
-        err("Домен панели '%s' не похож на домен" % pdom)
-        say_homoglyph_hint(pdom)
-        sys.exit(1)
-    pdom = pdom or state_value("panel_domain", lambda: "panel.%s" % domain)
+    # же имени, при частых переустановках обходится другим именем.
+    # В режиме 3 панели нет — и спрашивать про неё нечего.
+    pdom = ask_subdomain("Домен панели (A-запись на этот сервер)",
+                         "panel_domain", args.panel_domain,
+                         lambda: "panel.%s" % domain,
+                         interactive=own and mode != "3")
+
+    # Клиентский домен нужен уже в инструкции: у Yandex он указывается и в
+    # сертификате, и в самом ресурсе, поэтому спрашиваем его заранее, вместе
+    # с остальными, а не в конце.
+    client_domain = ""
+    if args.client_domain or cdn_name == "yandex":
+        client_domain = ask_subdomain(
+            "Домен для клиентов (на него выпускается сертификат в Yandex Cloud)",
+            "client_domain", args.client_domain,
+            lambda: "%s.%s" % (rand_label(), domain), own)
 
     cfg = {"mode": mode, "cdn": cdn_name, "domain": domain,
            "origin_domain": origin, "panel_domain": pdom, "path": path,
@@ -3671,17 +3715,6 @@ def main():
         result = install_cdn_only(cfg)
 
     # ── CDN-инструкция + ожидание ──
-    # Клиентский домен нужен уже в инструкции: у Yandex он указывается и в
-    # сертификате, и в самом ресурсе, поэтому придумываем его заранее, а не
-    # спрашиваем в конце. Постоянный между запусками — как origin и путь.
-    client_domain = (args.client_domain or "").strip()
-    if client_domain and not RE_DOMAIN.match(client_domain):
-        err("Домен клиентов '%s' не похож на домен" % client_domain)
-        sys.exit(1)
-    if not client_domain and cdn_name == "yandex":
-        client_domain = state_value(
-            "client_domain", lambda: "%s.%s" % (rand_label(), domain))
-
     print_cdn_instructions(cdn_name, origin, client_domain, my_ip, path)
     if not args.skip_cdn_wait:
         pause("Enter когда CDN настроен и серт выпущен")

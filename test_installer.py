@@ -1229,7 +1229,7 @@ class TestMainFlow(unittest.TestCase):
     """main() целиком на заглушках: без tty он обязан доезжать до конца."""
 
     def _main(self, argv, installs=("install_remnawave", "install_node_only",
-                                    "install_cdn_only")):
+                                    "install_cdn_only"), ask=None, tty=False):
         saved = {n: getattr(inst, n) for n in installs}
         saved.update({n: getattr(inst, n) for n in
                       ("run", "run_remote", "check_ubuntu", "state_load", "state_save",
@@ -1241,7 +1241,10 @@ class TestMainFlow(unittest.TestCase):
         try:
             # без терминала: isatty() -> False, чтение сразу упирается в EOF
             sys.stdin = io.StringIO()
-            inst.ask = lambda prompt, default=None, remember=True: default or ""
+            if tty:
+                sys.stdin.isatty = lambda: True
+            inst.ask = ask or (lambda prompt, default=None, remember=True:
+                               default or "")
             inst.run = lambda cmd, **kw: (("203.0.113.9", 0) if "curl -s4" in cmd
                                           else ("", 0))
             inst.run_remote = lambda cred, cmd, **kw: ("ok", 0)
@@ -1291,6 +1294,33 @@ class TestMainFlow(unittest.TestCase):
         self.assertIsNotNone(a_record, out)
         self.assertTrue(a_record.group(1).endswith(".e.com"))
         self.assertFalse(a_record.group(1).startswith("origin."))   # не угадывается
+
+    def _typed(self, choice):
+        # переустановка: «Домены» -> пункт choice, дальше вписываем прежние имена
+        typed = {"Выбор": choice, "источника": "src.e.com",
+                 "панели": "pan.e.com", "клиентов": "cdn.e.com"}
+
+        def fake_ask(prompt, default=None, remember=True):
+            for word, value in typed.items():
+                if word in prompt:
+                    return value
+            return default or ""
+        seen, out = self._main(["--mode", "1", "--cdn", "yandex"] + self.BASE,
+                               ask=fake_ask, tty=True)
+        return seen["install_remnawave"], out
+
+    def test_own_domains_are_asked_and_used(self):
+        cfg, out = self._typed("2")
+        self.assertEqual(cfg["origin_domain"], "src.e.com")
+        self.assertEqual(cfg["panel_domain"], "pan.e.com")
+        self.assertIn("CNAME  cdn.e.com  ->  c5d6df02.topology.gslb.yccdn.ru", out)
+
+    def test_generated_domains_skip_the_questions(self):
+        cfg, out = self._typed("1")
+        self.assertNotEqual(cfg["origin_domain"], "src.e.com")
+        self.assertTrue(cfg["origin_domain"].endswith(".e.com"))
+        self.assertEqual(cfg["panel_domain"], "panel.e.com")
+        self.assertNotIn("cdn.e.com", out)
 
     def test_origin_domain_flag_overrides_random_label(self):
         seen, out = self._main(["--mode", "1", "--cdn", "yandex",
